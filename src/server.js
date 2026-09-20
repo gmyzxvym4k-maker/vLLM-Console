@@ -1,0 +1,10010 @@
+#!/usr/bin/env node
+/**
+ * vLLM Management Console - Backend Service
+ * Runs on port 8889, proxies API calls to vLLM (port 8000)
+ */
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { URL } = require('url');
+const { spawn } = require('child_process');
+const zlib = require('zlib');
+
+// 09-20 性能优化：异步 sleep（替代 execSync('sleep N')——后者会冻结整个事件循环，
+// 停止/清理模型期间所有轮询与页面请求排队 1~30 秒）。
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// execFile 的 Promise 版：长耗时脚本（停止脚本可达分钟级）不再用 execSync 阻塞主线程。
+const execFileAsync = (file, args, opts) => new Promise((resolve, reject) => {
+  require('child_process').execFile(file, args, opts, (err, stdout, stderr) => {
+    if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve(stdout);
+  });
+});
+
+
+
+// ====== 后端端口动态解析 ======
+// VLLM_PORT 环境变量显式指定时优先（用户手动固定端口）；否则扫描运行中的
+// vllm serve / sglang.launch_server 进程的 --port，跟随实际实例 —— 避免 vLLM
+// 换了端口而控制台还指旧端口导致仪表盘没数据（08-24 两次实测踩坑）。
+// 找不到进程时回落默认端口 8000。
+// ====== Docker 端口映射（09-19）======
+// vLLM 跑在 docker 容器里时（qwen-flash-sm80/serve.py 栈），宿主可见进程的 cmdline
+// --port 是容器内端口（8000），宿主真实监听端口由 docker-proxy 经 -p 映射（18420）。
+// 控制台按容器内端口注册路由/拉 metrics → 宿主 8000 无监听 → 仪表盘所有数据卡空转。
+// 判据：/proc/<pid>/cgroup 含 docker 容器 id → docker port 查宿主端口。
+// 非容器进程原样返回；结果缓存 10s，失败也缓存负结果，防 dockerd 挂起反复阻塞事件循环。
+const __dockerHostPortCache = new Map();
+function dockerCidForPid(pid) {
+  try {
+    const cg = fs.readFileSync(`/proc/${pid}/cgroup`, 'utf8');
+    const m = cg.match(/\/docker\/([0-9a-f]{12,64})/) || cg.match(/docker-([0-9a-f]{12,64})\.scope/);
+    return m ? m[1].slice(0, 12) : null;
+  } catch (e) { return null; }
+}
+function mappedHostPort(pid, port) {
+  const cid = dockerCidForPid(pid);
+  if (!cid) return port;
+  const key = cid + ':' + port;
+  const now = Date.now();
+  const hit = __dockerHostPortCache.get(key);
+  if (hit && now - hit.ts < 10000) return hit.hp || port;
+  let hp = null;
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync(`docker port ${cid} ${port}/tcp 2>/dev/null`, { encoding: 'utf8', timeout: 1500 }).toString();
+    const m2 = out.match(/:(\d+)/);
+    if (m2) { const n = parseInt(m2[1]); if (n > 0 && n < 65536) hp = n; }
+  } catch (e) {}
+  __dockerHostPortCache.set(key, { hp, ts: now });
+  if (hp && hp !== port) console.log(`[docker-map] ${cid}:${port} -> host ${hp}`);
+  return hp || port;
+}
+
+function resolveBackendPort() {
+  const envPort = parseInt(process.env.VLLM_PORT);
+  if (envPort) return envPort;
+  // 直接扫 /proc（不走 pgrep/tr 子进程）：高负载下 execSync 偶发 2s 超时会让探测
+  // 间歇性漏掉 vllm 实例、回落到 sglang 端口，造成默认端口 8000↔8001 横跳
+  // （08-26 首次踩坑加了探测进程过滤，08-30 仍因超时横跳，且横跳连带把
+  // VLLM_MODEL_PORTS 显式映射覆盖掉 → Qwen3.6-27B 404 事故）。
+  // 保留探测类进程过滤（ssh/bash -c 里带 "vllm serve" 字样会误匹配）。
+  const found = []; // {rank: 0=vllm 1=sglang, port}
+  let entries = [];
+  try { entries = fs.readdirSync('/proc'); } catch (e) { return 8000; }
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue;
+    let cmd;
+    try { cmd = fs.readFileSync(`/proc/${name}/cmdline`, 'utf8').split('\0').join(' '); } catch (e) { continue; }
+    if (!cmd) continue;
+    if (/(^|\s)(ssh|bash|sh|expect)(\s|$)/.test(cmd)) continue;
+    if (/\b(pgrep|grep|ps)\b/.test(cmd)) continue;
+    const m = cmd.match(/--port\s+(\d+)/);
+    if (!m) continue;
+    if (isVllmProcCmd(cmd)) found.push({ rank: 0, port: mappedHostPort(parseInt(name), parseInt(m[1])) });
+    else if (cmd.includes('sglang.launch_server')) found.push({ rank: 1, port: mappedHostPort(parseInt(name), parseInt(m[1])) });
+  }
+  if (!found.length) return 8000;
+  found.sort((a, b) => a.rank - b.rank || a.port - b.port);
+  return found[0].port;
+}
+
+// ====== 多实例探测（多卡多实例：每张卡独立跑一个 vllm serve）======
+// 扫描所有运行中的 vllm serve 主进程，返回 [{port, pid, gpu, modelPath, servedName}]。
+// gpu 取进程环境 CUDA_VISIBLE_DEVICES 的第一个值（vLLM 按该顺序映射物理卡）；
+// 未设置时回落 0。3 秒缓存（ticker 每秒调用一次，避免频繁 pgrep/读 proc）。
+// 判断进程 cmdline 是否为 vLLM 主进程（两种启动形式都要认）：
+// ① vllm serve <model> ...（CLI 形式）
+// ② python -m vllm.entrypoints.openai.api_server --model <model> ...（模块形式，
+//    09-05 发现 GPU0 的 syv 实例用此形式，此前被 pgrep '[v]llm serve' 漏掉 →
+//    8889 仪表盘 GPU0 无信息的根因）
+function isVllmProcCmd(cmd) {
+  return cmd.includes('vllm serve') ||
+    (cmd.includes('vllm.entrypoints.openai.api_server') &&
+     cmd.includes('vllm.entrypoints')) ||
+    // vLLM 0.28 CLI 形式：python -m vllm.entrypoints.cli.main serve <model> ...
+    // （chroot 内 Flash-Next 实例即此形式；09-14 实测旧规则探测不到 → 路由/仪表盘丢失）
+    cmd.includes('vllm.entrypoints.cli.main');
+}
+
+let __vllmInstancesCache = { at: 0, list: [] };
+function listVllmInstances(force) {
+  const now = Date.now();
+  if (!force && now - __vllmInstancesCache.at < 3000) return __vllmInstancesCache.list;
+  const list = [];
+  try {
+    const { execSync } = require('child_process');
+    // 用 [v]llm 括号技巧避免 pgrep 匹配到「自己 spawn 的 sh -c 包装进程」
+    // （其 cmdline 含 'vllm serve' 字样，会自匹配后随即退出，导致读 /proc 报
+    // "cannot open /proc/PID/cmdline" 噪音）。
+    let pids = '';
+    try {
+      pids = execSync(`pgrep -f "[v]llm serve|vllm.entrypoints.openai.api_server|vllm.entrypoints.cli.main"`, { timeout: 2000 }).toString().trim();
+    } catch (e) { pids = ''; }
+    for (const pid of pids.split('\n').filter(Boolean)) {
+      try {
+        // 直接读 /proc（不经过 sh 子进程，避免 stderr 噪音）
+        const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ');
+        // 排除误匹配的探测进程（与 resolveBackendPort 同规则：pgrep -f 是子串匹配，
+        // ssh/bash -c 里含 'vllm serve' 字样的探测命令也会命中）
+        if (/(^|\s)(ssh|bash|sh|expect)(\s|$)/.test(cmd)) continue;
+        if (/\b(pgrep|grep|ps)\b/.test(cmd)) continue;
+        if (!isVllmProcCmd(cmd)) continue;
+        const pm = cmd.match(/--port\s+(\d+)/);
+        if (!pm) continue;
+        // 容器内进程 → 宿主映射端口（09-19：docker 栈容器 8000 → 宿主 18420）
+        const port = mappedHostPort(parseInt(pid), parseInt(pm[1]));
+        // 模型路径：vllm serve <model> 或 -m ... --model <model> 两种形式
+        const modelPath = (cmd.match(/vllm serve\s+(\S+)/) ||
+          cmd.match(/-m vllm\.entrypoints\.cli\.main serve\s+(\S+)/) ||
+          cmd.match(/--model[=\s](\S+)/) || [])[1] || '';
+        const servedName = (cmd.match(/--served-model-name\s+(\S+)/) || [])[1] || '';
+        // ---- GPU 归属（09-14 增强：单实例可跨多卡=TP/PP/DP）----
+        // 旧版只取 CUDA_VISIBLE_DEVICES 的第一个值 → PP2/TP2 这种「一个实例占两张卡」
+        // 的部署被错标成 GPU0，仪表盘 GPU1 整组没数据。现在给出完整 gpus 列表：
+        //   · CUDA_VISIBLE_DEVICES 显式列出 → 用它（截到 worldSize）
+        //   · 未设置 → vLLM 按 0..worldSize-1 连续占卡，worldSize = TP × PP × DP
+        // gpus[0] 仍作为主卡（沿用旧字段 gpu 的语义，兼容既有前端/接口）。
+        let gpus = [];
+        try {
+          const env = fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
+          const cvdLine = env.find(l => l.startsWith('CUDA_VISIBLE_DEVICES=')) || '';
+          const cvd = (cvdLine.split('=').slice(1).join('=')) || '';
+          if (cvd.trim() !== '') {
+            gpus = cvd.split(',').map(s => parseInt(s.trim())).filter(g => !isNaN(g));
+          }
+        } catch (e2) {}
+        const sizeOf = (re) => {
+          const mm = cmd.match(re);
+          const n = mm ? parseInt(mm[1]) : 1;
+          return (isNaN(n) || n < 1) ? 1 : n;
+        };
+        const worldSize = sizeOf(/--tensor-parallel-size[=\s]+(\d+)/)
+          * sizeOf(/--pipeline-parallel-size[=\s]+(\d+)/)
+          * sizeOf(/--data-parallel-size[=\s]+(\d+)/);
+        if (gpus.length === 0) {
+          for (let i = 0; i < worldSize; i++) gpus.push(i);
+        } else if (gpus.length > worldSize) {
+          gpus = gpus.slice(0, worldSize);
+        }
+        const gpu = gpus.length ? gpus[0] : 0;
+        list.push({ port, pid: parseInt(pid), gpu, gpus, worldSize, modelPath, servedName });
+      } catch (e2) { /* 进程已退出 */ }
+    }
+  } catch (e) {}
+  // 按端口去重（同一端口只保留第一个主进程）
+  const seen = new Set();
+  const dedup = [];
+  for (const it of list) {
+    if (seen.has(it.port)) continue;
+    seen.add(it.port);
+    dedup.push(it);
+  }
+  __vllmInstancesCache = { at: now, list: dedup };
+  return dedup;
+}
+
+// ---- trace 记录时间戳合理性校验（09-18）----
+// 现场实锤：127 机系统时钟会异常跳到 2161-01-01（request-traces.jsonl 出现 t≈6.03e9
+// 的记录、实例日志同现 "INFO 01-01"）。这类"未来时间"记录在 recent-requests 的
+// t 倒序里永远顶在最前，把真实数据整段挤出 limit 窗口；写它们的实例进程又已死
+// （pid 归因失败 → gpu=null），前端就堆出一整组「GPU ?」历史数据。
+// 判据：非有限数 / 早于 2001-01-01（1e9，顺带抓到误用单调钟）/ 晚于当前+5min → 一律视为脏。
+function traceTsPlausible(t) {
+  if (typeof t !== 'number' || !Number.isFinite(t)) return false;
+  return t >= 1e9 && t <= Date.now() / 1000 + 300;
+}
+
+// ---- pid → 实例解析（09-14：支持 EngineCore / Worker 子进程）----
+// vLLM 的 stat logger 插件在 **EngineCore 子进程**里调用 os.getpid()，写进
+// request-traces.jsonl 的 pid 是 EngineCore 的 pid；而 listVllmInstances() 扫到的是
+// API server 主进程 pid（cgroup 里最外层 vllm serve）。两者不相等 → 旧版
+// instByPid.get(rec.pid) 恒 miss → 所有 vLLM 完成记录 gpu=null（前端显示「—」），
+// PP/TP 双卡实例更是整卡无数据。这里沿 /proc/<pid>/stat 的 ppid 链上溯 8 层找主进程。
+// 解析成功的 pid 落 __pidInstSeen 长期缓存（实例重启换 pid 后，旧 trace 行的归因不丢，
+// 不再因为 pid 消失而整列变「—」）。
+let __pidInstSeen = new Map(); // pid → {port, gpu, gpus, at}
+function __ppidOf(pid) {
+  try {
+    const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // 第 2 字段是 (comm)，可能含空格/括号 → 从最后一个 ')' 之后再切：state ppid ...
+    const rest = st.slice(st.lastIndexOf(')') + 2).split(' ');
+    return parseInt(rest[1]) || 0;
+  } catch (e) { return 0; }
+}
+function resolveInstanceByPid(pid, insts) {
+  let cur = parseInt(pid);
+  if (!cur) return null;
+  const chain = [];
+  for (let hop = 0; hop < 8 && cur > 1; hop++) {
+    chain.push(cur);
+    const hit = insts.find(i => i.pid === cur);
+    if (hit) {
+      const snap = { port: hit.port, gpu: hit.gpu, gpus: hit.gpus, at: Date.now() };
+      for (const p of chain) __pidInstSeen.set(p, snap);
+      if (__pidInstSeen.size > 800) { // 防无限增长：只留最近 400 条
+        const keep = [...__pidInstSeen.entries()].sort((a, b) => (b[1].at || 0) - (a[1].at || 0)).slice(0, 400);
+        __pidInstSeen = new Map(keep);
+      }
+      return snap;
+    }
+    const cached = __pidInstSeen.get(cur);
+    if (cached) return cached;
+    const up = __ppidOf(cur);
+    if (!up || up === cur) break;
+    cur = up;
+  }
+  return __pidInstSeen.get(parseInt(pid)) || null;
+}
+
+// rid → pid 映射（从 vllm-live-prefill.jsonl 构建，2s 缓存）。
+// vLLM 的 request-traces.jsonl 完成记录不带 pid，但 live-prefill 每条都带
+// rid+pid，且 trace.request_id == live-prefill.rid。据此把「最近完成请求」
+// 的每条记录关联到所属实例（pid）→ GPU。文件由插件封顶 2MB/2000 行，读取廉价。
+let __ridPidCache = { at: 0, map: new Map() };
+function buildRidPidMap() {
+  const now = Date.now();
+  if (now - __ridPidCache.at < 2000) return __ridPidCache.map;
+  const map = new Map();
+  try {
+    const data = fs.readFileSync(path.join(__dirname, 'vllm-live-prefill.jsonl'), 'utf8');
+    for (const l of data.split('\n')) {
+      if (!l.trim()) continue;
+      try {
+        const r = JSON.parse(l);
+        if (!r.rid || r.pid == null) continue;
+        map.set(r.rid, r.pid);
+        // vLLM 内部 rid 带 -<8hex> 后缀（如 chatcmpl-xxx-8b83f9ae），而 trace 的
+        // request_id 是去后缀的（chatcmpl-xxx）。按前缀（去后缀）再建一条索引。
+        const base = r.rid.replace(/-[0-9a-f]{8}$/, '');
+        if (base !== r.rid) map.set(base, r.pid);
+      } catch (e) { /* 半截行/坏行跳过 */ }
+    }
+  } catch (e) { /* 文件不存在 */ }
+  __ridPidCache = { at: now, map };
+  return map;
+}
+
+// 运行中的 SGLang 实例列表（port + pid + gpu），3s 缓存。
+// sglang 的 request-metrics 记录不带 pid/端口，无法逐请求精确归属；
+// 「最近完成请求」表格用「恰好 1 个实例在跑」的启发式归属 GPU（0 个或多个则显示 —）。
+let __sglangInstCache = { at: 0, list: [] };
+// sglang 逐请求 metrics 目录：默认 sglang-request-metrics/ + 自定义 --export-metrics-dir
+// 指定的 sglang-metrics-<port>/（36 主机启动 8000 实例时用了该目录，其记录此前完全
+// 进不了「最近完成请求」表 = 用户反馈的 GPU0 无数据根因）。port 从目录名推导，
+// 作为 rec 无 port 字段时的回退（覆盖补丁前旧 exporter 写出的记录）。
+function sglangMetricsDirs() {
+  const out = [{ dir: path.join(__dirname, "sglang-request-metrics"), port: null }];
+  try {
+    for (const e of fs.readdirSync(__dirname, { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
+      const m = e.name.match(/^sglang-metrics-(\d+)$/);
+      if (m) out.push({ dir: path.join(__dirname, e.name), port: parseInt(m[1], 10) });
+    }
+  } catch (err) { /* ignore */ }
+  return out;
+}
+
+function listSglangInstances() {
+  const now = Date.now();
+  if (now - __sglangInstCache.at < 3000) return __sglangInstCache.list;
+  const list = [];
+  try {
+    const { execSync } = require('child_process');
+    // [s]glang 括号技巧避免 pgrep 自匹配（同 listVllmInstances 的说明）
+    let pids = '';
+    try {
+      pids = execSync(`pgrep -f "[s]glang.launch_server"`, { timeout: 2000 }).toString().trim();
+    } catch (e) { pids = ''; }
+    for (const pid of pids.split('\n').filter(Boolean)) {
+      try {
+        const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ');
+        if (/(^|\s)(ssh|bash|sh|expect)(\s|$)/.test(cmd)) continue;
+        if (/\b(pgrep|grep|ps)\b/.test(cmd)) continue;
+        const pm = cmd.match(/--port\s+(\d+)/);
+        if (!pm) continue;
+        let gpu = 0;
+        try {
+          const env = fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
+          const cvdLine = env.find(l => l.startsWith('CUDA_VISIBLE_DEVICES=')) || '';
+          const cvd = (cvdLine.split('=').slice(1).join('=')) || '';
+          if (cvd.trim() !== '') {
+            const g = parseInt(cvd.split(',')[0].trim());
+            if (!isNaN(g)) gpu = g;
+          }
+        } catch (e2) {}
+        // 真实模型文件路径：--model-path（SGLang 的 /v1/models root 字段填的是
+        // served-model-name 而非文件路径，仪表盘「模型路径」需要这个真实路径）
+        const modelPath = (cmd.match(/--model-path\s+(\S+)/) || [])[1]
+          || (cmd.match(/--model\s+(\S+)/) || [])[1] || '';
+        const servedName = (cmd.match(/--served-model-name\s+(\S+)/) || [])[1] || '';
+        list.push({ port: parseInt(pm[1]), pid: parseInt(pid), gpu, modelPath, servedName });
+      } catch (e2) { /* 进程已退出 */ }
+    }
+  } catch (e) {}
+  __sglangInstCache = { at: now, list };
+  return list;
+}
+
+// 解析 vllm/sglang 服务进程 cmdline → 参数对象（model-params 单端口模式与全实例模式共用）。
+// 未显式传参的字段保留下方默认值（前端对 null/缺省显示 '--'）。
+function parseServerParams(cmdline, runtime, port) {
+  const params = { runtime, port, tensor_parallel_size: 1, gpu_memory_utilization: 0.9, max_num_seqs: 4, block_size: 32, attention_backend: 'FLASHINFER', enable_chunked_prefill: true, enable_prefix_caching: false, speculative_config: null, dflash: false, dflashMethod: null, dspark: false, dsparkMethod: null, thinking: null, thinkingEffort: 'medium', kv_cache_quant: 'auto', temperature: null, top_p: null, top_k: null, min_p: null, repetition_penalty: null };
+  for (let i = 0; i < cmdline.length; i++) {
+    const a = cmdline[i];
+    const next = () => cmdline[i + 1] || '';
+    if (a === '--port') params.port = parseInt(next()) || 8000;
+    // vllm 参数
+    else if (a === '--tensor-parallel-size') params.tensor_parallel_size = parseInt(next()) || 1;
+    else if (a === '--pipeline-parallel-size' || a === '--pp' || a === '--pp-size') params.pipeline_parallel_size = parseInt(next()) || 1;
+    else if (a === '--gpu-memory-utilization') params.gpu_memory_utilization = parseFloat(next()) || 0.9;
+    else if (a === '--max-num-seqs') params.max_num_seqs = parseInt(next()) || 4;
+    else if (a === '--block-size') params.block_size = parseInt(next()) || 32;
+    else if (a === '--attention-backend') params.attention_backend = next();
+    else if (a === '--enable-chunked-prefill') params.enable_chunked_prefill = true;
+    else if (a === '--no-enable-chunked-prefill') params.enable_chunked_prefill = false;
+    else if (a === '--enable-prefix-caching') params.enable_prefix_caching = true;
+    else if (a === '--speculative-config') {
+      try {
+        const sc = JSON.parse(next());
+        params.speculative_config = sc;
+        // DFlash 探测：method 或草稿模型路径含 dflash（初代 DFlash / DFlash2 均命中）
+        if (sc && (String(sc.method || '').toLowerCase().includes('dflash') || String(sc.model || '').toLowerCase().includes('dflash'))) {
+          params.dflash = true;
+          params.dflashMethod = sc.method || null;
+        }
+        // DSpark 探测：method 或草稿模型路径含 dspark（DFlash 骨干 + Markov 头，vllm-env 0.27.1）
+        else if (sc && (String(sc.method || '').toLowerCase().includes('dspark') || String(sc.model || '').toLowerCase().includes('dspark'))) {
+          params.dspark = true;
+          params.dsparkMethod = sc.method || null;
+        }
+      } catch (e) { params.speculative_config = null; }
+    }
+    else if (a === '--default-chat-template-kwargs') {
+      try { const ck = JSON.parse(next()); params.thinking = ck.enable_thinking !== false; params.thinkingEffort = ck.reasoning_effort || 'medium'; } catch (e) {}
+    }
+    else if (a === '--override-generation-config') {
+      try { const g = JSON.parse(next()); params.temperature = g.temperature; params.top_p = g.top_p; params.top_k = g.top_k; params.min_p = g.min_p; params.repetition_penalty = g.repetition_penalty; } catch (e) {}
+    }
+    else if (a === '--kv-cache-dtype') {
+      const kv = next();
+      if (kv === 'fp8') params.kv_cache_quant = 'fp8 (FP8 量化 KV 缓存)';
+      else if (kv === 'int8') params.kv_cache_quant = 'int8 (INT8 量化 KV 缓存)';
+      else params.kv_cache_quant = kv;
+    }
+    else if (a === '--quantization') {
+      const q = next();
+      if (q === 'fp8_kv') params.kv_cache_quant = 'fp8_kv (仅 KV 缓存)';
+      else if (q === 'fp8') params.kv_cache_quant = 'fp8 (权重+KV)';
+      else if (q === 'awq') params.kv_cache_quant = 'int8 (AWQ)';
+      else params.kv_cache_quant = q;
+    }
+    // sglang 参数适配
+    else if (a === '--tp' || a === '--tp-size') params.tensor_parallel_size = parseInt(next()) || 1;
+    else if (a === '--mem-fraction-static') params.gpu_memory_utilization = parseFloat(next()) || 0.9;
+    else if (a === '--max-running-requests') params.max_num_seqs = parseInt(next()) || 4;
+    else if (a === '--page-size') params.block_size = parseInt(next()) || 1;
+    else if (a === '--chunked-prefill-size') { const v = parseInt(next()); if (v > 0) params.enable_chunked_prefill = true; }
+    else if (a === '--disable-radix-cache') params.enable_prefix_caching = false;
+    else if (a === '--radix-cache-backend') { /* 启用前缀缓存（默认有 radix cache）*/ params.enable_prefix_caching = true; }
+    else if (a === '--speculative-algorithm') {
+      const algo = next();
+      const tokens = (() => { for (let j = i + 1; j < cmdline.length; j++) { if (cmdline[j] === '--speculative-num-draft-tokens') return parseInt(cmdline[j + 1]); } return 0; })();
+      params.speculative_config = { method: algo, num_speculative_tokens: tokens || 0 };
+      // DFlash 探测：算法名或草稿模型路径含 dflash
+      if (/dflash/i.test(algo) || cmdline.some((x, j) => j > i && cmdline[j - 1] === '--speculative-draft-model-url' && /dflash/i.test(x))) {
+        params.dflash = true;
+        params.dflashMethod = algo;
+      }
+    }
+    else if (a === '--kv-cache-dtype') {
+      const kv = next();
+      if (kv === 'fp8_e4m3' || kv === 'fp8') params.kv_cache_quant = 'fp8 (FP8 量化 KV 缓存)';
+      else if (kv === 'fp8_e5m2') params.kv_cache_quant = 'fp8_e5m2';
+      else if (kv === 'mxfp8') params.kv_cache_quant = 'mxfp8';
+      else if (kv === 'int8' || kv === 'int8_bf16') params.kv_cache_quant = 'int8';
+      else params.kv_cache_quant = kv;
+    }
+    // sglang 采样参数
+    else if (a === '--preferred-sampling-params') {
+      try { const g = JSON.parse(next()); params.temperature = g.temperature; params.top_p = g.top_p; params.top_k = g.top_k; params.min_p = g.min_p; params.repetition_penalty = g.repetition_penalty; } catch (e) {}
+    }
+    else if (a === '--sampling-defaults') {
+      // 未显式传 preferred-sampling-params 时，用 sampling_defaults 的默认值
+      const sd = next();
+      if (sd === 'openai') { params.temperature = 1.0; params.top_p = 1.0; params.top_k = 0; params.min_p = 0.0; params.repetition_penalty = 1.0; }
+      // 'model' 不设置值（保留 null，让前端显示 '--'，表示使用模型配置）
+    }
+  }
+  // 前缀缓存：sglang 默认启用 radix cache，除非显式 --disable-radix-cache
+  if (runtime === 'sglang' && params.enable_prefix_caching === false) {
+    if (!cmdline.includes('--disable-radix-cache')) params.enable_prefix_caching = true;
+  }
+  return params;
+}
+
+const config = {
+  vllmHost: process.env.VLLM_HOST || '127.0.0.1',
+  vllmPort: resolveBackendPort(),
+  serverPort: parseInt(process.env.SERVER_PORT) || 8889,
+};
+
+let vllmBaseUrl = `http://${config.vllmHost}:${config.vllmPort}`;
+
+// ticker 拉不到 metrics 时自动重新探测端口并跟随（限频 5s 一次），
+// 让控制台在 vLLM 重启/换端口后自愈，无需手动改配置重启。
+function maybeReDetectBackend() {
+  const now = Date.now();
+  if (global.__lastPortDetect && now - global.__lastPortDetect < 5000) return;
+  global.__lastPortDetect = now;
+  try {
+    const p = resolveBackendPort();
+    if (p && p !== config.vllmPort) {
+      const old = config.vllmPort;
+      console.error(`[backend] 端口变化 ${old} -> ${p}，自动跟随`);
+      config.vllmPort = p;
+      vllmBaseUrl = `http://${config.vllmHost}:${p}`;
+      // 注意：这里【不再】同步覆盖 VLLM_MODEL_PORTS 条目。路由表里都是显式
+      // 模型→端口映射（启动弹窗注册 / 环境变量 / SGLang 实例同步），跟随默认
+      // 端口会把它们横跳覆盖掉（08-30 事故：Qwen3.6-27B→8000 被改成 8001 → 404）。
+      // 未注册的模型走 vllmPortForModel() 动态回落 config.vllmPort，天然跟随。
+    }
+  } catch (e) {}
+}
+
+// ====== Multi-model support ======
+// Map of served model name -> vLLM backend port. Each backend is its own
+// `vllm serve` instance pinned to one GPU. Unknown model names fall back to
+// the default backend (config.vllmPort，动态跟随自愈后的端口)。
+// 注意：不要把默认模型硬编码成 config.vllmPort 的「拷贝值」——端口自愈后
+// 拷贝值会过期导致代理仍打旧端口（08-24 实测踩坑：路由表 8000 vs 实际 8001）。
+// 09-03：移除旧硬编码 'qwen3.6-35b-a3b-fp8': 8001——运行中 vLLM 实例的模型名
+// 现由 syncVllmModelPortsFromProcs() 从进程 cmdline 动态注册（只增改不删）。
+const VLLM_MODEL_PORTS = Object.assign(
+  {},
+  (() => { try { return JSON.parse(process.env.VLLM_MODEL_PORTS || '{}'); } catch (e) { return {}; } })()
+);
+// ====== 模型名别名（2026-09-14）======
+// 客户端/模型页可能用别名请求模型：路由前先解析成真实 served-model-name 再查路由表。
+// Flash-Next 实例 served 名 = qwen3.8-flash-next；惯用别名 = qwen3.8-flash-next-nvfp4
+// （模型启动页展示名）与磁盘目录名 Qwen3.8-Flash-Next-NVFP4。
+const MODEL_ALIASES = {
+  'qwen3.8-flash-next-nvfp4': 'qwen3.8-flash-next',
+  'Qwen3.8-Flash-Next-NVFP4': 'qwen3.8-flash-next',
+  // 2026-09-16: twin-709 目录名与 served 名相同，显式自映射（代理转发/弹窗注册共用）
+  'qwen3.8-27b-twin-709': 'qwen3.8-27b-twin-709',
+};
+function resolveModelAlias(model) { return MODEL_ALIASES[model] || model; }
+
+// ====== 脚本化模型（2026-09-14）======
+// 必须在容器镜像 chroot 内启动、无法走标准 vLLM 启动路径的模型（Flash-Next-NVFP4：
+// PP2 + PLE-mmap，依赖 chroot 内补丁与镜像内环境）。模型启动页的「启动/停止」按钮
+// 对这类模型直接调用宿主侧脚本。
+const SCRIPT_MODELS = {
+  'qwen3.8-flash-next-nvfp4': {
+    dirNames: ['Qwen3.8-Flash-Next-NVFP4'],
+    modelPath: '/media/ll/data/models/Qwen3.8-Flash-Next-NVFP4',
+    script: '/home/ll/deploy/start-flash-next-18420.sh',
+    inner: '/home/ll/deploy/flash-next-inner-param.sh',
+    stopScript: '/home/ll/deploy/stop-flash-next-18420.sh',
+    port: 18420,
+    served: 'qwen3.8-flash-next',
+    log: '/home/ll/deploy/vllm-flash-next-18420.log',
+    note: '容器镜像 PP2 脚本启动，加载约 7 分钟',
+    // 生产基准值（= flash-next-inner-param.sh 内置缺省）：弹窗值与之相同则不产生额外 flag，
+    // 保证「不改任何参数 = 与现行生产命令逐字一致」。
+    base: {
+      maxModelLen: 262144, gpuMemUtil: 0.95, maxNumSeqs: 8, maxBatchedTokens: 8192,
+      blockSize: 1632, temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+      presencePenalty: 1.5, repetitionPenalty: 1.0, pp: 2, mtpTokens: 6,
+    },
+    // 该栈对未文档化参数零容忍（09-14 定版）：弹窗记忆里可能残留 27B 的参数，必须剔除
+    bannedArgs: ['--mamba-ssm-cache-dtype', '--mamba-cache-mode', '--language-model-only',
+                 '--enable-prompt-tokens-details', '--safetensors-load-strategy'],
+    bannedEnv: ['QWEN_GDN_REPLAY', 'GDN_DIAG_DISABLE_JIT_MONITOR', 'CUDA_MODULE_LOADING',
+                'PYTORCH_NVML_BASED_CUDA_CHECK', 'PYTORCH_CUDA_ALLOC_CONF', 'VLLM_SPEC_DECODE_ATTN',
+                'VLLM_DFLASH2_LOOKUP', 'VLLM_V2_CUDAGRAPH_MEM_MIB'],
+  },
+};
+SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
+  dirNames: ['Qwen3.8-Flash-Next-W4A16-AutoRound'],
+  modelPath: '/media/ll/data/models/Qwen3.8-Flash-Next-W4A16-AutoRound',
+  script: '/home/ll/deploy/start-flash-next-w4a16.sh',
+  inner: '/home/ll/deploy/flash-next-w4a16-inner.sh',
+  stopScript: '/home/ll/deploy/stop-flash-next-w4a16.sh',
+  port: 18420,
+  served: 'qwen3.8-flash-next',
+  log: '/home/ll/deploy/vllm-flash-next-w4a16.log',
+  note: '\u5bb9\u5668\u955c\u50cf PP2 \u811a\u672c\u542f\u52a8\uff08W4A16-AutoRound\uff0c\u5b98\u65b9\u624b\u518c \u00a74\uff09\uff0c\u52a0\u8f7d\u7ea6 3~9 \u5206\u949f',
+  base: {
+    maxModelLen: 262144, gpuMemUtil: 0.95, maxNumSeqs: 4, maxBatchedTokens: 8192,
+    blockSize: 1616, temperature: 0.3, topP: 0.95, topK: 20, minP: 0.0,
+    presencePenalty: 0.0, repetitionPenalty: 1.0, pp: 2, mtpTokens: 4,
+  },
+  bannedArgs: ['--mamba-ssm-cache-dtype', '--mamba-cache-mode', '--language-model-only',
+               '--enable-prompt-tokens-details', '--safetensors-load-strategy',
+               '--block-size', '--pipeline-parallel-size'],
+  bannedEnv: ['QWEN_GDN_REPLAY', 'GDN_DIAG_DISABLE_JIT_MONITOR', 'CUDA_MODULE_LOADING',
+              'PYTORCH_NVML_BASED_CUDA_CHECK', 'PYTORCH_CUDA_ALLOC_CONF', 'VLLM_SPEC_DECODE_ATTN',
+              'VLLM_DFLASH2_LOOKUP', 'VLLM_V2_CUDAGRAPH_MEM_MIB'],
+  aliases: ['Qwen3.8-Flash-Next-W4A16-AutoRound', 'qwen3.8-flash-next-w4a16-autoround'],
+  // ===== 1M 长上下文（2026-09-16）=====
+  // 本 checkpoint 原生 text_config.max_position_embeddings=262144、rope_type=default：
+  // 直接把 max_model_len 填 >262144 会被 vLLM 拒（VLLM_ALLOW_LONG_MAX_MODEL_LEN），
+  // 即便放行，RoPE 未缩放时位置越过 262144 会 NaN/越界。故 1M 走 YaRN×4 配置副本：
+  //   /media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M
+  //   （max_position_embeddings 1048576 + rope_parameters{yarn, factor 4.0, original 262144}，
+  //    其余文件全部软链回原目录，原 checkpoint 零改动；生成脚本 make-1m-config.py）
+  // 上限 maxModelLenLong：mrope 的 cos/sin 缓存 = 262144×4 = 1048576，再大就位置越界。
+  // 长上下文档位（2026-09-16）：原生 256K / 512K(YaRN×2) / 1M(YaRN×4)。
+  //   每档一个「只改 config.json、其余软链回原目录」的副本；factor = 目标长度 / 262144。
+  //   mrope 缓存恒 = original(262144) × 4 = 1048576，故 512K、1M 都安全（≤ 缓存）。
+  altModelPaths: ['/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M',
+                  '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-512K'],
+  longCtxModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M',
+  longCtx512ModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-512K',
+  maxModelLenLong: 1048576,
+  maxModelLen512: 524288,
+};
+MODEL_ALIASES['qwen3.8-flash-next-w4a16'] = 'qwen3.8-flash-next';
+MODEL_ALIASES['Qwen3.8-Flash-Next-W4A16-AutoRound'] = 'qwen3.8-flash-next';
+
+function scriptModelForName(name) {
+  if (!name) return null;
+  if (SCRIPT_MODELS[name]) return Object.assign({ key: name }, SCRIPT_MODELS[name]);
+  for (const k of Object.keys(SCRIPT_MODELS)) {
+    const v = SCRIPT_MODELS[k];
+    if ((v.dirNames || []).indexOf(name) >= 0) return Object.assign({ key: k }, v);
+  }
+  return null;
+}
+// 脚本模型实例探测：chroot 内引擎属 root（ll 的 lsof 看不到监听端口），按
+// /proc/<pid>/cmdline 里的模型路径认领，端口从 --port 动态解析（弹窗可改端口）。
+// 1M 档会用 longCtxModelPath（altModelPaths），故这里要把所有候选路径都算上。
+function scriptModelInstance(sm) {
+  if (!sm) return null;
+  const paths = [sm.modelPath].concat(sm.altModelPaths || []).filter(Boolean);
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync('pgrep -f "[v]llm.entrypoints" 2>/dev/null || true', { encoding: 'utf8', timeout: 3000 }).trim();
+    for (const pid of out.split('\n').filter(Boolean)) {
+      try {
+        const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ');
+        if (/(^|\s)(ssh|bash|sh|expect)(\s|$)/.test(cmd)) continue;
+        if (paths.length && !paths.some(p => cmd.includes(p))) continue;
+        const m = cmd.match(/--port\s+(\d+)/);
+        if (m) return { port: parseInt(m[1]), pid: parseInt(pid) };
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return null;
+}
+function scriptModelAlive(sm) { return !!scriptModelInstance(sm); }
+function scriptModelForPort(port) {
+  const p = parseInt(port);
+  if (!p) return null;
+  for (const k of Object.keys(SCRIPT_MODELS)) {
+    const v = SCRIPT_MODELS[k];
+    if (v.port === p) return Object.assign({ key: k }, v);
+  }
+  for (const k of Object.keys(SCRIPT_MODELS)) {
+    const v = SCRIPT_MODELS[k];
+    const inst = scriptModelInstance(v);
+    if (inst && inst.port === p) return Object.assign({ key: k }, v);
+  }
+  return null;
+}
+// 弹窗默认值（= 生产基准）：前端 startConfigDefaults 用它覆盖 localStorage 记忆，
+// 避免别的模型（如 27B 的 --mamba-ssm-cache-dtype）参数串到该栈上。
+function scriptModelDefaults(sm) {
+  const b = sm.base || {};
+  return {
+    port: sm.port, servedName: sm.served, maxModelLen: String(b.maxModelLen), ctxLen: '',
+    gpuId: 0, gpuCount: b.pp || 2, parallelMode: 'pp', pdMode: '0',
+    maxSeqs: b.maxNumSeqs, gpuMemUtil: b.gpuMemUtil, maxBatchedTokens: b.maxBatchedTokens,
+    blockSize: b.blockSize, temperature: b.temperature, topP: b.topP, topK: b.topK,
+    minP: b.minP, presencePenalty: b.presencePenalty, repetitionPenalty: b.repetitionPenalty,
+    thinking: '1', thinkingEffort: 'medium', kvCacheQuant: 'auto', retention: '',
+    mtp: '0', dflash: '0', dspark: '0', mtpTokens: b.mtpTokens || 6,
+    runtime: 'vllm', dtype: 'auto',
+    // 1M 长上下文开关（'0' 原生 256K / '1' YaRN×4 → 1M）；maxModelLenLong=0 表示该脚本
+    // 模型没提供 1M 档（如 NVFP4 栈），前端据此隐藏开关
+    longCtx: '0', maxModelLenLong: sm.maxModelLenLong || 0, maxModelLen512: sm.maxModelLen512 || 0,
+  };
+}
+// ====== Flash-Next 启动方案（2026-09-14）======
+// 方案二的参数由上游仓库 config/vllm-args.json + config/runtime-env.json 提取到独立 JSON，
+// 便于随上游更新而无需改动 server.js 代码。
+const FLASHNEXT_SCHEME_FILE = '/home/ll/deploy/flashnext-scheme-170hx.json';
+function loadFlashNextSchemeLocal() {
+  try {
+    return JSON.parse(fs.readFileSync('/home/ll/deploy/flashnext-scheme-170hx-local.json', 'utf8'));
+  } catch (e) { return null; }
+}
+
+function loadFlashNextScheme170hx() {
+  try {
+    return JSON.parse(fs.readFileSync(FLASHNEXT_SCHEME_FILE, 'utf8'));
+  } catch (e) { return null; }
+}
+// 方案二前置条件探测（Docker / GDS / PLE GDS 数据 / 镜像 / 模型 revision）
+function schemeReadiness(scheme) {
+  const r = { docker: false, image: false, cufile: false, nvidia_fs: false, pleArtifact: false, model: false };
+  // 本机可运行形态（launcher.mode==='script'）：不依赖 Docker/GDS，只校验脚本与模型
+  if (scheme && scheme.launcher && scheme.launcher.mode === 'script') {
+    try { r.wrapper = fs.existsSync(scheme.launcher.wrapper); } catch (e) { r.wrapper = false; }
+    try { r.inner = fs.existsSync(scheme.launcher.inner); } catch (e) { r.inner = false; }
+    try {
+      const mp = scheme.launcher.model || '/media/ll/data/models/Qwen3.8-Flash-Next-NVFP4';
+      const files = fs.readdirSync(mp);
+      const shards = files.filter(f => f.endsWith('.safetensors')).length;
+      let bytes = null;
+      try { bytes = JSON.parse(fs.readFileSync(mp + '/model.safetensors.index.json', 'utf8')).metadata.total_size; } catch (e2) {}
+      const want = scheme.launcher.modelBytes || 135195303851;
+      r.model = shards >= 200 && (bytes === null || Math.abs(bytes - want) / want < 0.01);
+      r.modelShards = shards; r.modelBytes = bytes || null;
+    } catch (e) { r.model = false; }
+    return r;
+  }
+  try {
+    const out = require('child_process').execSync('command -v docker 2>/dev/null || true', { encoding: 'utf8', timeout: 3000 }).trim();
+    r.docker = !!out;
+  } catch (e) {}
+  if (r.docker) {
+    try {
+      const img = (scheme && scheme.launcher && scheme.launcher.image) || 'qwen-flash-sm80:0.1.4';
+      require('child_process').execSync('docker image inspect --format "{{.Id}}" ' + JSON.stringify(img) + ' 2>/dev/null', { timeout: 5000 });
+      r.image = true;
+    } catch (e) { r.image = false; }
+  }
+  try {
+    r.cufile = fs.existsSync('/usr/lib/x86_64-linux-gnu/libcufile.so.0') ||
+               fs.existsSync('/usr/lib/x86_64-linux-gnu/libcufile.so') ||
+               fs.existsSync('/usr/local/cuda/lib64/libcufile.so');
+  } catch (e) {}
+  try {
+    r.nvidia_fs = fs.existsSync('/sys/module/nvidia_fs') ||
+                  (fs.existsSync('/proc/modules') && fs.readFileSync('/proc/modules', 'utf8').indexOf('nvidia_fs') >= 0);
+  } catch (e) {}
+  try { r.pleArtifact = fs.existsSync('/media/ll/data/ple-gds/CURRENT'); } catch (e) {}
+  // 模型：目录存在 + 分片数量 + index total_size 与上游 revision 期望值比对（容许 1% 差异）
+  try {
+    const mp = '/media/ll/data/models/Qwen3.8-Flash-Next-NVFP4';
+    const files = fs.readdirSync(mp);
+    const shards = files.filter(f => f.endsWith('.safetensors')).length;
+    let bytes = null;
+    try {
+      const idx = JSON.parse(fs.readFileSync(mp + '/model.safetensors.index.json', 'utf8'));
+      bytes = idx && idx.metadata && idx.metadata.total_size;
+    } catch (e2) {}
+    r.modelShards = shards;
+    r.modelBytes = bytes || null;
+    const want = (scheme && scheme.launcher && scheme.launcher.modelBytes) || 135195303851;
+    r.model = shards >= 200 && (bytes === null || Math.abs(bytes - want) / want < 0.01);
+  } catch (e) { r.model = false; }
+  return r;
+}
+function flashNextSchemes() {
+  const out = [{
+    key: 'chroot-pp2',
+    name: '当前生产（chroot 镜像 + PP2 + PLE mmap，无投机）',
+    kind: 'chroot',
+    ready: true,
+    missing: [],
+    note: '本机现用方案：PP2 双卡流水并行，PLE 走 mmap + CPU offload，MTP 关闭（该镜像下不稳）。弹窗参数化启动即走此方案。',
+  }];
+  const s170 = loadFlashNextScheme170hx();
+  if (s170) {
+    const rd = schemeReadiness(s170);
+    const missing = (s170.requires || []).filter(x => !rd[x.key]).map(x => x.label);
+    out.push({
+      key: s170.key, name: s170.name, kind: 'docker', source: s170.source, note: s170.note,
+      vllmArgs: s170.vllmArgs, env: s170.env, launcher: s170.launcher,
+      readiness: rd, missing: missing, ready: missing.length === 0,
+    });
+  }
+  const sLocal = loadFlashNextSchemeLocal();
+  if (sLocal) {
+    const rdL = schemeReadiness(sLocal);
+    const missingL = (sLocal.requires || []).filter(x => !rdL[x.key]).map(x => x.label);
+    out.push({
+      key: sLocal.key, name: sLocal.name, kind: 'chroot', source: sLocal.source, note: sLocal.note,
+      vllmArgs: sLocal.vllmArgs, env: sLocal.env, launcher: sLocal.launcher,
+      readiness: rdL, missing: missingL, ready: missingL.length === 0,
+    });
+  }
+  return out;
+}
+// 弹窗参数 → chroot 启动环境变量（FN_*）；与基准相同的项不产生额外 flag。
+function scriptModelLaunchPlan(sm, d) {
+  const b = sm.base || {};
+  const warnings = [];
+  // 不写死 FN_LOG：wrapper 按端口命名为 vllm-flash-next-${PORT}.log
+  const env = { FN_MODEL_PATH: sm.modelPath };
+  const num = (v, dflt) => { const n = parseFloat(v); return isNaN(n) ? dflt : n; };
+  const int = (v, dflt) => { const n = parseInt(v, 10); return isNaN(n) ? dflt : n; };
+  const port = int(d.port, sm.port);
+  const served = String(d.servedName || sm.served).trim() || sm.served;
+  env.FN_PORT = String(port);
+  env.FN_SERVED = served;
+  // 上下文：ctxLen 优先，其次 maxModelLen；空/auto → 基准
+  let maxLen = String(d.ctxLen || '').trim() || String(d.maxModelLen || '').trim();
+  if (!maxLen || maxLen === 'auto') maxLen = String(b.maxModelLen);
+  // ===== 长上下文档位（2026-09-16）：原生 256K / 512K(YaRN×2) / 1M(YaRN×4) =====
+  // 触发路径：① 弹窗「上下文扩展」显式选档（longCtx='512k' | '1m'，旧值 '1' 兼容为 1m）；
+  //          ② 上下文数值本身 >262144 → 按数值就近自动选档（否则会像 09-16 18:28 那次
+  //             填 512144 被 vLLM 直接拒启 ValueError；且 >262144 不缩放会 NaN）。
+  // 选档后：模型切到对应 YaRN 副本目录（inner 脚本兜底再判一次），maxLen 硬钳到该档上限。
+  // 上限依据：mrope cos/sin 缓存 = original(262144)×4 = 1048576，512K/1M 都在缓存内。
+  const cap1m = int(sm.maxModelLenLong, 0);     // 0 = 该脚本模型未提供长上下文档
+  const cap512 = int(sm.maxModelLen512, 0);
+  const baseCap = int(b.maxModelLen, 262144);
+  const nMaxLen = int(maxLen, NaN);
+  let tier = '';                                 // '' = 原生；'512k' / '1m'
+  const lcRaw = String(d.longCtx || '').trim().toLowerCase();
+  if (lcRaw === '1' || lcRaw === '1m') tier = '1m';
+  else if (lcRaw === '512k' || lcRaw === '512') tier = '512k';
+  else if (cap512 > 0 && !isNaN(nMaxLen) && nMaxLen > baseCap && nMaxLen <= cap512) tier = '512k';
+  else if (cap1m > baseCap && !isNaN(nMaxLen) && nMaxLen > baseCap) tier = '1m';
+  // 该模型若没有 1M 档（只有 512K 或全无），按可用上限收敛 tier
+  if (tier === '1m' && !(cap1m > baseCap)) tier = (cap512 > baseCap ? '512k' : '');
+  if (tier === '512k' && !(cap512 > baseCap)) tier = (cap1m > baseCap ? '1m' : '');
+  if (tier) {
+    const tierCap = tier === '1m' ? cap1m : cap512;
+    const tierPath = tier === '1m'
+      ? (sm.longCtxModelPath || (sm.altModelPaths || [])[0] || '')
+      : (sm.longCtx512ModelPath || '');
+    const factor = tier === '1m' ? 4.0 : 2.0;
+    if (isNaN(nMaxLen) || nMaxLen > tierCap) maxLen = String(tierCap);
+    env.FN_LONGCTX = '1';
+    env.FN_1M_MODEL_PATH = tierPath;             // inner 脚本据此选模型目录
+    env.FN_YARN_FACTOR = String(factor);         // inner 脚本据此钳制上限（缓存恒为 1048576）
+    warnings.push(`已启用 ${tier === '1m' ? '1M' : '512K'} 长上下文（YaRN×${factor === 4.0 ? '4' : '2'}，上限 ${tierCap} token）：`
+      + `模型切到 ${tierPath}；KV 池必须装得下 ${maxLen} token，并发会下降（max-num-seqs 从 ${env.FN_SEQS || b.maxNumSeqs} 起算）`);
+  }
+  env.FN_MAXLEN = maxLen;
+  env.FN_GPUMEM = String(num(d.gpuMemUtil, b.gpuMemUtil));
+  env.FN_SEQS = String(int(d.maxNumSeqs, b.maxNumSeqs));
+  env.FN_BLOCK = String(int(d.blockSize, b.blockSize));
+  env.FN_MBTOKENS = String(int(d.maxBatchedTokens, b.maxBatchedTokens));
+  env.FN_PP = String(b.pp || 2);
+  env.FN_PREFIX_CACHE = String(String(d.prefixCaching) === '0' ? 0 : 1);
+  env.FN_CHUNKED = String(String(d.chunkedPrefill) === '0' ? 0 : 1);
+  env.FN_ASYNC = String(String(d.asyncScheduling) === '0' ? 0 : 1);
+  const dtype = String(d.dtype || 'auto');
+  if (dtype && dtype !== 'auto') env.FN_DTYPE = dtype;
+  if (String(d.enforceEager) === '1') env.FN_ENFORCE_EAGER = '1';
+  const sp = String(d.schedPolicy || '');
+  if (sp && sp !== 'fcfs') env.FN_SCHED_POLICY = sp;
+  if (d.seed) env.FN_SEED = String(d.seed);
+  if (String(d.noLogRequests) === '1') env.FN_NOLOG = '1';
+  if (String(d.disableAllReduce) === '1') env.FN_DISABLE_ALLREDUCE = '1';
+  const mm = String(d.limitMm || '');
+  if (mm && mm !== '999') env.FN_LIMIT_MM = mm;
+  if (d.maxScheduledTokens) env.FN_MAX_SCHED_TOKENS = String(d.maxScheduledTokens);
+  if (d.cpuOffloadGb) env.FN_CPU_OFFLOAD_GB = String(d.cpuOffloadGb);
+  const kv = String(d.kvCacheQuant || 'auto');
+  if (kv && kv !== 'auto' && kv !== 'bfloat16') env.FN_KV_DTYPE = kv;
+  // 采样：全部等于基准 → 不传（= 生产无 --override-generation-config）
+  const gen = {
+    temperature: num(d.temperature, b.temperature), top_p: num(d.topP, b.topP),
+    top_k: int(d.topK, b.topK), min_p: num(d.minP, b.minP),
+    presence_penalty: num(d.presencePenalty, b.presencePenalty),
+    repetition_penalty: num(d.repetitionPenalty, b.repetitionPenalty),
+  };
+  const genSame = gen.temperature === b.temperature && gen.top_p === b.topP && gen.top_k === b.topK &&
+    gen.min_p === b.minP && gen.presence_penalty === b.presencePenalty &&
+    gen.repetition_penalty === b.repetitionPenalty;
+  if (!genSame) env.FN_GENCFG = JSON.stringify(gen);
+  // 思考模式：'1'（默认）= 不传（用模型模板默认）；'0' = 显式关闭
+  if (String(d.thinking) === '0') env.FN_CHATKWARGS = JSON.stringify({ enable_thinking: false });
+  // 投机：MTP 可用但本镜像 PP2 下不稳；DFlash/DSpark 无对应草稿 ckpt
+  if (String(d.mtp) === '1') {
+    const n = int(d.mtpTokens, b.mtpTokens || 6);
+    env.FN_SPEC = JSON.stringify({ method: 'mtp', num_speculative_tokens: n, use_local_argmax_reduction: false });
+    // 09-19：W4A16 档的 MTP 已实测稳定（与 NVFP4 档相反），警告按档位区分，避免误导
+    warnings.push(sm.key === 'qwen3.8-flash-next-w4a16'
+      ? `已启用 MTP(x${n})：W4A16 档实测稳定（09-19：接受长度 2.84、decode 111 tok/s、输出无乱码）。注意草稿档位受 QSA ring capacity 整除约束——block-size 1616 下合法档为 1~4 与 9~12，5~8 会启动即崩。`
+      : `已启用 MTP(x${n})：本镜像 PP2 下 MTP 有连续长请求 device assert 残余 bug，不稳定请改回「无投机」`);
+  } else if (String(d.dflash) === '1' || String(d.dspark) === '1') {
+    warnings.push('Flash-Next-NVFP4 无 DFlash/DSpark 草稿 ckpt，已按「无投机」启动');
+  } else {
+    // 未选投机：显式下发 none，避免脚本侧缺省值（W4A16 缺省=MTP4）被误用
+    env.FN_SPEC = 'none';
+  }
+  // 附加环境变量 / 附加启动参数（危险项过滤）
+  const bannedEnv = (sm.bannedEnv || []).map(x => x.toUpperCase());
+  const keptEnv = [];
+  String(d.vllmExtraEnv || '').split('\n').map(x => x.trim()).filter(x => x && !x.startsWith('#')).forEach(line => {
+    const key = line.split('=')[0].trim().toUpperCase();
+    if (bannedEnv.some(x => key.includes(x))) { warnings.push('已剔除危险环境变量：' + line.split('=')[0].trim()); return; }
+    keptEnv.push(line);
+  });
+  if (keptEnv.length) env.FN_EXTRA_ENV = keptEnv.join('\n');
+  const extra = String(d.vllmExtraArgs || '').trim();
+  if (extra) {
+    const toks = extra.split(/\s+/);
+    const banned = sm.bannedArgs || [];
+    const kept = [];
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i];
+      if (banned.some(x => t === x || t.startsWith(x + '='))) { warnings.push('已剔除危险参数：' + t); i++; continue; }
+      kept.push(t);
+    }
+    if (kept.length) env.FN_EXTRA_ARGS = kept.join(' ');
+  }
+  const summary = [
+    'serve ' + (env.FN_MODEL_PATH || sm.modelPath), '--served-model-name ' + served, '--port ' + port,
+    '--max-model-len ' + maxLen, '--gpu-memory-utilization ' + env.FN_GPUMEM,
+    '--max-num-seqs ' + env.FN_SEQS, '--max-num-batched-tokens ' + env.FN_MBTOKENS,
+    '--block-size ' + env.FN_BLOCK, '--pipeline-parallel-size ' + env.FN_PP,
+    env.FN_SPEC ? ('spec=' + env.FN_SPEC) : '无投机',
+    env.FN_GENCFG ? ('gen=' + env.FN_GENCFG) : '采样=模型默认',
+    env.FN_LONGCTX === '1' ? '长上下文=YaRN×4/1M' : '',
+  ].filter(Boolean).join(' ');
+  return { env, port, served, warnings, summary };
+}
+function vllmPortForModel(model) {
+  if (!model) return null;
+  const name = resolveModelAlias(model);
+  // 显式路由（多模型映射）优先；否则默认后端动态跟随 config.vllmPort
+  return (VLLM_MODEL_PORTS[name] !== undefined) ? VLLM_MODEL_PORTS[name] : config.vllmPort;
+}
+
+// ====== PD (prefill/decode) 两步转发支持 ======
+// PD 模型 = 两个 vLLM 实例分工：prefill（kv_producer）只算 KV 缓存，decode（kv_consumer）
+// 拿到 KV 后直接生成。客户端无感：代理自动拆两步——
+//   1) 请求转发给 prefill 实例（强制非流式，注入 return_token_ids + do_remote_decode），
+//      响应带回 prompt_token_ids 与 kv_transfer_params（remote_block_ids/engine_id/request_id 等）；
+//   2) 把这两个字段注入原请求转发给 decode 实例（按客户端意愿流式/非流式），响应原样透传。
+// 环境变量 PD_MODEL_PORTS（JSON）：{"模型名":{"prefill":端口,"decode":端口}}；
+// 需要 vLLM 以 --kv-transfer-config 跑成 kv_producer/kv_consumer 一对实例。
+const PD_MODEL_PORTS = Object.assign(
+  // 08-28 修正：当前 8000 为单实例（非 PD）。旧硬编码 {prefill:8010, decode:8011}
+  // 会让 qwen3.8-27b-fp8 请求在控制台重启后（动态同步探测不到 kv_producer/consumer
+  // 配对）回退指向不存在的 8010/8011 → ECONNREFUSED 502。真正起 PD 实例时改用
+  // 启动弹窗注册或 PD_MODEL_PORTS 环境变量注入。
+  {},
+  (() => { try { return JSON.parse(process.env.PD_MODEL_PORTS || '{}'); } catch (e) { return {}; } })()
+);
+function pdPortsForModel(model) {
+  if (!model) return null;
+  const p = PD_MODEL_PORTS[model];
+  return (p && p.prefill && p.decode) ? { prefill: p.prefill, decode: p.decode } : null;
+}
+
+// ====== PD 路由动态同步 ======
+// 控制台重启后，启动弹窗注册到 PD_MODEL_PORTS 的运行时条目会丢失，而实例进程（setsid
+// 独立）仍在跑——路由表会退回硬编码默认值导致代理打错端口（实测 08-27：实例在 8001/8002
+// 而路由指 8010 → ECONNREFUSED）。这里从运行中的 vllm serve 进程 cmdline 探测
+// kv_producer/kv_consumer 配对，按 served-model-name 重建路由（覆盖硬编码）。
+function syncPdModelPortsFromProcs() {
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync('pgrep -f "vllm serve" 2>/dev/null || true', { encoding: 'utf8', timeout: 3000 }).trim();
+    if (!out) return;
+    const producers = {}; // servedName -> prefill port
+    const consumers = {}; // servedName -> decode port
+    for (const pid of out.split('\n').filter(Boolean)) {
+      let cmd;
+      try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' '); } catch (e) { continue; }
+      if (/(^|\s)(ssh|bash|sh|expect)(\s|$)/.test(cmd)) continue;
+      if (/\b(pgrep|grep|ps)\b/.test(cmd)) continue;
+      const portM = cmd.match(/--port\s+(\d+)/);
+      const nameM = cmd.match(/--served-model-name\s+(\S+)/);
+      if (!portM || !nameM) continue;
+      if (cmd.includes('"kv_role":"kv_producer"')) producers[nameM[1]] = parseInt(portM[1]);
+      else if (cmd.includes('"kv_role":"kv_consumer"')) consumers[nameM[1]] = parseInt(portM[1]);
+    }
+    for (const name of new Set([...Object.keys(producers), ...Object.keys(consumers)])) {
+      if (producers[name] && consumers[name]) {
+        const cur = PD_MODEL_PORTS[name];
+        if (!cur || cur.prefill !== producers[name] || cur.decode !== consumers[name]) {
+          PD_MODEL_PORTS[name] = { prefill: producers[name], decode: consumers[name] };
+          console.log(`[pd-sync] ${name} -> prefill ${producers[name]} / decode ${consumers[name]}`);
+        }
+      }
+    }
+  } catch (e) { /* 探测失败保持现状 */ }
+}
+// 启动时同步一次 + 每 5s 跟随实例变化（新增/停止 PD 对）
+try { syncPdModelPortsFromProcs(); } catch (e) {}
+setInterval(syncPdModelPortsFromProcs, 5000).unref();
+
+// SGLang 实例 模型名→端口 动态同步（同 PD 同步思路）：
+// 启动弹窗注册只存内存，控制台重启即丢；脚本手动起的实例更是从未注册过。
+// 这里扫 sglang.launch_server 进程的 --port/--served-model-name 注册进
+// VLLM_MODEL_PORTS，8889 代理按模型名正确路由（08-30 事故：Qwen3.6-27B 未注册
+// 回落默认端口 8001 → vLLM 报 404 model does not exist）。
+// 只增改不删：探测瞬时失败（进程列表读空）不会清掉已有映射。
+function syncSglangModelPortsFromProcs() {
+  try {
+    for (const inst of listSglangInstances()) {
+      let name = '';
+      try {
+        const cmd = fs.readFileSync(`/proc/${inst.pid}/cmdline`, 'utf8').split('\0').join(' ');
+        const nameM = cmd.match(/--served-model-name\s+(\S+)/);
+        const pathM = cmd.match(/--model-path\s+(\S+)/);
+        // SGLang 未指定 --served-model-name 时默认对外名 = 模型路径
+        name = nameM ? nameM[1] : (pathM ? pathM[1] : '');
+      } catch (e) { continue; }
+      if (!name) continue;
+      if (VLLM_MODEL_PORTS[name] !== inst.port) {
+        VLLM_MODEL_PORTS[name] = inst.port;
+        console.log(`[sglang-sync] ${name} -> ${inst.port}`);
+      }
+    }
+  } catch (e) { /* 探测失败保持现状 */ }
+}
+try { syncSglangModelPortsFromProcs(); } catch (e) {}
+setInterval(syncSglangModelPortsFromProcs, 5000).unref();
+
+// vLLM 实例 模型名→端口 动态同步（09-03，同 sglang-sync 思路）：
+// 多实例时（8000/8001 各 serve 不同 served-model-name），路由表此前只有启动弹窗/
+// 环境变量的显式注册，未注册的模型回落 config.vllmPort（主实例端口）→ 次实例的
+// 模型名请求打到主实例 404「The model ... does not exist」
+// （09-03 事故：qwen3.8-27b-1 回落 8000 → 404）。
+// 这里从运行中 vllm serve 进程 cmdline 注册 --served-model-name（缺省=模型路径）→ --port。
+// 规则：只增改不删（探测瞬时失败不清已有映射）；PD 实例命中 pdPortsForModel 时走
+// 两步转发优先（见 CATCH-ALL），此表仅兜底；与 SGLang 实例同名时让位（保持既有
+// 行为：SGLang 动态注册优先）。
+function syncVllmModelPortsFromProcs() {
+  try {
+    // 运行中 SGLang 实例的对外名集合（同名让位判断，口径与 sglang-sync 一致）
+    const sgNames = new Set();
+    for (const inst of listSglangInstances()) {
+      try {
+        const cmd = fs.readFileSync(`/proc/${inst.pid}/cmdline`, 'utf8').split('\0').join(' ');
+        const nameM = cmd.match(/--served-model-name\s+(\S+)/);
+        const pathM = cmd.match(/--model-path\s+(\S+)/);
+        const n = nameM ? nameM[1] : (pathM ? pathM[1] : '');
+        if (n) sgNames.add(n);
+      } catch (e) {}
+    }
+    const insts = listVllmInstances().slice().sort((a, b) => a.port - b.port);
+    for (const inst of insts) {
+      const name = inst.servedName || inst.modelPath;
+      if (!name) continue;
+      if (sgNames.has(name)) continue; // SGLang 实例正 serve 同名，路由让给它
+      if (VLLM_MODEL_PORTS[name] !== inst.port) {
+        VLLM_MODEL_PORTS[name] = inst.port;
+        console.log(`[vllm-sync] ${name} -> ${inst.port}`);
+      }
+    }
+  } catch (e) { /* 探测失败保持现状 */ }
+}
+// 启动时同步一次 + 每 5s 跟随实例变化（新增/停止）
+try { syncVllmModelPortsFromProcs(); } catch (e) {}
+setInterval(syncVllmModelPortsFromProcs, 5000).unref();
+
+// ====== SGLang 支持 ======
+// sglang 环境（main 快照，含 DFLASH / DFlash2DraftModel）与 DFlash2 草稿模型路径
+const SGLANG_VENV = '/home/ll/sglang-env';
+const SGLANG_DRAFT_PATH = '/home/ll/models/qwen3.8-27b-dflash2';
+const SGLANG_DSPARK_PATH = '/home/ll/models/qwen3.8-27b-dspark';
+const SGLANG_LOG_PATH = path.join(__dirname, 'sglang.log');
+
+// DSpark 草稿 ckpt 的 dspark_block_size（gamma）训练时定死，运行时不可改：
+// vLLM 要求 num_speculative_tokens ≥ gamma（小了乱码/硬报错），SGLang 要求
+// --speculative-num-draft-tokens 严格等于 gamma+1（verify 窗口）。两引擎的 DSpark
+// 分支一律以 ckpt config 为准，UI「投机 token 数」输入不再参与。读取失败回退 7。
+function readDsparkGamma(draftPath) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(draftPath, 'config.json'), 'utf8'));
+    const g = parseInt(cfg && cfg.dspark_block_size, 10);
+    return (Number.isFinite(g) && g > 0) ? g : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ====== GPU 占用登记表 ======
+// 防止 vLLM 与 SGLang 实例占用同一 GPU 造成冲突。
+// Map<port, {port, gpuId, gpuCount, runtime, model, startedAt}>
+if (!global.__GPU_INSTANCES) global.__GPU_INSTANCES = new Map();
+
+// 按 PID 识别运行时：'sglang' / 'vllm' / null
+function detectRuntimeForPid(pid) {
+  if (!pid) return null;
+  try {
+    const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ');
+    if (cmd.includes('sglang.launch_server') || cmd.includes('python -m sglang')) return 'sglang';
+    if (cmd.includes('vllm serve') || cmd.includes('vllm.entrypoints') || cmd.includes('python -m vllm')) return 'vllm';
+  } catch (e) {}
+  return null;
+}
+
+const MIME_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css',
+  '.js': 'application/javascript',
+  '.json': 'application/json',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.txt': 'text/plain',
+};
+
+// ====== 1-second token ticker（按端口）======
+// Samples each backend port's /metrics every second INDEPENDENTLY of client
+// polling, so the dashboard can show true "tokens produced in the last 1
+// second" per request.
+// 多卡多实例：每个端口一个独立 ticker（global.__tokTickers[port]）；
+// global.__tokTicker 始终指向主后端（config.vllmPort）的 ticker 别名，
+// 既有单实例逻辑（last_second / 计费 / 预填充聚合）引用它不变。
+if (!global.__tokTickers) global.__tokTickers = new Map();
+function getTicker(port) {
+  let tk = global.__tokTickers.get(port);
+  if (!tk) {
+    tk = { lastTotal: null, lastPromptTotal: null, lastTime: null, busy: false,
+      lastSecond: { tokens: 0, speed: 0, running: 0, at: 0 } };
+    global.__tokTickers.set(port, tk);
+  }
+  return tk;
+}
+if (!global.__tokTicker) global.__tokTicker = getTicker(config.vllmPort);
+
+// 每 GPU 累计缓存命中率：读各实例 ticker 的累计计数器
+// （vLLM: local_cache_hit/(hit+local_compute)；SGLang: cached_tokens_total/(cached+uncached_sum)）。
+// 口径=自实例启动累计，与主卡「重置后」口径独立。
+// 返回 [{port, gpu, model, cached, uncached, rate}]（rate 为百分数或 null）。
+function perPortCacheStats() {
+  const out = [];
+  try {
+    const seen = new Set();
+    const all = [...listVllmInstances(), ...listSglangInstances()];
+    for (const inst of all) {
+      if (seen.has(inst.port)) continue;
+      seen.add(inst.port);
+      const tk = global.__tokTickers.get(inst.port);
+      if (!tk || tk.lastCacheCached === undefined || tk.lastCacheUncached === undefined) continue;
+      const cached = Math.max(0, Math.round(tk.lastCacheCached));
+      const uncached = Math.max(0, Math.round(tk.lastCacheUncached));
+      const total = cached + uncached;
+      out.push({
+        port: inst.port,
+        gpu: inst.gpu,
+        gpus: inst.gpus || (inst.gpu != null ? [inst.gpu] : []),
+        model: inst.model,
+        cached, uncached,
+        rate: total > 0 ? parseFloat((cached / total * 100).toFixed(1)) : null,
+      });
+    }
+  } catch (e) {}
+  return out;
+}
+
+// 09-01 SGLang「理论可命中率」（LCP×8192 网格折算，sglang-theory.service 每 60s 写 json）
+function readSglangTheory(port) {
+  try {
+    const now = Date.now();
+    if (!global.__theoryCache) global.__theoryCache = new Map();
+    let e = global.__theoryCache.get(String(port));
+    if (!e || now - e.t > 15000) {
+      const raw = fs.readFileSync('/home/ll/deploy/sglang-theory-' + port + '.json', 'utf8');
+      e = { t: now, d: JSON.parse(raw) };
+      global.__theoryCache.set(String(port), e);
+    }
+    return e.d;
+  } catch (err) { return null; }
+}
+
+// 采样指定端口的 /metrics 并更新对应 ticker（主/从端口共用）
+function samplePortMetrics(port) {
+  const tk = getTicker(port);
+  if (tk.busy) return;
+  tk.busy = true;
+  const req = http.get(`http://${config.vllmHost}:${port}/metrics`, (proxyRes) => {
+    let data = '';
+    proxyRes.on('data', c => data += c);
+    proxyRes.on('error', () => { tk.busy = false; });
+    proxyRes.on('end', () => {
+      tk.busy = false;
+      // v2 每请求速度采样：复用本次 /metrics 响应（零额外请求），每秒维护
+      try { const _sp = reqOutSamplerFor(port); _sp.lastTickerFeedAt = Date.now(); processReqOutSample(port, data, Date.now()); } catch (e) {}
+      try {
+        const m = parseMetrics(data);
+        const ns = metricsNamespace(m);
+        // vllm 与 sglang 的生成/输入 token 计数器同名（仅前缀不同）；running 名称不同
+        const genBase = ns === 'sglang' ? 'sglang:generation_tokens_total' : 'vllm:generation_tokens_total';
+        const promptBase = ns === 'sglang' ? 'sglang:prompt_tokens_total' : 'vllm:prompt_tokens_total';
+        const runningBase = ns === 'sglang' ? 'sglang:num_running_reqs' : 'vllm:num_requests_running';
+        const total = Math.round(counterTotal(m, genBase));
+        const promptTotal = Math.round(counterTotal(m, promptBase));
+        // 未缓存预填充 token（source=local_compute）：vLLM 每个迭代步都递增该
+        // 计数器（见 vllm/v1/metrics/loggers.py record()），所以它的每秒增量就是
+        // 「真实发生的预填充计算量」——精确的实时预填充吞吐（缓存命中不计入）。
+        const uncachedTotal = ns === 'sglang'
+          ? 0 : Math.round(counterBySource(m, 'vllm:prompt_tokens_by_source_total', 'local_compute'));
+        // 每 GPU 累计缓存命中统计（独立字段，不动上面 uncachedTotal 路径，
+        // 避免改变 PD 走势图 sglang 分支行为）：
+        // vLLM = local_cache_hit / (hit + local_compute)；
+        // SGLang = cached_tokens_total / (cached + uncached_prompt_tokens_histogram_sum)
+        const cacheCached = ns === 'sglang'
+          ? Math.round(counterTotal(m, 'sglang:cached_tokens_total'))
+          : Math.round(counterBySource(m, 'vllm:prompt_tokens_by_source_total', 'local_cache_hit'));
+        const cacheUncached = ns === 'sglang'
+          ? Math.round(counterTotal(m, 'sglang:uncached_prompt_tokens_histogram_sum'))
+          : uncachedTotal;
+        tk.lastCacheCached = cacheCached;
+        tk.lastCacheUncached = cacheUncached;
+        const running = Math.round(
+          ns === 'sglang' ? gaugeValue(m, runningBase)
+                          : (m['vllm:num_requests_running' + buildModelLabelFromMetrics(m, 'vllm:num_requests_running{')] || 0)
+        );
+        const now = Date.now();
+        if (tk.lastTotal !== null && now - tk.lastTime >= 500) {
+          const dt = (now - tk.lastTime) / 1000;
+          const genDelta = total - tk.lastTotal;
+          const promptDelta = promptTotal - (tk.lastPromptTotal || promptTotal);
+          const uncachedDelta = uncachedTotal - (tk.lastUncachedTotal || uncachedTotal);
+          tk.lastSecond = {
+            tokens: Math.max(0, genDelta),
+            speed: dt > 0 ? parseFloat(Math.max(0, genDelta / dt).toFixed(1)) : 0,
+            promptTokens: Math.max(0, promptDelta),
+            promptSpeed: dt > 0 ? parseFloat(Math.max(0, promptDelta / dt).toFixed(1)) : 0,
+            // 未缓存预填充吞吐（精确实时，bench_pp_tps 与每行预填充速率的数据源）
+            uncachedTokens: Math.max(0, uncachedDelta),
+            uncachedPPS: dt > 0 ? parseFloat(Math.max(0, uncachedDelta / dt).toFixed(1)) : 0,
+            running: running,
+            at: now,
+          };
+        } else if (tk.lastTotal === null) {
+          tk.lastSecond = { tokens: 0, speed: 0, promptTokens: 0, promptSpeed: 0, uncachedTokens: 0, uncachedPPS: 0, running: running, at: now };
+        }
+        tk.lastTotal = total;
+        tk.lastPromptTotal = promptTotal;
+        tk.lastUncachedTotal = uncachedTotal;
+        tk.lastTime = now;
+        // 生成 token 计数历史（09-15 瞬时输出速度）：每秒 1 样本、滚动 ~8 样本，
+        // 供 computeConcurrencyDetails 短窗差分算并发请求行的「近1s tok/s」。
+        if (!tk.genHist) tk.genHist = [];
+        tk.genHist.push({ t: now, g: total });
+        if (tk.genHist.length > 8) tk.genHist.shift();
+
+        // ====== PD 动态图时间序列（全局按秒聚合，多端口累加） ======
+        // 常规模式：单端口同时贡献 prefill(uncached) 与 gen；PD 模式：prefill 端口贡献
+        // uncached（request_prefill_kv_computed_tokens 口径，缓存命中不计）、decode 端口
+        // 贡献 gen，按秒桶累加后天然对齐成「预填充 → 输出」一条走势。保留 2h。
+        if (tk.lastSecond) {
+          if (!global.__pdSeries) global.__pdSeries = { points: [] };
+          const S = global.__pdSeries;
+          const bucket = Math.floor(now / 1000);
+          let cur = S.points.length ? S.points[S.points.length - 1] : null;
+          if (!cur || cur.t !== bucket) {
+            cur = { t: bucket, prefill: 0, gen: 0 };
+            S.points.push(cur);
+            if (S.points.length > 7200) S.points.splice(0, S.points.length - 7200);
+          }
+          cur.prefill += tk.lastSecond.uncachedTokens || 0;
+          cur.gen += tk.lastSecond.tokens || 0;
+        }
+      } catch (e) { /* ignore malformed metrics */ }
+    });
+  });
+  // 只有主端口拉取失败才触发端口自愈探测（从实例挂掉不代表主后端换端口）
+  req.on('error', () => { tk.busy = false; if (port === config.vllmPort) maybeReDetectBackend(); });
+  req.setTimeout(2000, () => { req.destroy(new Error('ticker timeout')); });
+}
+
+setInterval(() => {
+  // 主后端 + 所有探测到的 vllm 实例（多卡多实例各自独立采样）
+  const ports = new Set([config.vllmPort]);
+  try { for (const inst of listVllmInstances()) ports.add(inst.port); } catch (e) {}
+  // 08-30: SGLang 实例也进 ticker 采样（每 GPU 缓存命中率依赖 ticker 累计计数器）
+  try { for (const inst of listSglangInstances()) ports.add(inst.port); } catch (e) {}
+  for (const p of ports) { samplePortMetrics(p); sampleReqOutGauges(p); }
+  // 主别名跟随自愈后的端口
+  global.__tokTicker = getTicker(config.vllmPort);
+}, 1000).unref();
+
+// ====== 1-second whole-machine energy sampler (能耗/电费) ======
+// 每秒采样「整机估算总功耗」= 全部 GPU 功率之和 + CPU(RAPL) + 补偿值，
+// 按 W × Δt 积分累计 Wh（零阶保持）。口径与能耗统计页的整机估算总功耗一致。
+// 与 vLLM 是否运行无关：待机功耗同样计入。持久化到 energy-state.json，
+// 每 10 秒落盘一次（进程被杀最多丢 ~10 秒积分，误差可忽略）。
+const ENERGY_STATE_PATH = path.join(__dirname, 'energy-state.json');
+const ENERGY_CONFIG_PATH = path.join(__dirname, 'energy-config.json');
+
+function loadEnergyState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(ENERGY_STATE_PATH, 'utf8'));
+    if (s && typeof s === 'object') {
+      const days = {};
+      for (const [k, v] of Object.entries(s.days || {})) {
+        const wh = parseFloat(v);
+        if (!isNaN(wh) && wh >= 0) days[k] = wh;
+      }
+      return { wh: parseFloat(s.wh) || 0, history_wh: parseFloat(s.history_wh) || 0, days };
+    }
+  } catch (e) {}
+  return { wh: 0, history_wh: 0, days: {} };
+}
+
+function saveEnergyState() {
+  const en = global.__energy;
+  if (!en) return;
+  try {
+    fs.writeFileSync(ENERGY_STATE_PATH, JSON.stringify({ wh: en.wh, history_wh: en.history_wh, days: en.days }, null, 2));
+    en.lastFlush = Date.now();
+  } catch (e) {}
+}
+
+function loadEnergyConfig() {
+  try {
+    const c = JSON.parse(fs.readFileSync(ENERGY_CONFIG_PATH, 'utf8'));
+    if (c && typeof c === 'object') return { price_per_kwh: parseFloat(c.price_per_kwh) || 0, unit: c.unit || '元' };
+  } catch (e) {}
+  return { price_per_kwh: 1.0, unit: '元' };
+}
+
+function saveEnergyConfig(c) {
+  fs.writeFileSync(ENERGY_CONFIG_PATH, JSON.stringify(c, null, 2));
+}
+
+// 功耗补偿值：用户手动设置，代表无法直接测量的其它硬件（NVMe/Wi-Fi/主板/电源损耗等）
+const POWER_CONFIG_PATH = path.join(__dirname, 'power-config.json');
+function loadPowerConfig() {
+  try {
+    const c = JSON.parse(fs.readFileSync(POWER_CONFIG_PATH, 'utf8'));
+    return { offsetW: Math.max(0, Math.min(1000, parseFloat(c.offsetW) || 0)) };
+  } catch (e) {}
+  return { offsetW: 0 };
+}
+function savePowerConfig(c) {
+  fs.writeFileSync(POWER_CONFIG_PATH, JSON.stringify(c, null, 2));
+}
+
+{
+  const seeded = loadEnergyState();
+  global.__energy = { wh: seeded.wh, history_wh: seeded.history_wh, days: seeded.days || {}, lastWatts: null, lastSampleAt: null, lastFlush: Date.now(), busy: false };
+}
+setInterval(() => {
+  const en = global.__energy;
+  if (en.busy) return;
+  en.busy = true;
+  const q = spawn('nvidia-smi', ['--query-gpu=power.draw', '--format=csv,noheader,nounits']);
+  const t = setTimeout(() => { try { q.kill('SIGKILL'); } catch (e) {} }, 3000);
+  t.unref();
+  let out = '';
+  q.stdout.on('data', d => { out += d; });
+  q.on('close', () => {
+    en.busy = false;
+    // 全部 GPU 功率求和（单卡机即该卡功耗；双卡机兼容，防未来扩卡口径漂移）
+    let gpuW = 0;
+    for (const line of String(out).split('\n')) {
+      const w = parseFloat(line.trim());
+      if (!isNaN(w) && w > 0) gpuW += w;
+    }
+    if (gpuW <= 0) return; // nvidia-smi 失败：跳过本轮，避免用 0/负值污染积分
+    // 整机估算总功耗 = 全部 GPU + CPU(RAPL，功耗监测模块维护) + 补偿值
+    // 口径与能耗统计页的「整机估算总功耗」(adjustedTotalW) 完全一致
+    const cpuW = (typeof cpuPowerW !== 'undefined' && cpuPowerW !== null) ? cpuPowerW : 0;
+    const totalW = gpuW + cpuW + loadPowerConfig().offsetW;
+    const now = Date.now();
+    if (en.lastSampleAt !== null) {
+      const dtSec = (now - en.lastSampleAt) / 1000;
+      if (dtSec > 0 && dtSec <= 10) { // 间隔健康才积分，避免停机/挂起导致的时间洞被放大
+        const dWh = en.lastWatts * dtSec / 3600;
+        en.wh += dWh;
+        en.history_wh += dWh;
+        // 每日能耗桶（服务器本地日期，与每日费用明细对齐）
+        if (!en.days) en.days = {};
+        const dk = billingDayKey();
+        en.days[dk] = (en.days[dk] || 0) + dWh;
+        const dkKeys = Object.keys(en.days).sort();
+        while (dkKeys.length > BILLING_MAX_DAYS) delete en.days[dkKeys.shift()];
+      }
+    }
+    en.lastWatts = totalW;
+    en.lastSampleAt = now;
+    if (now - en.lastFlush > 10000) saveEnergyState();
+  });
+  q.on('error', () => { en.busy = false; });
+}, 1000).unref();
+
+// 系统内存（/proc/meminfo）：2 秒缓存，避免 buildEnergyInfo 高频调用时重复读盘
+let _lastMemInfo = null, _lastMemInfoAt = 0;
+function readMemInfo() {
+  const now = Date.now();
+  if (_lastMemInfo && now - _lastMemInfoAt < 2000) return _lastMemInfo;
+  try {
+    const txt = fs.readFileSync('/proc/meminfo', 'utf8');
+    const mi = {};
+    for (const line of txt.split('\n')) {
+      const mm = line.match(/^(\w+):\s+(\d+)\s*kB/);
+      if (mm) mi[mm[1]] = parseInt(mm[2], 10);
+    }
+    if (mi.MemTotal) {
+      const total = mi.MemTotal;
+      const avail = mi.MemAvailable !== undefined ? mi.MemAvailable : (mi.MemFree || 0);
+      const used = Math.max(0, total - avail);
+      _lastMemInfo = {
+        used_pct: parseFloat((used / total * 100).toFixed(1)),
+        total_gb: Math.round(total / 1024 / 1024 * 10) / 10,
+        used_gb: Math.round(used / 1024 / 1024 * 10) / 10,
+      };
+      _lastMemInfoAt = now;
+    }
+  } catch (e) {}
+  return _lastMemInfo;
+}
+
+function buildEnergyInfo() {
+  const en = global.__energy || {};
+  const cfg = loadEnergyConfig();
+  const kwh = (en.wh || 0) / 1000;
+  const hkwh = (en.history_wh || 0) / 1000;
+  // 每日电费：按天累计的 Wh × 当前电价（电价调整后按新价实时显示）
+  const days = {};
+  for (const [dk, dwh] of Object.entries(en.days || {})) {
+    const dkwh = dwh / 1000;
+    days[dk] = { kwh: dkwh, cost: dkwh * cfg.price_per_kwh };
+  }
+  return {
+    kwh,
+    cost: kwh * cfg.price_per_kwh,
+    history_kwh: hkwh,
+    history_cost: hkwh * cfg.price_per_kwh,
+    days,
+    current_power_w: en.lastWatts || 0, // 整机估算总功耗（全部 GPU + CPU + 补偿值），仪表盘「总功耗」显示用
+    price_per_kwh: cfg.price_per_kwh,
+    unit: cfg.unit || '元',
+    sampling_lag_s: en.lastSampleAt ? Math.round((Date.now() - en.lastSampleAt) / 1000) : -1,
+    cpu_util_pct: (typeof cpuUtilPct !== 'undefined') ? cpuUtilPct : null, // 处理器 CPU 整机利用率 %（/proc/stat 2s 采样，全部核心平均）
+    cpu_cores: (typeof CPU_CORES !== 'undefined') ? CPU_CORES : null,
+    mem: readMemInfo(), // 系统内存 { used_pct, total_gb, used_gb }（/proc/meminfo，2s 缓存）
+  };
+}
+
+function resetEnergyBucket(scope) {
+  const en = global.__energy;
+  if (!en) return;
+  if (scope === 'current') en.wh = 0;
+  else if (scope === 'history') en.history_wh = 0;
+  saveEnergyState();
+}
+
+// ====== Live token-stream capture ======
+// vLLM metrics carry no per-request generated text. Requests that pass
+// through this console's /v1/(chat/)completions proxy are tee'd here: the
+// raw bytes are forwarded untouched, while the delta text is accumulated
+// per request so the dashboard can show each running request's token
+// stream (red-box area of the "正在处理 N 个请求" card).
+if (!global.__liveStreams) {
+  global.__liveStreams = { seq: 0, map: new Map() };
+}
+const LIVE_TEXT_MAX = 4000;      // rolling window of text kept per request
+const LIVE_DONE_KEEP_MS = 5000;  // keep finished entries this long for the UI
+const LIVE_PATH_RE = /^\/v1\/(chat\/completions|completions|responses)$/
+
+// ============================================================================
+// 并发请求实时输出速度 v2（2026-09-17 全新设计）
+// ----------------------------------------------------------------------------
+// 设计目标：每个并发请求行的「实时输出 tok/s」独立、稳定、可溯源，杜绝
+// 旧实现三宗罪——① arrival 时间近邻猜测归属（并发错配）、② SSE 文本字符
+// 估算 token（口径漂移）、③ 引擎总吞吐均摊残差（单行凭空满速）。
+//
+// 数据源（按优先级，全部为引擎 Prometheus /metrics 真值，每秒采样）：
+//  A. 每请求在途 gauge（带真实 rid 标签，新版 vLLM 支持）：
+//     vllm:request_generation_tokens{req_id} 该请求已生成 token（累计）
+//     vllm:request_decode_time_seconds{req_id} 该请求已花 decode 时长
+//     vllm:time_to_first_token_seconds{req_id} 引擎侧请求到达时刻（epoch）
+//     → 速度 = 滑窗 Δgen/Δdecode_time（2~6s 窗；分母只用该请求自身 GPU
+//       生成时长 → 排队/首包等待/引擎停顿天然排除，并发零摊分）。
+//  B. 直方图驻留估计（实例不导出 A 时的引擎真值回退）：
+//     驻留 = decode 时长桶按秒差分的小时加权平均（桶上界是驻留硬下界，
+//     封顶 dt/le → 估计恒 ≤ 真值：宁可显示偏低绝不虚高）；
+//     速度 = 实例 generation_tokens 短窗吞吐 ÷ 在途 decode 数 N；
+//     累计接管 = 实例 genCum（重启基线续算）÷ 当前 decode 行数。
+//  C. 全无（实例刚重启、采样空窗）→ undefined（前端如实显示 --），
+//     绝不退回旧均摊残差编造数值。
+//
+// 每请求序列 hist=[{t, gen, dec}] 每秒一个样本（主 ticker 循环驱动；
+// 样本时间戳 = 引擎真值「到达时刻+累计 decode 时长」折算墙钟，与抓取
+// 节奏解耦。stats 轮询时另有一层 >2.5s 空窗的同步补采兜底）。
+//
+// 归属（REQ 行 ↔ 引擎 rid）两级，杜绝 arrival 近邻错配：
+//   ① 精确：代理注入 X-Client-Req-Id → tee 首帧解析引擎真实 rid →
+//      taskId→crid→rid 直查（走 8889 的流量，零猜测）；
+//   ② 兜底：直连流量按「引擎到达时刻（ttft−dec）与行 startedAt 最近邻」
+//      + 粘性绑定（orphan 守卫防双行抢同一 rid）。
+//
+// 速度 = 滑窗差分：基线取「距现在 ∈[2s,6s] 内最老的新鲜样本」，末样本必须是
+// 最近 2.5s 内的新样本（否则如实 undefined 而非编造）。窗口内时间分母用
+// decode 时间增量（dDec）：decode gauge 只计该请求自己 GPU 生成时刻，天然
+// 排除排队/首包等待/引擎停顿 → 输出 tok 与时间分母严格同期，这是「准」的根。
+//
+// 覆盖边界：SGLang 实例无对应 gauge/桶族 → 速度如实 undefined（前端 --）。
+// speed_src 取值：v2-exact / v2-nearest / v2-hist（v2 真值，精度递减）；
+// tee / engine / residual 仅作为「v2 全无信号」时旧逻辑回落值保留。
+// ============================================================================
+if (!global.__reqOutSamplers) global.__reqOutSamplers = new Map(); // port -> sampler
+// rid 匹配（v2）：SSE 响应 id（chatcmpl-xxx）与引擎内部 rid（chatcmpl-xxx-yyy，
+// 插件/gauge 用的带尾缀形式）互为前缀关系——精确匹配必须容忍该尾缀。
+function ridMatches(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return String(b).indexOf(a + '-') === 0 || String(a).indexOf(b + '-') === 0;
+}
+// 在带 rid 键的 Map 里找与响应 id 匹配的真实键（gauge 序列 / live-prefill 记录）
+function ridFind(map, rid) {
+  if (!map || !rid) return null;
+  if (map.has(rid)) return rid;
+  const p = rid + '-';
+  for (const k of map.keys()) { if (String(k).indexOf(p) === 0) return k; }
+  return null;
+}
+
+// 代理捕获：clientReqId → { rid, at }（tee 首帧建立；行凭 taskId 反查认领 rid）
+if (!global.__clientReqRid) global.__clientReqRid = new Map();
+function linkClientReqRid(crid, rid) {
+  if (!crid || !rid) return;
+  const m = global.__clientReqRid;
+  if (m.size >= 5000) { const k = m.keys().next().value; if (k !== undefined) m.delete(k); }
+  if (!m.has(crid)) m.set(crid, { rid, at: Date.now() });
+}
+
+// 从 /metrics 文本抽每请求 gauge（带 req_id 标签）→ Map<rid,{gen,dec,ttft}>
+function parseRequestGauges(text) {
+  const out = new Map();
+  if (!text) return out;
+  const lines = text.split('\n');
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
+    if (!line || line.charCodeAt(0) === 35) continue; // '#' 注释/快速跳过空行
+    const ridM = reqIdRe.exec(line);
+    if (!ridM) continue;
+    const sp = line.lastIndexOf(' ');
+    const v = parseFloat(line.substring(sp + 1));
+    if (!isFinite(v) || v < 0) continue;
+    const name = line.substring(0, line.indexOf('{'));
+    const rid = ridM[1];
+    let r = out.get(rid);
+    if (!r) { r = { gen: null, dec: null, ttft: null }; out.set(rid, r); }
+    if (name.endsWith('request_generation_tokens')) { if (r.gen === null || v > r.gen) r.gen = v; }
+    else if (name.endsWith('request_decode_time_seconds')) { if (r.dec === null || v > r.dec) r.dec = v; }
+    else if (name.endsWith('time_to_first_token_seconds') && r.ttft === null) r.ttft = v;
+  }
+  return out;
+}
+const reqIdRe = /req_id="([^"]+)"/;
+
+// 实例级直方图桶（decode 时长/首包等待两族）。用途：实例不导出带 req_id 的
+// gauge 时（vLLM 默认配置），v2 引擎真值仍可用——桶计数按「请求在 bucket 内
+// 驻留时间 ~ 桶上界」建模：
+//   N_i(dt) = Σ_k C_k · min(1, dt/le_k)   （dt 秒未结束请求在桶 k 的期望计数）
+//   平均驻留 = Σ dt·(N − N_prev)/Σ(N − N_prev) = 在途请求的 decode 平均驻留
+// 数学性质：该估计【恒不高于】真实驻留（桶上界是驻留的硬下界，全请求封顶
+// dt/le_k 使每个请求贡献 ≤1），且 dt 相对 le 分布较大时接近无偏。因此由此
+// 得到的速度 = Δgen/驻留 是【保守下界】——宁可显示偏低也绝不虚高（用户痛点
+// 是旧值虚高）。并发多请求共享桶差分时各请求分得同值（= 真实驻留分布的均值，
+// 比旧版「总吞吐/行数」更接近个体真值）。
+function parseBucketHist(text, metricBase) {
+  // Prometheus 桶行名 = 指标名 + '_bucket'（调用方传基础名即可）。
+  // 标签内可能有任意前缀（engine=... 等），le 两侧用 [^}]* 宽松匹配。
+  const re = new RegExp('^' + metricBase + '_bucket\\{[^}]*le="([^"]+)"[^}]*\\}\\s+([0-9eE+.]+)\\s*$', 'gm');
+  const out = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const le = m[1] === '+Inf' ? Infinity : parseFloat(m[1]);
+    const v = parseFloat(m[2]);
+    if (isFinite(le) && isFinite(v)) out.push({ le, c: v });
+  }
+  out.sort((a, b) => a.le - b.le);
+  return out;
+}
+
+// 实例采样器：每秒抓取（随 ticker 循环，busy 互斥）。cfgOk=false 会做低频探测
+// （该实例是否支持 gauge，命中后自动升级），支持后无在途请求时降频省流量。
+function reqOutSamplerFor(port) {
+  let sp = global.__reqOutSamplers.get(port);
+  if (!sp) {
+    sp = {
+      port, cfgOk: null, probeAt: 0, busy: false, lastSeenAt: 0,
+      reqs: new Map(),       // rid -> {gen,dec,ttft,hist,stale}（gauge 模式：rid 精确序列）
+      genHist: [],           // [{t,g}] 实例级 generation_tokens_total（总量守恒/顶栏兜底）
+      lastGenTotal: null,
+      occ: new Map(),        // rid -> 行 startedAt（最近邻粘性占用表，按端口隔离）
+      // 直方图模式（实例无 req_id gauge 时的 v2 引擎真值回退）：
+      decBk: [],             // decode 时长桶最新计数 [{le,c}]
+      ttftBk: [],            // 首包等待桶最新计数
+      prevDecBk: null,       // 上一秒快照（差分用）
+      prevDecBkAt: 0,
+      genAvgWin: undefined,  // 在途平均 decode 驻留（秒）；undefined=数据不足
+      waitAvgWin: undefined, // 在途平均首包等待（prefill+queue 驻留）
+      winN: 0,               // 驻留估计的样本数（本秒进入驻留的请求数）
+      thrWin: undefined,     // 实例 gen 短窗吞吐（同 reqOutInstThroughput 口径，供驻留法分母）
+      genCum: 0,             // 本会话累计输出（重启基线续算；直方图接管行累计用）
+    };
+    global.__reqOutSamplers.set(port, sp);
+  }
+  return sp;
+}
+// v2 采样处理核心（不发起请求）：解析每请求 gauge + 直方图桶 + 实例 gen 滑窗，
+// 维护 sampler 状态。数据来自两处：主 ticker（samplePortMetrics，每秒，零额外
+// 请求）或 sampleReqOutGauges 的兜底抓取（ticker 停摆时）。
+function processReqOutSample(port, data, now) {
+  const sp = reqOutSamplerFor(port);
+  if (!data || data.indexOf('vllm:') === -1) return; // SGLang 等其它运行时：无对应指标，跳过
+  try {
+        const rg = parseRequestGauges(data);
+        // genCumPost：在途请求「已完成部分」的累计（重启后新请求预填，行接管
+        // 时扣除）。gauge 可见 = 至少一个在途请求：其 gen 之和即预填下界。
+        if (rg.size > 0) {
+          let postSum = 0;
+          for (const g of rg.values()) if (g.gen) postSum += g.gen;
+          sp.genCumPost = postSum;
+        } else if (sp.genCumPost === undefined) sp.genCumPost = 0;
+        if (rg.size > 0 || sp.cfgOk === true) {
+          if (sp.cfgOk !== true) console.log(`[reqout] port ${port} per-request gauges active`);
+        }
+        // 直方图桶：无条件维护（gauge 模式实例也可能后续重启降级；且
+        // 驻留估计同时为两种模式提供交叉校验基线）
+        try {
+          const decBk = parseBucketHist(data, 'vllm:request_decode_time_seconds');
+          const ttftBk = parseBucketHist(data, 'vllm:time_to_first_token_seconds');
+          if (decBk.length) {
+            const bkAt = now;
+            if (sp.prevDecBk && bkAt - sp.prevDecBkAt >= 700) {
+              const dt = (bkAt - sp.prevDecBkAt) / 1000;
+              // 桶是累计计数（le=上界）：dC = 本窗口「decode 完成」的请求数，
+              // 其真实驻留 ∈ (le_{k-1}, le_k]。完成事件本身就是驻留样本——
+              // W = 样本驻留均值（中点估计 sqrt(prev*cur)，单点桶退化为 le），
+              // λ = 完成率。Little 定律：在途 decode 数 N = λ̄ × W（EWMA 平滑，
+              // 突发完成摊平；λ 样本窗对齐 W 窗避免相位错配）。
+              let dSum = 0, dWsum = 0;
+              for (let k = 0; k < decBk.length && k < sp.prevDecBk.length; k++) {
+                const dC = decBk[k].c - sp.prevDecBk[k].c;
+                if (dC <= 0) continue;
+                const lo = k > 0 ? sp.prevDecBk[k - 1].le : 0;
+                const hi = decBk[k].le;
+                const dur = (isFinite(lo) && lo > 0 && isFinite(hi))
+                  ? Math.sqrt(lo * hi)
+                  : (isFinite(hi) ? hi : (sp.winEw || 10));
+                dSum += dC; dWsum += dC * dur;
+              }
+              const lamNew = dSum / dt;
+              if (dSum > 0) {
+                const wNew = dWsum / dSum;
+                if (sp.winEw === undefined) { sp.winEw = wNew; sp.lamEw = lamNew; }
+                else {
+                  sp.winEw += 0.3 * (wNew - sp.winEw);
+                  sp.lamEw += 0.3 * (lamNew - sp.lamEw);
+                }
+              } else if (sp.lamEw !== undefined) {
+                // 空窗（无人完成 ≠ 无人 decode）：λ 保持、W 保持，N 估计不塌
+                sp.lamEw *= Math.pow(0.85, dt / 1.5); // 3s 半衰向稳值缓降
+                if (sp.lamEw < 0.001) sp.lamEw = 0.001;
+              }
+              if (sp.winEw !== undefined && sp.lamEw !== undefined) {
+                const nNow = sp.lamEw * sp.winEw;
+                sp.nEw = sp.nEw === undefined ? nNow : sp.nEw + 0.4 * (nNow - sp.nEw);
+                sp.genAvgWin = sp.winEw;
+                sp.winLastAt = now;
+              }
+            }
+            sp.prevDecBk = decBk;
+            sp.prevDecBkAt = bkAt;
+          }
+          if (ttftBk.length) {
+            const bkAt2 = now;
+            if (!sp.prevTtftBk) { sp.prevTtftBk = ttftBk; sp.prevTtftBkAt = now; }
+            else {
+              const dt2 = (bkAt2 - (sp.prevTtftBkAt || bkAt2)) / 1000;
+              if (dt2 >= 0.7) {
+                let dS = 0, dW2 = 0;
+                for (let k = 0; k < ttftBk.length && k < sp.prevTtftBk.length; k++) {
+                  const dC = ttftBk[k].c - sp.prevTtftBk[k].c;
+                  if (dC > 0) { dS += dC; dW2 += dC * Math.min(1, dt2 / ttftBk[k].le); }
+                }
+                if (dS > 0) sp.waitAvgWin = Math.max(0.2, dt2 * dS / dW2);
+              }
+              sp.prevTtftBk = ttftBk;
+              sp.prevTtftBkAt = bkAt2;
+            }
+          }
+        } catch (e) { /* 桶解析失败不影响主路径 */ }
+        // 实例级总吞吐（总量守恒 + 单请求兜底）
+        try {
+          const m = parseMetrics(data);
+          const gt = counterTotal(m, 'vllm:generation_tokens_total');
+          if (sp.lastGenTotal === null || gt < sp.lastGenTotal - 1000) sp.lastGenTotal = gt;
+          const dG = Math.max(0, Math.round(gt - sp.lastGenTotal));
+          sp.lastGenTotal = gt;
+          if (dG > 0) { sp.genHist.push({ t: now, g: gt }); if (sp.genHist.length > 10) sp.genHist.shift(); }
+          sp.thrWin = reqOutInstThroughput(sp, now); // 驻留法分母（直方图模式用）
+          // 吞吐 EWMA：hist 速度显示用平滑值，消除 1.5s 窗的突发锯齿
+          // （引擎 decode 有 chunk 节奏，瞬时吞吐天然抖 ±40%，用户感知为「跳」）
+          if (sp.thrWin !== undefined) {
+            sp.thrEw = sp.thrEw === undefined ? sp.thrWin : sp.thrEw + 0.35 * (sp.thrWin - sp.thrEw);
+          } else if (sp.thrEw !== undefined) {
+            // 滑窗空洞（gen 计数 1~2.5s 未更新）：EWMA 向 0 缓降，真停顿时
+            // hist 速度如实回落，不会冻结在最后一个高值
+            sp.thrEw *= 0.75;
+            if (sp.thrEw < 0.5) sp.thrEw = undefined;
+          }
+          if (dG > 0) sp.genCum += dG;
+        } catch (e) { /* metrics 解析失败忽略本轮 */ }
+        if (rg.size === 0 && sp.cfgOk !== true) {
+          // 可能该构建不带 req_id gauge，也可能只是空闲——空闲时无法区分，
+          // 记 false 但保持 30s 探测（一有在途请求即升级）。
+          // 重启基线捕获：无在途且从未建立累计 → genCumPre=当前 gen_total，
+          // genCumPost=0（本轮起累计从引擎计数重新起算）。
+          if (sp.genCumPre === undefined) {
+            try {
+              const mm = parseMetrics(data);
+              sp.genCumPre = Math.round(counterTotal(mm, 'vllm:generation_tokens_total'));
+              sp.genCumPost = 0;
+            } catch (e) {}
+          }
+          sp.cfgOk = sp.cfgOk === true ? true : false;
+          return;
+        }
+        sp.cfgOk = true;
+        // 更新在途表。样本时间戳 = 请求到达 epoch + 累计 decode 时长（引擎
+        // 真值，与抓取周期无关）：轮询被事件循环拖慢时样本时刻不会系统性
+        // 提前/滞后，滑窗分母（decode 增量）严格等于窗内真实 GPU 生成时长。
+        for (const [rid, g] of rg) {
+          let r = sp.reqs.get(rid);
+          if (!r) { r = { gen: 0, dec: 0, ttft: undefined, stale: 0, hist: [] }; sp.reqs.set(rid, r); }
+          if (g.dec !== null) r.dec = g.dec;
+          if (g.gen !== null) r.gen = g.gen;
+          if (g.ttft !== null && r.ttft === undefined) r.ttft = g.ttft;
+          r.stale = 0;
+          if (r.dec > 0) {
+            // 样本时刻按引擎真值折算成墙钟 ms（供与 nowMs 同域比较）
+            const sampleT = ((r.ttft !== undefined ? r.ttft : (now / 1000 - r.dec)) + r.dec) * 1000;
+            const lastS = r.hist.length ? r.hist[r.hist.length - 1] : null;
+            if (!lastS || sampleT - lastS.t >= 800) {
+              if (lastS && g.gen < r.lastGen) { r.hist = []; } // gauge 回退（重启/重采样）：清窗重建
+              r.hist.push({ t: sampleT, gen: g.gen !== null ? g.gen : r.gen, dec: r.dec });
+              if (r.hist.length > 10) r.hist.shift();
+            }
+            r.lastGen = g.gen !== null ? g.gen : r.gen;
+          }
+        }
+        // 消失 = 请求已完成（Prometheus gauge 撤除）。保留对象一个短 TTL：
+        // 响应 tee 首帧登记 rid 可能晚于最后一次 gauge 抓取，行需要凭 rid
+        // 找到对象读出最终 gen。超 3 轮未见 → 删除。
+        for (const [rid, r] of sp.reqs) {
+          r.stale++;
+          if (r.stale > 3) sp.reqs.delete(rid);
+        }
+  } catch (e) { /* ignore */ }
+}
+
+// 兜底抓取器：主 ticker 未覆盖该端口（>2.5s 没喂数据）时独立抓一次 /metrics。
+function sampleReqOutGauges(port) {
+  const sp = reqOutSamplerFor(port);
+  if (sp.busy) return;
+  const now = Date.now();
+  if (now - (sp.lastTickerFeedAt || 0) < 2500) return;
+  sp.busy = true;
+  const req = http.get(`http://${config.vllmHost}:${port}/metrics`, (proxyRes) => {
+    let data = '';
+    let aborted = false;
+    proxyRes.on('data', (c) => {
+      data += c;
+      if (data.length > 16 * 1024 * 1024) { aborted = true; try { proxyRes.destroy(); } catch (e) {} }
+    });
+    proxyRes.on('error', () => { sp.busy = false; });
+    proxyRes.on('end', () => {
+      sp.busy = false;
+      if (aborted) return;
+      processReqOutSample(port, data, Date.now());
+    });
+  });
+  req.on('error', () => { sp.busy = false; });
+  req.setTimeout(2500, () => { try { req.destroy(new Error('reqout timeout')); } catch (e) {} sp.busy = false; });
+}
+
+// 速度推导：给定某 rid 的采样对象 → { spd, gen, exact } 或 null。
+// 滑窗基线 = hist 中「距现在 ∈[2s,6s] 最老的样本」；末样本距现在 ≤2.5s；
+// 分母 = decode 时间增量（该请求 GPU 生成时长）。无合格窗口 → null（显示 --）。
+function reqOutSpeed(r, nowMs) {
+  if (!r || !Array.isArray(r.hist) || r.hist.length < 2) return null;
+  const last = r.hist[r.hist.length - 1];
+  if (!last || (nowMs - last.t) > 2500) return null;
+  let base = null;
+  for (let k = 0; k < r.hist.length - 1; k++) {
+    const age = nowMs - r.hist[k].t;
+    if (age < 2000) continue;
+    if (age <= 6000) { base = r.hist[k]; break; }
+    if (!base) base = r.hist[k];
+  }
+  if (!base) base = r.hist[0];
+  const dDec = last.dec - base.dec;
+  const dGen = last.gen - base.gen;
+  if (dDec < 0.8 || dGen <= 0) return null;
+  return { spd: dGen / dDec, gen: last.gen, win: dDec };
+}
+
+// 直方图驻留模式速度（实例无 req_id gauge 时的 v2 引擎真值回退）。
+// 输入 sampler：sp.genAvgWin = 在途请求平均 decode 驻留（保守下界，见
+// parseBucketHist 注释）；sp.thrWin = 实例 gen 短窗吞吐。
+// 速度 = thrWin / N（N=在途 decode 请求数），再按驻留修正排队行：
+// 返回 { spdPerDecodeReq, avgWin }；调用方只对 phase=decode 行发放。
+// 驻留 2s 内无新桶样本沿用（稀疏流量下保持稳定），>2s 过期 → undefined。
+function reqOutHistModeSpeed(sp, nowMs) {
+  if (!sp || sp.nEw === undefined) return null;
+  const thr = sp.thrEw !== undefined ? sp.thrEw : sp.thrWin;
+  if (thr === undefined) return null;
+  // nEw 过期（>4s 无桶样本）→ null：宁可回落 tee，不用陈旧并发数
+  if (sp.winLastAt && nowMs - sp.winLastAt > 4000) return null;
+  if (thr <= 0.5) return null;
+  return { n: Math.max(1, sp.nEw), thr };
+}
+
+// 顶栏/总量口径：实例 genHist 短窗速率（最近样本 ≤2.5s）
+function reqOutInstThroughput(sp, nowMs) {
+  if (!sp || sp.genHist.length < 2) return undefined;
+  const h = sp.genHist.slice(-4);
+  const b = h[h.length - 1];
+  if (!b || nowMs - b.t > 2500) return undefined;
+  const a = h[0];
+  const dt = (b.t - a.t) / 1000;
+  if (dt < 0.5) return undefined;
+  return Math.max(0, (b.g - a.g) / dt);
+}
+
+// 采样器回收：端口 60s 无任何访问（stats/ticker 都停了）→ 删除采样器，
+// 防实例下线后 Map 泄漏。
+setInterval(() => {
+  try {
+    const t = Date.now();
+    for (const [p, sp] of global.__reqOutSamplers) {
+      if (t - (sp.lastSeenAt || 0) > 60000) global.__reqOutSamplers.delete(p);
+    }
+  } catch (e) {}
+}, 30000).unref();
+
+function clientIp(req) {
+  try {
+    let a = (req.socket && req.socket.remoteAddress) || '';
+    a = a.replace(/^::ffff:/, '');
+    if (!a || a === '127.0.0.1' || a === '::1') return '—';
+    return a;
+  } catch (e) { return '—'; }
+}
+
+// 粗略估算请求的 prompt token 数（用于 SGLang 预填充进度条总量；vLLM 有引擎侧估算不用它）。
+// 中文 tokenizer 约 1 字≈1 token，英文约 4 字符≈1 token；中英混合取 1 字符≈0.9 token 的
+// 粗略值即可（前端标"(估)"，仅作进度参考）。
+function estimatePromptTokens(b) {
+  if (!b || !Array.isArray(b.messages)) return 0;
+  let chars = 0;
+  for (const m of b.messages) {
+    const c = m && m.content;
+    if (typeof c === 'string') chars += c.length;
+    else if (Array.isArray(c)) for (const part of c) if (part && typeof part.text === 'string') chars += part.text.length;
+  }
+  return Math.max(1, Math.round(chars * 0.9));
+}
+
+// 异步用 sglang 的 /v1/messages/count_tokens 精确计算请求的 prompt token，
+// 更新 live.promptTokens（预填充进度条总量用精确值而非字符估算）。
+// 不阻塞转发：请求先照常发出，token 数异步回来覆盖估算值；失败/超时保持估算兜底。
+function refreshPromptTokens(live, body, host, port) {
+  try {
+    if (!live || !body || !Array.isArray(body.messages) || !host) return;
+    const payload = JSON.stringify({ model: body.model, messages: body.messages });
+    const req = http.request({
+      host, port: port || 8001, path: '/v1/messages/count_tokens', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      timeout: 5000,
+    }, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(data);
+          const n = Math.round(j.input_tokens || 0);
+          if (n > 0) { live.promptTokens = n; live.promptTokensExact = true; }
+        } catch (e) { /* 保持估算兜底 */ }
+      });
+    });
+    req.on('error', () => { /* 保持估算兜底 */ });
+    req.on('timeout', () => { try { req.destroy(); } catch (e) {} });
+    req.end(payload);
+  } catch (e) { /* ignore */ }
+}
+
+// ====== App-layer chat history trimming（prefix-cache 优化） ======
+// 生产多轮聊天把全文历史（含陈旧轮次）每次全量发给 vLLM，单请求 prompt 可达 170K+ token，
+// 一个请求就吃掉 KV 池的 60%+，多会话互斥导致 LRU 逐出、跨轮命中率 ≈0。
+// 裁剪策略（冻结前缀 + 滑动尾部）：
+//   1) 全部 system 消息 + 最早的非 system 消息（最长 KEEP_OLD_CHARS 字符）＝【冻结前缀】；
+//      会话最早的内容永不变化 → 每轮请求 token[0..] 与该段恒定一致，1664-token 对齐稳定命中；
+//   2) 固定文本占位消息插在冻结段之后（内容恒定 → 占位 token 稳定）；
+//   3) 最新的非 system 消息（最长 KEEP_TAIL_CHARS 字符）＝【滑动尾部】，每轮被新消息替换。
+// 仅当总量 > CAP_MAX_CHARS 才裁剪（低于阈值 byte 级原样转发，零重写开销）。
+// 代价分析：被裁掉的中段历史只影响尾部（尾部在缓存里本来就是每轮新写的冷段），
+// 冻结前缀每轮必命中 → 命中率 ≈ KEEP_OLD/(KEEP_OLD+KEEP_TAIL)（默认 ≈ 66%）。
+// 参数（环境变量，单位＝字符；中文≈1 char/token，英文≈4-5 char/token；生产 monster 单请求 ~185K token ≈ 205K chars）：
+//   VLLM_CHAT_TRIM=0 关闭；
+//   VLLM_CHAT_CAP_MAX_CHARS（默认 80000≈63K token，低于此不裁）；
+//   VLLM_CHAT_KEEP_OLD_CHARS（默认 40000≈31K token 冻结前缀）；
+//   VLLM_CHAT_KEEP_TAIL_CHARS（默认 20000≈16K token 滑动尾部）。
+// 裁剪后单请求 ≈ 47K token，KV 池（≈500K token）可容纳 10+ 个会话，LRU 不再互相逐出。
+const CHAT_TRIM_PLACEHOLDER = '【较早对话已省略：为节省上下文，仅保留最早对话与最近对话内容。】';
+
+function chatTrimEnabled() {
+  const v = process.env.VLLM_CHAT_TRIM;
+  if (v === undefined || v === null || v === '') return true;
+  return !/^(0|false|off|no)$/i.test(String(v));
+}
+
+function chatTrimCapMaxChars() {
+  const n = parseInt(process.env.VLLM_CHAT_CAP_MAX_CHARS || '80000', 10);
+  return (n >= 2000 && n <= 2000000) ? n : 80000;
+}
+
+function chatTrimKeepOldChars() {
+  const n = parseInt(process.env.VLLM_CHAT_KEEP_OLD_CHARS || '40000', 10);
+  return (n >= 1000 && n <= 1000000) ? n : 40000;
+}
+
+function chatTrimKeepTailChars() {
+  const n = parseInt(process.env.VLLM_CHAT_KEEP_TAIL_CHARS || '20000', 10);
+  return (n >= 1000 && n <= 1000000) ? n : 20000;
+}
+
+// 消息内容字符数（兼容 content 字符串与多模态 parts 的 text 字段）
+function msgChars(m) {
+  const c = m && m.content;
+  if (typeof c === 'string') return c.length;
+  if (Array.isArray(c)) {
+    let n = 0;
+    for (const part of c) if (part && typeof part.text === 'string') n += part.text.length;
+    return n;
+  }
+  return 0;
+}
+
+// 从头取最长前缀，使累计字符 ≤ maxChars；至少返回 1 条（保证不产生空段）
+function takeMsgsByChars(msgs, maxChars) {
+  const out = [];
+  let chars = 0;
+  for (const m of msgs) {
+    const c = msgChars(m);
+    if (out.length > 0 && chars + c > maxChars) break;
+    out.push(m);
+    chars += c;
+  }
+  return out;
+}
+
+// 返回裁剪统计；未发生裁剪返回 null（此时 body 原样转发，无任何重写开销）
+function trimChatBody(body) {
+  if (!body || !Array.isArray(body.messages) || body.messages.length === 0) return null;
+  const capMax = chatTrimCapMaxChars();
+  const msgs = body.messages;
+  const beforeChars = msgs.reduce((s, m) => s + msgChars(m), 0);
+  if (beforeChars <= capMax) return null; // 低于阈值：原样转发
+  const stats = trimChatMessages(body, capMax, beforeChars);
+  if (stats) return stats;
+  // 消息级裁不掉（少量巨型消息，dropped<=0）：降级为消息内容内截断（Design I+）
+  if (!chatTrimContentEnabled()) return null;
+  const msgMax = chatTrimMsgMaxChars();
+  let contentTruncated = 0;
+  for (const m of msgs) {
+    if (msgChars(m) > msgMax && truncateMsgContent(m, msgMax)) contentTruncated++;
+  }
+  if (contentTruncated === 0) return null; // 没有可截断的巨型消息，原样转发
+  const afterChars = msgs.reduce((s, m) => s + msgChars(m), 0);
+  const stats2 = trimChatMessages(body, capMax, afterChars);
+  if (stats2) return stats2;
+  return { before: msgs.length, after: msgs.length, dropped: 0, contentTruncated, beforeChars, afterChars };
+}
+
+// 消息级裁剪：冻结前缀(system+最早 non-system) + 固定占位符 + 滑动尾部；裁不掉返回 null
+function trimChatMessages(body, capMax, beforeChars) {
+  const keepOld = chatTrimKeepOldChars();
+  const keepTail = chatTrimKeepTailChars();
+  const msgs = body.messages;
+  const systemMsgs = msgs.filter(m => m && m.role === 'system');
+  const nonSystem = msgs.filter(m => !m || m.role !== 'system');
+  if (nonSystem.length === 0) return null;
+  const oldPart = takeMsgsByChars(nonSystem, keepOld);
+  const tailPart = takeMsgsByChars(nonSystem.slice(oldPart.length).reverse(), keepTail).reverse();
+  const trimmed = systemMsgs.concat(oldPart, [{ role: 'user', content: CHAT_TRIM_PLACEHOLDER }], tailPart);
+  const dropped = msgs.length - trimmed.length;
+  if (dropped <= 0) return null; // 裁不掉：交给上层（内容内截断）或原样转发
+  body.messages = trimmed;
+  return {
+    before: msgs.length,
+    after: trimmed.length,
+    dropped,
+    beforeChars,
+    afterChars: trimmed.reduce((s, m) => s + msgChars(m), 0),
+  };
+}
+
+const CHAT_TRIM_CONTENT_PLACEHOLDER = '【中间内容已省略：仅保留消息开头与结尾。】';
+
+function chatTrimContentEnabled() {
+  const v = process.env.VLLM_CHAT_TRIM_CONTENT;
+  if (v === undefined || v === null || v === '') return true;
+  return !/^(0|false|off|no)$/i.test(String(v));
+}
+
+function chatTrimMsgMaxChars() {
+  const n = parseInt(process.env.VLLM_CHAT_KEEP_MSG_CHARS || '40000', 10);
+  return (n >= 2000 && n <= 1000000) ? n : 40000;
+}
+
+// 单条消息内容原地截为 head+占位符+tail（总长 ≤ maxChars）；返回是否发生截断
+function truncateMsgContent(m, maxChars) {
+  const head = Math.floor(maxChars * 2 / 3);
+  const tail = maxChars - head - CHAT_TRIM_CONTENT_PLACEHOLDER.length;
+  if (!(tail >= 100 && head >= 100)) return false;
+  const c = m && m.content;
+  if (typeof c === 'string') {
+    if (c.length <= maxChars) return false;
+    m.content = c.slice(0, head) + CHAT_TRIM_CONTENT_PLACEHOLDER + c.slice(c.length - tail);
+    return true;
+  }
+  if (Array.isArray(c)) {
+    let changed = false;
+    const parts = c.map((p) => {
+      if (p && typeof p.text === 'string' && p.text.length > maxChars) {
+        changed = true;
+        return { ...p, text: p.text.slice(0, head) + CHAT_TRIM_CONTENT_PLACEHOLDER + p.text.slice(p.text.length - tail) };
+      }
+      return p;
+    });
+    if (changed) m.content = parts;
+    return changed;
+  }
+  return false;
+}
+
+function startLiveReq(model, ip, stream, promptTokens, clientReqId) {  const ls = global.__liveStreams;
+  const entry = {
+    id: 'LIVE-' + (++ls.seq),
+    model: model || '—',
+    ip: ip || '—',
+    stream: !!stream,
+    startedAt: Date.now(),
+    tokens: 0,
+    text: '',
+    done: false,
+    doneAt: 0,
+    finish: '',
+    promptTokens: promptTokens || 0,  // 估算的 prompt token（SGLang 预填充进度条总量）
+    tk: [],  // 逐秒采样 [{t, n=累计 token 估算}]：并发行「每行独立瞬时速度」数据源
+    clientReqId: clientReqId || null, // 代理注入的 X-Client-Req-Id（v2 行↔rid 精确认领桥）
+    rid: null,                        // tee 首帧解析出的引擎真实 rid（chatcmpl-xxx）
+  };
+  ls.map.set(entry.id, entry);
+  return entry;
+}
+
+// 一段增量文本的 token 估算：CJK 字符≈0.7 tok/字，其余≈0.25 tok/字符
+//（英文/代码约 4 字符/token）。09-16 实测校准：MTP 引擎一步一 delta 行携带
+// 多个已接受 token（239 行 SSE = 600 真实 tokens），旧版按「行数」计数（每步
+// +1）使齐步 decode 的并发各行数值完全相同（行速=步速），且单位虚低 ~2.5×。
+function estimatePieceTokens(s) {
+  let cjk = 0, other = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if ((c >= 0x3040 && c <= 0x9fff) || (c >= 0xac00 && c <= 0xd7af) ||
+        (c >= 0xf900 && c <= 0xfaff) || (c >= 0xff00 && c <= 0xffef)) cjk++;
+    else other++;
+  }
+  return cjk * 0.7 + other * 0.25;
+}
+
+function appendLiveText(live, s) {
+  if (!s) return;
+  if (!live.firstTokAt) live.firstTokAt = Date.now(); // 首 token 实时时刻（SGLang prefill 时长 = firstTokAt − startedAt，对齐 vLLM ttft 口径）
+  live.tokens += estimatePieceTokens(s); // 09-16：按每行文本估 token 数（旧 +1/行 使并发各行速度齐步同值）
+  live.text += s;
+  if (live.text.length > LIVE_TEXT_MAX) live.text = live.text.slice(-LIVE_TEXT_MAX);
+}
+
+function finishLiveReq(live, finish) {
+  if (!live || live.done) return;
+  live.done = true;
+  live.doneAt = Date.now();
+  if (finish) live.finish = String(finish);
+}
+
+function liveStreamsSnapshot() {
+  const now = Date.now();
+  const ls = global.__liveStreams;
+  const out = [];
+  for (const [id, e] of ls.map) {
+    if (e.done && now - e.doneAt > LIVE_DONE_KEEP_MS) { ls.map.delete(id); continue; }
+    out.push({
+      id: e.id,
+      model: e.model,
+      ip: e.ip,
+      stream: e.stream,
+      started_at: e.startedAt,
+      elapsed_s: Math.round(((e.done ? e.doneAt : now) - e.startedAt) / 1000),
+      tokens: e.tokens,
+      done: e.done,
+      finish: e.finish,
+      text: e.text.length > 600 ? '…' + e.text.slice(-600) : e.text,
+    });
+  }
+  out.sort((a, b) => a.started_at - b.started_at);
+  return out;
+}
+
+// Sweep stale entries (finished long ago / hung in-flight > 30 min)
+setInterval(() => {
+  const now = Date.now();
+  const ls = global.__liveStreams;
+  for (const [id, e] of ls.map) {
+    if ((e.done && now - e.doneAt > LIVE_DONE_KEEP_MS) ||
+        (!e.done && now - e.startedAt > 30 * 60 * 1000)) {
+      ls.map.delete(id);
+    }
+  }
+}, 5000).unref();
+
+// 逐秒采样 tee 条目的累计输出计数（滚动 ≤6 个样本）：并发请求每行独立
+// 瞬时速度（computeConcurrencyDetails 里 REQ↔LIVE 绑定）的唯一数据源。
+// 条目完成后清掉样本数组（行也随之消失，无绑定需求）。
+setInterval(() => {
+  const now = Date.now();
+  const ls = global.__liveStreams;
+  for (const [, e] of ls.map) {
+    if (e.done) { if (e.tk) e.tk = null; continue; }
+    if (!Array.isArray(e.tk)) e.tk = [];
+    const last = e.tk[e.tk.length - 1];
+    if (last && now - last.t < 500) continue; // 防同秒重复采样
+    e.tk.push({ t: now, n: e.tokens });
+    if (e.tk.length > 6) e.tk.shift();
+  }
+}, 1000).unref();
+
+// Tee an SSE (streaming) response: forward raw bytes, parse delta text.
+function teeSseStream(proxyRes, res, live, taskId) {
+  let buf = '';
+  proxyRes.on('data', (chunk) => {
+    res.write(chunk); // transparent forward — client sees the original stream
+    buf += chunk.toString('utf8');
+    let nl;
+    while ((nl = buf.indexOf('\n')) !== -1) {
+      let line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      line = line.trim(); // tolerate \r\n
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (!payload) continue;
+      if (payload === '[DONE]') { finishLiveReq(live, live.finish || 'stop'); continue; }
+      try {
+        const obj = JSON.parse(payload);
+        if (taskId && obj.id) linkRidTaskId(obj.id, taskId);
+        if (obj.id && live && live.port) linkRidPort(obj.id, live.port);
+        // v2 精确认领桥：首帧 rid（= vLLM req_id）→ clientReqId 登记，
+        // REQ tracker 的 fill 行凭 taskId 反查 rid 直查引擎每请求序列。
+        if (obj.id && live && live.clientReqId) { live.rid = obj.id; linkClientReqRid(live.clientReqId, obj.id); }
+        if (obj.error) { finishLiveReq(live, 'error'); continue; }
+        const ch = obj.choices && obj.choices[0];
+        if (!ch) continue;
+        const d = ch.delta || {};
+        // this fork emits thinking text as delta.reasoning; upstream uses
+        // delta.reasoning_content — accept both
+        const piece = (d.content || '') + (d.reasoning_content || d.reasoning || '');
+        if (piece) appendLiveText(live, piece);
+        if (ch.finish_reason) live.finish = String(ch.finish_reason);
+      } catch (e) { /* partial/garbled line — skip */ }
+    }
+  });
+  proxyRes.on('end', () => {
+    if (!live.done) finishLiveReq(live, live.finish || 'done');
+    res.end();
+  });
+  proxyRes.on('error', () => {
+    if (!live.done) finishLiveReq(live, 'error');
+    try { res.end(); } catch (e) {}
+  });
+}
+
+// Tee a non-streaming JSON response: forward bytes, capture final text.
+function teeJsonStream(proxyRes, res, live, taskId) {
+  let buf = '';
+  let size = 0;
+  proxyRes.on('data', (chunk) => {
+    res.write(chunk);
+    size += chunk.length;
+    if (size < 8 * 1024 * 1024) buf += chunk.toString('utf8');
+  });
+  proxyRes.on('end', () => {
+    res.end();
+    if (buf) {
+      try {
+        const obj = JSON.parse(buf);
+        if (taskId && obj.id) linkRidTaskId(obj.id, taskId);
+        if (obj.id && live && live.port) linkRidPort(obj.id, live.port);
+        if (obj.id && live && live.clientReqId) { live.rid = obj.id; linkClientReqRid(live.clientReqId, obj.id); }
+        const ch = obj.choices && obj.choices[0];
+        if (ch) {
+          const piece = (ch.message && ch.message.content) || ch.text || '';
+          if (piece) {
+            live.text = piece.length > LIVE_TEXT_MAX ? piece.slice(-LIVE_TEXT_MAX) : piece;
+            live.tokens = Math.max(live.tokens, Math.round(estimatePieceTokens(piece))); // 非流式：整段按文本估 token（09-16 与流式口径统一）
+          }
+          if (ch.finish_reason) live.finish = String(ch.finish_reason);
+        }
+      } catch (e) { /* not JSON — ignore */ }
+    }
+    if (!live.done) finishLiveReq(live, live.finish || 'done');
+  });
+  proxyRes.on('error', () => {
+    if (!live.done) finishLiveReq(live, 'error');
+    try { res.end(); } catch (e) {}
+  });
+}
+
+// rid (vLLM chatcmpl id) → 控制台任务号（T 号）。代理 tee 响应流时记录，
+// 供「最近完成请求」表格把每条记录关联到它的任务号。LRU 上限防堆积。
+global.__ridTaskId = global.__ridTaskId || new Map();
+function linkRidTaskId(rid, taskId) {
+  if (!rid || !taskId) return;
+  const m = global.__ridTaskId;
+  if (m.size >= 5000) { const k = m.keys().next().value; if (k !== undefined) m.delete(k); }
+  if (!m.has(rid)) m.set(rid, taskId); // 首写生效：rid 复用（概率可忽略）不覆盖既有认领
+}
+// 任务号 → clientReqId（行认领后凭 crid 查引擎 rid 的桥）。有界 FIFO。
+if (!global.__taskCrid) global.__taskCrid = new Map();
+function linkTaskCrid(taskId, crid) {
+  if (!taskId || !crid) return;
+  const m = global.__taskCrid;
+  if (m.size >= 5000) { const k = m.keys().next().value; if (k !== undefined) m.delete(k); }
+  if (!m.has(taskId)) m.set(taskId, crid);
+}
+// rid（响应 id）→ 实际转发端口（8889 代理 tee 层写入）。SGLang 多实例 metrics 共用同一
+// 日志文件且记录不带 port，rid→port→gpu 是最近请求表唯一精确归因（vLLM 走 live-prefill rid→pid）
+global.__ridPortMap = global.__ridPortMap || new Map();
+function linkRidPort(rid, port) {
+  if (!rid || !port) return;
+  const m = global.__ridPortMap;
+  if (m.size >= 20000) { const k = m.keys().next().value; if (k !== undefined) m.delete(k); }
+  m.set(rid, port);
+}
+// port → 最近观察到的 GPU（stats 聚合实例时刷新；实例停止后该端口的记录仍可回溯归因）
+global.__portGpuSeen = global.__portGpuSeen || new Map();
+function rememberPortGpu(instList) {
+  try {
+    for (const i of instList || []) {
+      if (i && i.port != null && i.gpu != null && i.gpu !== '—') global.__portGpuSeen.set(i.port, i.gpu);
+    }
+  } catch (e) {}
+}
+
+// ====== Core Proxy ======
+function proxyToVllm(req, res, targetPath, targetPort, bufferedBody) {
+  const base = targetPort ? `http://${config.vllmHost}:${targetPort}` : vllmBaseUrl;
+  const targetUrl = new URL(targetPath, base);
+  const options = {
+    hostname: targetUrl.hostname,
+    port: targetUrl.port,
+    path: targetUrl.pathname + targetUrl.search,
+    method: req.method,
+    headers: { ...req.headers },
+    timeout: 300000,
+  };
+  delete options.headers['host'];
+  delete options.headers['content-length'];
+
+  // Live-stream capture for generation endpoints (streaming & non-streaming)
+  let live = null;
+  let taskId = null;
+  const fwdPort = parseInt(options.port) || config.vllmPort;
+  if (req.method === 'POST' && bufferedBody &&
+      LIVE_PATH_RE.test(targetPath.replace(/\?.*$/, ''))) {
+    try {
+      const b = JSON.parse(bufferedBody);
+      live = startLiveReq(b.model, clientIp(req), !!b.stream, estimatePromptTokens(b),
+        (b.headers && b.headers['X-Client-Req-Id']) || (b.headers && b.headers['x-client-req-id']) || null);
+      // 异步用后端 /v1/messages/count_tokens 精确计算 prompt token（预填充进度总量用精确值）
+      refreshPromptTokens(live, b, options.hostname, fwdPort);
+    } catch (e) { live = null; }
+    if (live) live.port = fwdPort; // rid→port 精确归因用（SGLang 多实例共用 metrics 日志，记录不带 port）
+    // 分配控制台任务号（该请求在目标实例上 birth 时被 REQ tracker 认领）
+    taskId = nextTaskId();
+    taskForwardRegister(fwdPort, taskId, live ? live.clientReqId : null);
+  }
+
+  const proxyReq = http.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    if (live && live.stream) teeSseStream(proxyRes, res, live, taskId);
+    else if (live) teeJsonStream(proxyRes, res, live, taskId);
+    else proxyRes.pipe(res);
+    // 响应结束 → 消费任务记录。快请求可能在两次 metrics 轮询之间跑完，
+    // fill 循环来不及认领，不消费则记录滞留排队列表最多 120s（T35 类幽灵）。
+    proxyRes.on('end', () => { if (taskId) taskForwardConsume(fwdPort, taskId); });
+  });
+
+  proxyReq.on('error', (err) => {
+    if (live) finishLiveReq(live, 'proxy-error');
+    if (err.code !== 'ECONNRESET') {
+      console.error(`Proxy error: ${err.message}`);
+    }
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Bad Gateway', message: err.message }));
+    } else {
+      // 上游在响应中途断开（SSE 流中断等）：客户端还在等数据，主动掐断连接，
+      // 否则浏览器侧 fetch 会一直挂着直到其自身超时。
+      try { res.destroy(); } catch (e) {}
+    }
+  });
+
+  // options.timeout 只设置 socket 超时；不监听 timeout 事件的话，上游卡死
+  // 5 分钟不响应时 socket 不会自动销毁，请求永久悬挂。超时后 destroy 触发 error 走上面分支。
+  proxyReq.on('timeout', () => { try { proxyReq.destroy(); } catch (e) {} });
+
+  res.on('close', () => {
+    if (live && !live.done) {
+      finishLiveReq(live, live.finish || 'client-closed');
+      try { proxyReq.destroy(); } catch (e) {}
+    }
+    if (taskId) taskForwardConsume(fwdPort, taskId); // 客户端断开/异常收尾兜底
+  });
+
+  if (bufferedBody !== undefined) {
+    proxyReq.end(bufferedBody);
+  } else if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+    req.pipe(proxyReq);
+  } else {
+    proxyReq.end();
+  }
+}
+
+// ====== PD 两步转发 ======
+// 辅助：向指定端口发 JSON POST，收集完整响应（非流式）
+function httpJsonPost(host, port, path, bodyObj, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(bodyObj);
+    const req = http.request({
+      host, port, path, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      timeout: timeoutMs || 300000,
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { try { req.destroy(new Error('timeout')); } catch (e) {} });
+    req.end(payload);
+  });
+}
+
+// PD 两步转发入口：客户端 POST → STEP1 prefill（拿 token_ids + kv 参数）→ STEP2 decode（原样透传）
+function proxyPdToVllm(req, res, targetPath, pd, bufferedBody, model) {
+  const host = config.vllmHost;
+  const pathOnly = targetPath.replace(/\?.*$/, '');
+  const isGenPath = LIVE_PATH_RE.test(pathOnly);
+  let body;
+  try { body = JSON.parse(bufferedBody); } catch (e) {
+    // body 解析失败：退回普通代理（打 decode 端口）
+    return proxyToVllm(req, res, targetPath, pd.decode, bufferedBody);
+  }
+  const clientStream = !!body.stream;
+  let live = null;
+  let taskId = null;
+  if (isGenPath) {
+    try {
+      live = startLiveReq(model, clientIp(req), clientStream, estimatePromptTokens(body),
+        (body.headers && (body.headers['X-Client-Req-Id'] || body.headers['x-client-req-id'])) || null);
+      refreshPromptTokens(live, body, host, pd.prefill); // 失败自动回落估算
+    } catch (e) { live = null; }
+    if (live) live.port = pd.decode; // PD 模式响应出自 decode 腿，GPU 归因记 decode 卡
+    // prefill 腿注册任务号 → 两卡显示同 T 号；decode 腿延迟到 STEP2 真正转发时
+    // 才注册（prefill 完成后），避免任务还没到 GPU1 就在那显示「排队」
+    taskId = nextTaskId();
+    taskForwardRegister(pd.prefill, taskId, live ? live.clientReqId : null);
+  }
+  const fail = (status, msg) => {
+    if (live) finishLiveReq(live, 'pd-error');
+    if (taskId) { taskForwardConsume(pd.prefill, taskId); taskForwardConsume(pd.decode, taskId); } // 失败兜底：双腿记录都清
+    if (res.headersSent) { try { res.destroy(); } catch (e) {} return; }
+    try {
+      res.writeHead(status || 502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'PD proxy error', message: String(msg || '') }));
+    } catch (e) {}
+  };
+
+  // STEP1: prefill 实例只做 prefill（强制非流式，注入 PD 参数）
+  const prefillBody = {
+    ...body,
+    stream: false,
+    max_tokens: Math.max(1, body.max_tokens || 1),
+    return_token_ids: true,
+    kv_transfer_params: { do_remote_decode: true },
+  };
+  // 流式专属字段在非流式 prefill 请求里会被 vLLM 拒绝（如 stream_options）
+  delete prefillBody.stream_options;
+  httpJsonPost(host, pd.prefill, pathOnly, prefillBody)
+    .then((r1) => {
+      if (r1.status !== 200) return fail(r1.status, (r1.body || '').slice(0, 500));
+      let j1;
+      try { j1 = JSON.parse(r1.body); } catch (e) { return fail(502, 'bad prefill response'); }
+      const ids = j1.prompt_token_ids;
+      const kvp = j1.kv_transfer_params || {};
+      if (!Array.isArray(ids) || !kvp.remote_engine_id) {
+        return fail(502, 'prefill response missing prompt_token_ids/kv_transfer_params');
+      }
+      // STEP2: decode 实例带透传参数直接生成，响应原样透传（含 SSE 流）
+      const decodeBody = {
+        ...body,
+        stream: clientStream,
+        kv_transfer_params: { ...kvp, do_remote_prefill: true, prompt_token_ids: ids },
+      };
+      const targetUrl = new URL(targetPath, `http://${host}:${pd.decode}`);
+      const options = {
+        hostname: targetUrl.hostname,
+        port: targetUrl.port,
+        path: targetUrl.pathname + targetUrl.search,
+        method: 'POST',
+        headers: { ...req.headers },
+        timeout: 300000,
+      };
+      delete options.headers['host'];
+      delete options.headers['content-length'];
+      const proxyReq = http.request(options, (proxyRes) => {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        if (live && live.stream) teeSseStream(proxyRes, res, live, taskId);
+        else if (live) teeJsonStream(proxyRes, res, live, taskId);
+        else proxyRes.pipe(res);
+        // decode 腿响应结束 → 消费 decode 记录（快请求 fill 漏认领时防滞留）
+        proxyRes.on('end', () => { if (taskId) taskForwardConsume(pd.decode, taskId); });
+      });
+      proxyReq.on('error', (err) => {
+        if (live) finishLiveReq(live, 'proxy-error');
+        if (!res.headersSent) {
+          try { res.writeHead(502, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Bad Gateway', message: err.message })); } catch (e) {}
+        } else {
+          try { res.destroy(); } catch (e) {}
+        }
+        if (taskId) { taskForwardConsume(pd.prefill, taskId); taskForwardConsume(pd.decode, taskId); }
+      });
+      proxyReq.on('timeout', () => { try { proxyReq.destroy(); } catch (e) {} });
+      res.on('close', () => {
+        if (live && !live.done) { finishLiveReq(live, live.finish || 'client-closed'); try { proxyReq.destroy(); } catch (e) {} }
+        if (taskId) taskForwardConsume(pd.decode, taskId); // 客户端断开兜底
+      });
+      if (taskId) {
+        taskForwardRegister(pd.decode, taskId, live ? live.clientReqId : null); // decode 腿：STEP2 真正转发时才注册
+        taskForwardConsume(pd.prefill, taskId);  // prefill 腿已消费 → 任务从 GPU0 排队消失
+      }
+      proxyReq.end(JSON.stringify(decodeBody));
+    })
+    .catch((err) => fail(502, err && err.message));
+}
+
+// ====== 端口 → 真实模型文件路径（进程 cmdline 提取）======
+// /v1/models 的 root 字段对 SGLang 是 served-model-name 而非文件路径，
+// 仪表盘「模型路径」卡片需要真实 checkpoint 路径。这里从运行中实例的
+// cmdline（vllm 取 serve 后第一参，sglang 取 --model-path）按端口查真实路径。
+// listVllmInstances/listSglangInstances 各自带 3s 缓存，调用廉价。
+function modelPathForPort(port) {
+  try {
+    for (const v of listVllmInstances()) {
+      if (v.port === port && v.modelPath) return v.modelPath;
+    }
+    for (const s of listSglangInstances()) {
+      if (s.port === port && s.modelPath) return s.modelPath;
+    }
+  } catch (e) {}
+  return null;
+}
+
+// ====== Merged /v1/models across all vLLM backends ======
+function handleMergedModels(res) {
+  const ports = Array.from(new Set([config.vllmPort, ...Object.values(VLLM_MODEL_PORTS)]));
+  let pending = ports.length;
+  const all = [];
+  let finished = false;
+  const finish = () => {
+    pending--;
+    if (pending > 0) return;
+    if (finished) return; // proxyRes 'end' 与 'error' 可能先后触发，防止重复收尾
+    finished = true;
+    if (res.writableEnded) return;
+    // 模型名别名条目（2026-09-14）：客户端刷新模型列表时也能看到注册别名
+    // （如 qwen3.8-flash-next-nvfp4）；请求侧会改写成真实 served 名再转发。
+    const aliasItems = [];
+    for (const a of Object.keys(MODEL_ALIASES)) {
+      if (all.some(x => x.id === a)) continue;
+      const src = all.find(x => x.id === MODEL_ALIASES[a]);
+      if (src) aliasItems.push(Object.assign({}, src, { id: a, alias_of: MODEL_ALIASES[a] }));
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ object: 'list', data: all.concat(aliasItems) }));
+  };
+  ports.forEach((p) => {
+    // 探测端口必须带超时：若该端口被 vLLM EngineCore 的内部 socket 占用（非 HTTP），
+    // http.get 会连上但永远等不到响应，导致整个请求挂起。
+    const req = http.get(`http://${config.vllmHost}:${p}/v1/models`, (proxyRes) => {
+      let data = '';
+      proxyRes.on('data', (c) => { data += c; });
+      // 上游在响应中途断开：不监听会让 unhandled 'error' 打崩整个进程
+      proxyRes.on('error', () => finish());
+      proxyRes.on('end', () => {
+        try {
+          const j = JSON.parse(data);
+          // 真实模型文件路径（vllm/sglang 进程 cmdline）。SGLang 的 /v1/models
+          // root 字段填的是 served-model-name（如 qwen3.8-27b-0）而非文件路径，
+          // 仪表盘「模型路径」据此补全为真实 checkpoint 路径。
+          const realPath = modelPathForPort(p);
+          (j.data || []).forEach((m) => {
+            const item = { ...m, port: p };
+            if (realPath) item.root = realPath;
+            all.push(item);
+          });
+        } catch (e) {}
+        finish();
+      });
+    });
+    // destroy() 必须带错误参数：不带参数时不会 emit 'error'，下面的
+    // req.on('error') 收尾逻辑永不执行 → 该端口的 pending 永不归零 → 整个
+    // /v1/models 请求永久挂起（目标端口被 EngineCore 内部 socket 等非 HTTP
+    // 进程占用时正是这种情况，实测挂起 >12s）。
+    req.setTimeout(3000, () => req.destroy(new Error('probe timeout')));
+    req.on('error', () => finish());
+  });
+}
+
+// ====== Running model instances (multi-backend: vllm / sglang) ======
+function findVllmPidByPort(port) {
+  try {
+    const { execSync } = require('child_process');
+    // 关键修复：-sTCP:LISTEN 只取「监听该端口」的服务进程，并排除控制台自身。
+    // 否则 lsof 会先命中控制台到该端口的 keep-alive 客户端 socket（本机进程），
+    // 导致实例 PID 显示为控制台自身、GPU 显示 '?'、停止也停错对象。
+    const out = execSync(`lsof -ti:${port} -sTCP:LISTEN 2>/dev/null || true`, { encoding: 'utf8', timeout: 3000 }).trim();
+    const first = out.split('\n').find(l => parseInt(l.trim()) !== process.pid);
+    if (first) return parseInt(first);
+    // 兜底：chroot 内引擎进程属 root，ll 用户的 lsof 看不到其监听端口，
+    // 改按 /proc/<pid>/cmdline 的 --port 匹配定位（cmdline 宿主可见）。
+    const pg = execSync('pgrep -f "[v]llm.entrypoints" 2>/dev/null || true', { encoding: 'utf8', timeout: 3000 }).trim();
+    for (const pid of pg.split('\n').filter(Boolean)) {
+      try {
+        const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ');
+        if (cmd.includes(`--port ${port}`)) return parseInt(pid);
+        // 09-19：docker 容器进程按「映射后宿主端口」匹配（容器内 --port 8000 → 宿主 18420）
+        const pm2 = cmd.match(/--port\s+(\d+)/);
+        if (pm2 && mappedHostPort(parseInt(pid), parseInt(pm2[1])) === port) return parseInt(pid);
+      } catch (e) {}
+    }
+    return null;
+  } catch (e) { return null; }
+}
+function gpuIndexForPid(pid) {
+  if (!pid) return null;
+  try {
+    const env = fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
+    const v = env.find(e => e.startsWith('CUDA_VISIBLE_DEVICES='));
+    return v ? v.split('=')[1] : null;
+  } catch (e) { return null; }
+}
+function checkGpuConflict(gpuId, gpuCount, startPort) {
+  // 检查请求的 GPU 区间 [gpuId, gpuId+gpuCount) 是否已被其他运行中实例占用
+  // 返回冲突信息 {port, gpuId, gpuCount, runtime, model} 或 null
+  const requested = [];
+  for (let i = 0; i < gpuCount; i++) requested.push(gpuId + i);
+  for (const [port, inst] of global.__GPU_INSTANCES) {
+    if (port === startPort) continue;
+    const occupied = [];
+    for (let i = 0; i < inst.gpuCount; i++) occupied.push(inst.gpuId + i);
+    for (const g of requested) {
+      if (occupied.includes(g)) return inst;
+    }
+  }
+  return null;
+}
+function getVllmInstances(ports, callback) {
+  let pending = ports.length;
+  const instances = [];
+  let finished = false;
+  const done = () => {
+    pending--;
+    if (pending > 0) return;
+    if (finished) return; // 'end' 与 'error' 可能先后触发，防止 callback 被调用两次
+    finished = true;
+    callback(instances);
+  };
+  ports.forEach((p) => {
+    // 同 handleMergedModels：探测必须带超时，防止 EngineCore 内部 socket 占端口时永久挂起
+    const req = http.get(`http://${config.vllmHost}:${p}/v1/models`, (proxyRes) => {
+      let data = '';
+      proxyRes.on('data', (c) => { data += c; });
+      proxyRes.on('error', () => done());
+      proxyRes.on('end', () => {
+        try {
+          const j = JSON.parse(data);
+          if (j.data && j.data.length) {
+            const pid = findVllmPidByPort(p);
+            instances.push({
+              port: p,
+              model: j.data[0].id,
+              pid,
+              gpu: gpuIndexForPid(pid),
+              runtime: detectRuntimeForPid(pid) || 'unknown',
+              running: true,
+            });
+          }
+        } catch (e) {}
+        done();
+      });
+    });
+    req.setTimeout(3000, () => req.destroy(new Error('probe timeout')));
+    req.on('error', () => done());
+  });
+}
+function portInUse(port) {
+  try {
+    const { execSync } = require('child_process');
+    return !!execSync(`lsof -ti:${port} 2>/dev/null || true`, { encoding: 'utf8', timeout: 3000 }).trim();
+  } catch (e) { return false; }
+}
+
+// ====== GPU Info ======
+function getGpuInfo(callback) {
+  let processes = [];
+  let gpuInfo = { utilization: 0, total: 0, used: 0, power: 0, temperature: 0 };
+  let done = 0;
+  let fired = false;
+
+  function checkDone() {
+    if (fired) return; // spawn 的 'error' 与 'close' 可能先后触发，防止重复回调/二次写响应
+    done++;
+    if (done >= 2) { fired = true; callback({ processes, gpu: gpuInfo }); }
+  }
+
+  const proc = spawn('nvidia-smi', [
+    '--query-compute-apps=pid,name,used_memory',
+    '--format=csv'
+  ]);
+  // nvidia-smi 偶发挂起（GPU 驱动异常）时强杀，避免 stats 回调永远不触发
+  const procTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch (e) {} }, 5000);
+  procTimer.unref();
+  let output = '';
+  proc.stdout.on('data', (data) => { output += data.toString(); });
+  // nvidia-smi 不存在/不可执行时 spawn 会 emit 'error'；不监听会打崩整个进程
+  proc.on('error', () => checkDone());
+  proc.on('close', (code) => {
+    if (code === 0 && output.trim()) {
+      output.trim().split('\n').forEach(line => {
+        if (line.toLowerCase().includes('pid')) return;
+        const parts = line.split(',').map(p => p.trim());
+        if (parts.length >= 3) {
+          const pid = parseInt(parts[0]);
+          if (!isNaN(pid) && pid > 0) {
+            processes.push({
+              gpu_id: '0',
+              pid: pid,
+              name: (parts[1] || 'VLLM').replace(/[^\x20-\x7E]/g, ''),
+              gpu_memory: parts[2] ? (parseInt(parts[2]) || 0) * 1024 * 1024 : 0,
+            });
+          }
+        }
+      });
+    }
+    checkDone();
+  });
+
+  const gpuQuery = spawn('nvidia-smi', [
+    '--query-gpu=index,utilization.gpu,memory.total,memory.used,power.draw,temperature.gpu',
+    '--format=csv'
+  ]);
+  const gpuTimer = setTimeout(() => { try { gpuQuery.kill('SIGKILL'); } catch (e) {} }, 5000);
+  gpuTimer.unref();
+  let gpuOutput = '';
+  gpuQuery.stdout.on('data', (data) => { gpuOutput += data.toString(); });
+  gpuQuery.on('error', () => checkDone());
+  gpuQuery.on('close', (code) => {
+    if (code === 0 && gpuOutput.trim()) {
+      const lines = gpuOutput.trim().split('\n');
+      let total = 0, used = 0, utilSum = 0, utilCount = 0, power = 0, temperature = 0;
+      const perGpu = [];
+      for (const line of lines) {
+        if (line.toLowerCase().includes('index')) continue;
+        const parts = line.split(',').map(p => p.replace(/[^\d.]/g, '').trim());
+        if (parts.length >= 4) {
+          total += parseInt(parts[2]) * 1024 * 1024 || 0;
+          used += parseInt(parts[3]) * 1024 * 1024 || 0;
+          utilSum += parseFloat(parts[1]) || 0;
+          utilCount++;
+          if (parts.length >= 5) power += parseFloat(parts[4]) || 0;
+          if (parts.length >= 6) temperature = Math.max(temperature, parseFloat(parts[5]) || 0);
+          perGpu.push({
+            index: parts[0],
+            utilization: parseFloat(parts[1]) || 0,
+            total: (parseInt(parts[2]) || 0) * 1024 * 1024,
+            used: (parseInt(parts[3]) || 0) * 1024 * 1024,
+            power: parts.length >= 5 ? (parseFloat(parts[4]) || 0) : 0,
+            temperature: parts.length >= 6 ? (parseFloat(parts[5]) || 0) : 0,
+          });
+        }
+      }
+      gpuInfo = {
+        utilization: utilCount ? Math.round(utilSum / utilCount) : 0,
+        total, used, power, temperature,
+        gpuCount: utilCount,
+        perGpu,
+      };
+    }
+    checkDone();
+  });
+}
+
+// ====== Metrics Parser ======
+function parseMetrics(text) {
+  const result = {};
+  const lines = text.split('\n');
+  for (const line of lines) {
+    if (line.startsWith('#') || !line.trim()) continue;
+    const idx = line.lastIndexOf(' ');
+    if (idx === -1) continue;
+    const metricPart = line.substring(0, idx).trim();
+    const value = parseFloat(line.substring(idx + 1).trim());
+    if (isNaN(value)) continue;
+    let name = metricPart;
+    let labels = {};
+    const labelMatch = metricPart.match(/^(.+?)\{(.+)\}$/);
+    if (labelMatch) {
+      name = labelMatch[1];
+      for (const kv of labelMatch[2].split(',')) {
+        const eqIdx = kv.indexOf('=');
+        if (eqIdx > 0) {
+          const k = kv.substring(0, eqIdx);
+          const v = kv.substring(eqIdx + 1).replace(/"/g, '');
+          labels[k] = v;
+        }
+      }
+    }
+    const key = name + '|' + JSON.stringify(labels);
+    result[key] = value;
+  }
+  return result;
+}
+
+// ====== Metrics namespace / 取值工具（vllm ↔ sglang 双运行时） ======
+// parseMetrics 输出 key 形如 `metric_name|{labels}`。sglang 指标用 `sglang:` 前缀，
+// vllm 用 `vllm:` 前缀，且同名指标的标签结构也略有差异。以下 helpers 用于按前缀读到值。
+function metricsNamespace(m) {
+  for (const k of Object.keys(m)) {
+    if (k.startsWith('sglang:')) return 'sglang';
+    if (k.startsWith('vllm:')) return 'vllm';
+  }
+  return 'vllm';
+}
+// Gauge/值类型：不限标签，取第一条 `base|` 开头的值（忽略标签结构）
+function gaugeValue(m, base) {
+  for (const k of Object.keys(m)) if (k.startsWith(base + '|')) return m[k];
+  return 0;
+}
+// Counter 类：累加所有该指标（可能多标签）的值
+function counterTotal(m, base) {
+  let t = 0;
+  for (const k of Object.keys(m)) if (k.startsWith(base + '|')) t += m[k];
+  return t;
+}
+// 按标签值累加 counter（如 prompt_tokens_by_source_total 的 source 标签）：
+// parseMetrics 把标签编码进 key（|{"engine":"0","model_name":"...","source":"..."}），
+// 直接匹配 `"source":"<v>"` 子串即可精确过滤出该 source 的全部 label 组合。
+function counterBySource(m, base, source) {
+  const needle = '"source":"' + source + '"';
+  let t = 0;
+  for (const k of Object.keys(m)) {
+    if (k.indexOf(base + '|') === 0 && k.indexOf(needle) !== -1) t += m[k];
+  }
+  return t;
+}
+// 按任意标签值累加 counter（parseMetrics 把标签编码进 key 的 JSON 里）
+function counterByLabel(m, base, label, value) {
+  const needle = '"' + label + '":"' + value + '"';
+  let t = 0;
+  for (const k of Object.keys(m)) {
+    if (k.startsWith(base + '|') && k.indexOf(needle) !== -1) t += m[k];
+  }
+  return t;
+}
+// Histogram：取 _count / _sum（忽略 _bucket），按标签名独立累加
+function histogramSumCount(m, base) {
+  let sum = 0, count = 0;
+  for (const k of Object.keys(m)) {
+    if (k.indexOf(base + '_count') === 0) count = m[k];
+    else if (k.indexOf(base + '_sum') === 0) sum = m[k];
+  }
+  return { sum, count };
+}
+
+// ====== SGLang 仪表盘统计 ======
+// sglang 的 /metrics 指标命名/结构（sglang: 前缀）与 vLLM 差异较大，这里用独立构建器
+// 产出与前端 `/v1/internal/stats` 兼容的结果结构（vllm 路径保持不变）。
+function buildSglangStats(m, ticker) {
+  const g = (base) => gaugeValue(m, base);
+  const hist = (base) => histogramSumCount(m, base);
+  const cnt = (base) => counterTotal(m, base);
+
+  const ttft = hist('sglang:time_to_first_token_seconds');
+  const tpot = hist('sglang:inter_token_latency_seconds');
+  const e2e = hist('sglang:e2e_request_latency_seconds');
+
+  const genTokens = cnt('sglang:generation_tokens_total');
+  const promptTokens = cnt('sglang:prompt_tokens_total');
+  const cachedTokens = Math.round(counterByLabel(m, 'sglang:prefill_effective_tokens_total', 'mode', 'device_hit')) + Math.round(counterByLabel(m, 'sglang:prefill_effective_tokens_total', 'mode', 'host_hit'));
+  const uncached = Math.max(0, promptTokens - cachedTokens);
+
+  const running = Math.round(g('sglang:num_running_reqs'));
+  const queue = Math.round(g('sglang:num_queue_reqs'));
+
+  // 生成吞吐（tg TPS）：直接用引擎实时 gauge sglang:gen_throughput。
+  // 注意不能用 generation_tokens_total 差值——sglang 该 counter 是请求完成时才批量
+  // 计入（请求期间恒定、结束瞬间一次 +N），差值法会显示 0 或脉冲尖峰。
+  const ls = (ticker && ticker.lastSecond) || { speed: 0, promptSpeed: 0, tokens: 0, running: 0, at: 0 };
+  const genTps = g('sglang:gen_throughput');
+  // 预填充吞吐：引擎实时 prefill_effective_tokens_total{mode=input} 的 3s 差值。
+  // （prompt_tokens_total 是 prefill 完成时批量计入，ticker 差值法不可用）
+  const ppSpeed3 = buildSglangPrefillSpeed3s(m);
+  const ppTps = ppSpeed3 !== undefined ? ppSpeed3 : (ls.promptSpeed > 0 ? ls.promptSpeed : 0);
+
+  // 投机解码命中率（DFLASH/MTP）：spec_accept_rate 为 0~1 比例
+  const acceptRate = g('sglang:spec_accept_rate');
+
+  // 峰值显存（KV + 权重）
+  const kvGb = g('sglang:kv_cache_memory_usage_gb');
+  const wGb = g('sglang:weight_memory_usage_gb');
+
+  // KV 缓存占用（0~1）
+  const tokenUsage = g('sglang:token_usage');
+
+  const out = {
+    cache_blocks: { used: Math.min(100, tokenUsage * 100), total_blocks: Math.max(1, Math.round(g('sglang:max_total_num_tokens') / Math.max(1, g('sglang:page_size')))), blocks: null },
+    kv_cache: {
+      usage_pct: g('sglang:max_total_num_tokens') > 0 ? Math.min(1, g('sglang:kv_used_tokens') / g('sglang:max_total_num_tokens')) : 0,
+      max_tokens: Math.round(g('sglang:max_total_num_tokens')),
+      used_tokens: Math.round(g('sglang:kv_used_tokens')),
+      block_size: Math.round(g('sglang:page_size')) || 0,
+      num_gpu_blocks: Math.max(1, Math.round(g('sglang:max_total_num_tokens') / Math.max(1, g('sglang:page_size')))),
+    },
+    num_running_seqs: running,
+    num_queue_seqs: queue,
+    running,
+    total_completed_requests: Math.round(cnt('sglang:num_requests_total')),
+    total_input_tokens: promptTokens,
+    cached_input_tokens: cachedTokens,
+    uncached_input_tokens: uncached,
+    total_output_tokens: genTokens,
+    cache_hit_rate: promptTokens > 0 ? ((cachedTokens / promptTokens) * 100).toFixed(1) : 0,
+    avg_ttft_ms: ttft.count > 0 ? (ttft.sum / ttft.count * 1000) : 0,
+    avg_tpot_ms: tpot.count > 0 ? (tpot.sum / tpot.count * 1000) : 0,
+    bench_pp_tps: parseFloat(ppTps.toFixed(1)),
+    bench_tg_tps: parseFloat(genTps.toFixed(1)),
+    bench_e2e_ms: e2e.count > 0 ? (e2e.sum / e2e.count * 1000) : 0,
+    bench_throughput: parseFloat((genTps + ppTps).toFixed(1)),
+    bench_peak_mem_gb: parseFloat((kvGb + wGb).toFixed(2)),
+    active_requests: [],
+    total_speed: genTps,
+    avg_speed_per_request: genTps,
+    avg_prefill_tokens_per_request: 0,
+    avg_prefill_time_seconds: 0,
+    avg_decode_time_seconds: 0,
+    avg_tokens_per_request: 0,
+    mtp_hit_rate: acceptRate > 0 ? parseFloat((acceptRate * 100).toFixed(1)) : undefined,
+    last_second: ls,
+    energy: (typeof buildEnergyInfo === 'function') ? buildEnergyInfo() : undefined,
+  };
+  return out;
+}
+
+// ====== SGLang 日志 prefill 命中（每请求 cached token 真值，08-30 vLLM 口径对齐）======
+// SGLang 日志 "Prefill batch, #new-seq, #new-token, #cached-token, ... #pending-token" 行的
+// #cached-token = 该请求 prefill 的真实缓存命中数（= vLLM num_cached_tokens 口径，引擎
+// 逐 chunk 处理时第一 chunk 行即给出）。引擎累计 counter（prefill_effective_tokens_total
+// 的 device_hit/input）是进程级累计，用全局累计命中率摊算单请求命中对新请求误差很大
+// （实测 4414-token 新请求真值 0 命中，全局 14.8% 估算会错减 662）。
+// 日志发现：/proc/<pid>/fd/{1,2} readlink（30s TTL），只解析 Prefill batch 行，保留最近 400 行。
+const __sglLogState = new Map(); // port -> {path, pos, lines:[{tMs,newSeq,newToken,cached,pending}], lastPathAt}
+
+function readSglangPrefillLines(port, pid) {
+  const now = Date.now();
+  let st = __sglLogState.get(port);
+  if (!st) { st = { path: null, pos: 0, lines: [], lastPathAt: 0 }; __sglLogState.set(port, st); }
+  if (!st.path || now - st.lastPathAt > 30000) {
+    st.lastPathAt = now;
+    let p = null;
+    if (pid) for (const fd of [1, 2]) {
+      try {
+        const q = fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
+        if (/\.log$/.test(q) && fs.existsSync(q)) { p = q; break; }
+      } catch (e) {}
+    }
+    if (p !== st.path) { st.path = p; st.pos = 0; st.lines = []; }
+  }
+  if (!st.path) return st.lines;
+  try {
+    const size = fs.statSync(st.path).size;
+    if (size < st.pos) st.pos = 0; // 日志被截断/轮转
+    if (size > st.pos) {
+      const fd = fs.openSync(st.path, 'r');
+      const len = Math.min(size - st.pos, 2 * 1024 * 1024);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, st.pos);
+      fs.closeSync(fd);
+      st.pos += len;
+      for (const ln of buf.toString('utf8').split('\n')) {
+        const m = ln.match(/^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\] Prefill batch, #new-seq: (\d+), #new-token: (\d+), #cached-token: (\d+),.*#pending-token: (\d+)/);
+        if (!m) continue;
+        // 日志时间戳=服务器本地时间；控制台同机运行，按本地时区解析
+        st.lines.push({ tMs: new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime(), newSeq: +m[7], newToken: +m[8], cached: +m[9], pending: +m[10] });
+      }
+      if (st.lines.length > 400) st.lines.splice(0, st.lines.length - 400);
+    }
+  } catch (e) {}
+  return st.lines;
+}
+
+// 查找某请求的每请求缓存命中真值（组首行 #cached-token），未匹配返回 undefined（回落全局估算）。
+// 组首行 = 该请求 prefill 的第一行：前 3s 内没有其他 Prefill batch 行（并发交织时无法
+// 区分组 → 宁可回退也不误配）。匹配依据：
+//   ① 时间窗 [startedAt−8s, +30s]（代理+模板+调度开销在 8s 内）；
+//   ② 组首行 (pending+cached) ≈ 请求全量 token（count_tokens 口径，±25%/512 容差——
+//      组首行 pending 含在途 chunk 与排队请求，容差吸收模板开销与少量排队量）。
+function sglangCachedForRequest(lines, e, promptTokens) {
+  if (!promptTokens || !lines.length) return undefined;
+  const start = e.startedAt || 0;
+  for (let i = 0; i < lines.length; i++) {
+    const L = lines[i];
+    if (L.newSeq !== 1) continue;
+    const prev = i > 0 ? lines[i - 1] : null;
+    if (prev && (L.tMs - prev.tMs) < 3000) continue; // 非组首（交织）
+    if (L.tMs < start - 8000 || L.tMs > start + 30000) continue;
+    const fullEst = L.pending + L.cached;
+    if (Math.abs(fullEst - promptTokens) <= Math.max(512, promptTokens * 0.25)) return L.cached;
+  }
+  return undefined;
+}
+
+// ===== SGLang 逐请求缓存命中环（09-01）：从实例日志解析 "Prefill batch" 行的 #cached-token，
+// 为「0命中占比」徽标补上 SGLang 侧逐请求口径（request-traces.jsonl 由 vLLM 插件写入，
+// 生产全切 SGLang 后停更，徽标此前对 SGLang 流量失明）。
+// 分组口径与 sglangCachedForRequest 一致：#new-seq>=1 且距上一行 >=3s 的行=新请求起点
+//（max-running-requests=1 时 chunked prefill 各 chunk 行 1s 间隔连续，不会误切）。
+// 进行中的请求存 st.open 跨增量读保持（100k+ 长 prefill 跨多次扫描不断成两条）；
+// 首次见到日志只 tail 2MB 作 1h 窗口种子，之后增量读；每 30s 重新探测 /proc/pid/fd。
+const __sglTraceState = new Map(); // port -> {path,pos,open,lastMs,ring,}
+function sglangTraceRecords() {
+  let instances = [];
+  try { instances = listSglangInstances(); } catch (e) {}
+  const now = Date.now();
+  const cutoffMs = now - 3600 * 1000;
+  for (const inst of instances) {
+    const port = inst.port, pid = inst.pid;
+    let st = __sglTraceState.get(port);
+    if (!st) { st = { path: null, pos: 0, open: null, lastMs: null, ring: [] }; __sglTraceState.set(port, st); }
+    if (!st._pathAt || now - st._pathAt > 30000) {
+      st._pathAt = now;
+      let p = null;
+      if (pid) for (const fd of [1, 2]) {
+        try { const q = fs.readlinkSync(`/proc/${pid}/fd/${fd}`); if (/\.log$/.test(q) && fs.existsSync(q)) { p = q; break; } } catch (e) {}
+      }
+      if (p !== st.path) {
+        st.path = p; st.open = null; st.lastMs = null; st.ring = [];
+        try { st.pos = p ? Math.max(0, fs.statSync(p).size - 2 * 1024 * 1024) : 0; } catch (e) { st.pos = 0; } // tail 种子
+      }
+    }
+    if (!st.path) continue;
+    try {
+      const size = fs.statSync(st.path).size;
+      if (size < st.pos) { st.pos = Math.max(0, size - 2 * 1024 * 1024); st.open = null; st.lastMs = null; } // 日志截断/轮转
+      if (size > st.pos) {
+        const fd = fs.openSync(st.path, 'r');
+        const len = Math.min(size - st.pos, 2 * 1024 * 1024);
+        const buf = Buffer.alloc(len);
+        fs.readSync(fd, buf, 0, len, st.pos);
+        fs.closeSync(fd);
+        st.pos += len;
+        for (const ln of buf.toString('utf8').split('\n')) {
+          // 行格式两种：新 build "#new-seq: 1, #new-token: 80, #cached-token: 0"；
+          // 旧 build 中间多 "#full-token: 512"——做成可选组兼容两种
+          const m = ln.match(/^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\] Prefill batch, #new-seq: (\d+)(?:, #full-token: \d+)?, #new-token: (\d+), #cached-token: (\d+)/);
+          if (!m) continue;
+          const tMs = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime();
+          if (tMs < cutoffMs) continue;
+          const ns = +m[7], nt = +m[8], ct = +m[9];
+          if (ns >= 1 && (st.lastMs === null || tMs - st.lastMs >= 3000)) {
+            if (st.open) st.ring.push(st.open);
+            st.open = { tMs, prompt: 0, cached: 0, port };
+          }
+          st.lastMs = tMs;
+          if (st.open) { st.open.prompt += nt; st.open.cached += ct; }
+        }
+      }
+    } catch (e) {}
+    if (st.ring.length > 5000) st.ring.splice(0, st.ring.length - 5000);
+  }
+  const out = [];
+  for (const st of __sglTraceState.values())
+    for (const r of st.ring) if (r.tMs >= cutoffMs) out.push(r);
+  return out;
+}
+
+// ====== SGLang 并发请求明细（active_requests） ======
+// sglang 的 /metrics 只有聚合值，没有每请求明细；但走控制台 8889 代理的请求会被
+// teeSseStream 捕获（global.__liveStreams），这里把「进行中的请求」转成与 vLLM
+// active_requests 同构的行（速度/阶段/耗时/进度），前端「并发请求」卡片即可像
+// vLLM 一样逐请求展示。直连后端端口（不经 8889）的请求没有 live 数据，会回落到
+// 聚合显示（"正在处理 N 个请求"），不影响 vLLM 路径。
+//
+// 「输出 token/s」口径（2026-08-25 用户要求与 tg TPS 对齐）：单请求输出速度不再用
+// tee 的 chunk 计数（MTP 时一个 chunk 多个 token 只算 1，偏低），改用引擎实时 gauge
+// sglang:gen_throughput（与仪表盘「生成吞吐」同源，每步更新），按各 decode 请求的
+// live token 占比分摊：单请求时占比=1，直接等于全局生成吞吐（准确）。
+function buildSglangActiveRequests(sg, liveStreams, genSpeed1s, prefillSpeed3s, ppTotalNow, getCached) {
+  const now = Date.now();
+  const out = [];
+  if (!liveStreams || !liveStreams.map) return out;
+  // 第一遍：收集进行中请求，算上一秒速度（meta 行小字，live 计数口径），区分 decode/prefill，
+  // 累计 decode 请求的 live token 作为吞吐分摊权重
+  const rows = [];
+  let decodeTokens = 0;
+  for (const e of liveStreams.map.values()) {
+    if (e.done) continue;                     // 只看进行中
+    // 惰性初始化「上一秒 token 采样」基线（首次采样 tok_last_sec=0 → 前端显示 --）
+    if (e._lastTok === undefined) { e._lastTok = e.tokens; e._lastAt = now; }
+    // dt 单位是秒；毫秒差要先除 1000（Math.max(1, ms)/1000 会得到 0.001s 恒小于阈值）。
+    // dt 不足（多个 stats 客户端 500ms 轮询同频共振）时不重置基线，delta 累积到下次采样；
+    // 同时沿用上次有效速度，避免撞车时页面速度闪烁为 0。
+    const dt = (now - e._lastAt) / 1000;
+    let tokLastSec = 0;
+    if (dt >= 0.3) {
+      tokLastSec = Math.max(0, (e.tokens - e._lastTok) / dt);
+      e._lastTok = e.tokens;
+      e._lastAt = now;
+      e._lastSpeed = tokLastSec;
+    } else {
+      tokLastSec = e._lastSpeed || 0;
+    }
+    const elapsed = Math.max(1, (now - e.startedAt) / 1000);
+    const isDecode = (e.text || '').length > 0;  // 已有输出文本 → decode；否则还在预填充
+    if (isDecode) decodeTokens += (e.tokens || 0);
+    rows.push({ e, tokLastSec, elapsed, isDecode });
+  }
+  // 第二遍：构建输出行
+  // 预填充数口径对齐 vLLM（fillActiveRequests 判定逻辑）：
+  //  ① 总量 = 精确 prompt − 缓存命中。缓存命中不计入预填充工作量（vLLM 口径
+  //     prompt−cached）；命中优先取每请求日志 "Prefill batch" 行 #cached-token 真值
+  //     （getCached，vLLM num_cached_tokens 同源口径），未匹配回落引擎总命中率近似
+  //     （cache_hit_rate = 命中/(命中+实算)）。
+  //  ② 进行中已处理：单请求 prefill = 引擎计数增量（最准）；并发 prefill =
+  //     vLLM 守恒分摊（引擎实时预填充吞吐/并发数 × 已耗时）——旧实现把全局增量
+  //     同时记给每行，并发时双记虚高；总量旧实现=全量 prompt（未减命中）。
+  //  ③ 进入 decode 后 prefill 已完成 → 总量/进度冻结为最终值（旧实现直接归 0，
+  //     进度瞬间塌掉），prefill_s 用首 token 实时值（tee 捕获 firstTokAt），
+  //     缺实时数据时回落采样精度（elapsed − decode 段时长）。
+  const decodeCount = rows.filter(r => r.isDecode).length;
+  const numPrefill = rows.length - decodeCount;
+  for (const r of rows) {
+    const { e, tokLastSec, elapsed, isDecode } = r;
+    // 引擎实测输出速度：总生成吞吐 × 该请求生成占比（单请求占比=1 → 直接等于全局生成吞吐）
+    let engineSpeed = undefined;
+    if (isDecode) {
+      const share = decodeTokens > 0
+        ? ((e.tokens || 0) / decodeTokens)
+        : (decodeCount > 0 ? 1 / decodeCount : 0);
+      if (genSpeed1s !== undefined && genSpeed1s >= 0) engineSpeed = genSpeed1s * share;
+    }
+    // —— 预填充数（vLLM 口径）——
+    // 08-30 修复：缓存命中优先用每请求日志 #cached-token 真值（= vLLM num_cached_tokens
+    // 口径，Prefill batch 行第一 chunk 即给出）；未匹配回退全局累计命中率估算（保守上限）。
+    // 旧实现一律用全局命中率摊算：新请求（真值 0 命中）会被错减估算值（实测 14.8%×4414=662），
+    // 总量虚低、进度虚高——与 vLLM 路径（prompt_total − cached 实测）口径不一致。
+    const prompt = e.promptTokens || 0;
+    const cachedExact = (typeof getCached === 'function') ? getCached(e) : undefined;
+    const hitRate = parseFloat(sg.cache_hit_rate) || 0;
+    const cachedEst = prompt > 0 && hitRate > 0 ? Math.min(prompt, Math.round(prompt * hitRate / 100)) : 0;
+    const cached = (cachedExact !== undefined && cachedExact >= 0) ? Math.min(cachedExact, prompt) : cachedEst;
+    const totalNow = Math.max(0, prompt - cached);
+    let ppTotal, ppDone, ppS = 0;
+    if (isDecode) {
+      // prefill 已完成：冻结（避免命中率波动抖动已展示的数；total 用首次观察值）
+      if (e._ppTotal === undefined) e._ppTotal = totalNow;
+      ppTotal = e._ppTotal;
+      if (e._ppDone === undefined) e._ppDone = ppTotal;
+      ppDone = e._ppDone;
+      if (e._ppS === undefined) {
+        // 首 token 实时值（ttft）；缺失时采样精度（vLLM 同款回落：elapsed − decode 段）
+        const decSpeed = ((engineSpeed !== undefined && engineSpeed > 0) ? engineSpeed : (tokLastSec > 0 ? tokLastSec : 10));
+        e._ppS = e.firstTokAt
+          ? Math.max(0.1, (e.firstTokAt - e.startedAt) / 1000)
+          : Math.max(0.5, elapsed - (e.tokens || 0) / decSpeed);
+      }
+      ppS = e._ppS;
+    } else {
+      ppTotal = totalNow;
+      let d = 0;
+      if (ppTotalNow !== undefined && numPrefill > 0) {
+        // 并发数变化时重设引擎基线（增量只有在单请求状态下才可全部归属该请求）
+        if (e._ppMode !== numPrefill || e._ppBase === undefined) {
+          e._ppBase = ppTotalNow;
+          e._ppMode = numPrefill;
+        }
+        if (numPrefill === 1) {
+          // 单请求 prefill：全局增量 = 该请求真实预填充（引擎计数，最准）
+          d = Math.max(0, ppTotalNow - (e._ppBase || 0));
+        } else {
+          // 并发 prefill：vLLM 守恒分摊（引擎 3s 预填充吞吐/并发数 × 已耗时）
+          const perSec = (prefillSpeed3s !== undefined && prefillSpeed3s > 0) ? (prefillSpeed3s / numPrefill) : 0;
+          d = perSec * elapsed;
+        }
+      }
+      // 单调不减（重设基线/估算抖动时进度条不回退）
+      ppDone = Math.min(ppTotal, Math.max(e._ppDone || 0, d));
+      e._ppDone = ppDone;
+    }
+    // 每请求预填充速度（vLLM 口径）：引擎 3s 实时预填充吞吐按 prefill 并发数分摊
+    const ppTps = (prefillSpeed3s !== undefined && prefillSpeed3s > 0)
+      ? prefillSpeed3s / Math.max(1, numPrefill)
+      : (sg.bench_pp_tps || 0);
+    out.push({
+      id: e.id.replace(/^LIVE-/, ''),
+      ip: e.ip || '—',
+      elapsed_s: Math.round(elapsed),
+      tokens_generated: e.tokens,
+      phase: isDecode ? 'decode' : 'prefill',
+      // decode 行大数字 tok/s：引擎实测分摊值，回落上一秒/全程均值
+      speed: isDecode
+        ? (engineSpeed !== undefined ? parseFloat(engineSpeed.toFixed(1)) : (tokLastSec > 0 ? tokLastSec : parseFloat((e.tokens / elapsed).toFixed(1))))
+        : 0,
+      avg_speed: engineSpeed !== undefined ? parseFloat(engineSpeed.toFixed(1)) : parseFloat((e.tokens / elapsed).toFixed(1)),
+      // 前端 decode 行大数字优先用此值（标签「近3s tok/s」）：引擎实测总生成吞吐分摊
+      avg_speed_3s: engineSpeed !== undefined ? parseFloat(engineSpeed.toFixed(1)) : undefined,
+      tok_last_sec: Math.round(tokLastSec),
+      // 预填充速度：引擎实时 prefill_effective_tokens_total{mode=input} 3s 差值，
+      // 按 prefill 并发数分摊到单请求（prompt_tokens_total 批量计入不可用）
+      prefill_tps: isDecode ? 0 : parseFloat(ppTps.toFixed(1)),
+      // 预填充进度（口径与 vLLM 一致）：
+      //  总量 = 精确 prompt token（count_tokens；未返回前字符估算）− 缓存命中
+      //         （引擎总命中率近似，vLLM 同源口径）；进入 decode 后冻结
+      //  已处理 = 单请求 prefill 期间引擎实时计数增量（最准）；并发 prefill 守恒
+      //         分摊；进入 decode 后 = 总量（冻结）
+      prefill_total_uncached: ppTotal,
+      prefill_done_uncached: ppDone,
+      prefill_exact: false,
+      prefill_s: ppS,
+    });
+  }
+  // 与前端 liveList 按 startedAt 升序 zip（同一条请求的 token 流对应同一行）；
+  // 先开始的请求 elapsed 更大，故按 elapsed 降序 = startedAt 升序
+  out.sort((a, b) => b.elapsed_s - a.elapsed_s);
+  return out;
+}
+
+// 引擎实测总预填充吞吐（3s 平滑）：
+// 数据源 = sglang:prefill_effective_tokens_total{mode="input"} —— 该 counter 是 prefill
+// 每步实时增长的（实测每 2s +4k~7k），而 prompt_tokens_total 是 prefill 完成时才批量
+// 计入（不可用于实时速度）。3s 窗口差值 ÷3 得实时预填充 tok/s（线性插值估算 3 秒前累计）。
+function buildSglangPrefillSpeed3s(m, hist) {
+  if (hist === undefined) hist = (hist = hist || []);
+  const now = Date.now();
+  const ppTotal = Math.round(counterByLabel(m, 'sglang:prefill_effective_tokens_total', 'mode', 'input'));
+  hist.push({ t: now, pp: ppTotal });
+  const cutoff = now - 3000;
+  while (hist.length > 3 && hist[1].t <= cutoff) hist.shift();
+  if (hist.length < 2) return undefined;
+  const first = hist[0], last = hist[hist.length - 1];
+  let base = first;
+  if (first.t < cutoff && hist[1].t > cutoff) {
+    const a = first, b = hist[1];
+    const frac = (cutoff - a.t) / (b.t - a.t);
+    base = { t: cutoff, pp: a.pp + (b.pp - a.pp) * frac };
+  }
+  const span = (last.t - base.t) / 1000;
+  if (span < 0.5) return undefined;
+  return Math.max(0, (last.pp - base.pp) / 3);
+}
+
+// 引擎实测总生成吞吐（1s 平滑，与 tg TPS 同源）：
+// 数据源 = sglang:gen_throughput gauge（引擎实时生成 tok/s，每步更新）。
+// 1 秒窗口内时间加权平均（不除以 3：窗口就是 1s，平均速率 ≈ 该秒的 token 数）。
+function buildSglangGenSpeed1s(m, hist) {
+  if (hist === undefined) hist = (hist = hist || []);
+  const now = Date.now();
+  const thr = gaugeValue(m, 'sglang:gen_throughput');
+  hist.push({ t: now, thr });
+  const cutoff = now - 1000;
+  // 保留至少 3 个样本；[0] 保持为「跨界左点」（t ≤ cutoff）供插值
+  while (hist.length > 3 && hist[1].t <= cutoff) hist.shift();
+  if (hist.length < 2) return undefined;
+  const last = hist[hist.length - 1];
+  // 窗口起点：跨界线性插值出 cutoff（now-1s）时刻的吞吐值
+  let base = hist[0];
+  if (hist[0].t < cutoff && hist[1].t > cutoff) {
+    const a = hist[0], b = hist[1];
+    const frac = (cutoff - a.t) / (b.t - a.t);
+    base = { t: cutoff, thr: a.thr + (b.thr - a.thr) * frac };
+  }
+  const spanS = (last.t - base.t) / 1000;
+  if (spanS < 0.3) return undefined;
+  // 时间加权（梯形积分）：每段的 token = 首尾吞吐均值 × 段时长，累计 = 窗口内总 token
+  let totalTok = 0;
+  let prev = base;
+  for (const s of hist) {
+    if (s.t <= prev.t) continue;
+    totalTok += ((prev.thr + s.thr) / 2) * (s.t - prev.t) / 1000;
+    prev = s;
+  }
+  // 窗口 ≈1s：平均速率 = 总 token ÷ 窗口时长（不再固定 ÷3）
+  return Math.max(0, totalTok / spanS);
+}
+
+// ====== Request-level speed tracking ======
+// vLLM only exposes aggregate metrics (num_requests_running,
+// generation_tokens_total, histogram buckets). We estimate per-request
+// phase (prefill vs decode) using cumulative tracking.
+//
+// Heuristic:
+//   - If running increased since last poll: new requests are in prefill
+//   - If totalSpeed > 0: some requests are producing tokens (decode)
+//   - If totalSpeed === 0 but running > 0: all requests are still prefilling
+//
+
+
+// ====== Stats reset baseline ======
+// vLLM metrics are cumulative counters / histograms for the model's whole
+// lifetime. "Reset stats" captures their current values as a baseline, and
+// the dashboard displays (raw - baseline), i.e. values since last reset.
+
+// 直扫 /proc 找推理进程。不能用 pgrep -f：它会匹配到 ssh/bash/expect 等探测命令
+// **自身**（命令行里恰好含 "vllm serve"/"sglang.launch_server" 字样），日志源会随
+// 「谁在 ssh 上敲了什么」漂移。必须直扫并过滤探测类进程。
+function scanInferenceProcs() {
+  const out = { vllm: [], sglang: [] };
+  let names = [];
+  try { names = fs.readdirSync('/proc'); } catch (e) { return out; }
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    const pid = parseInt(name, 10);
+    if (pid === process.pid) continue;
+    let cmd = '';
+    try {
+      cmd = fs.readFileSync('/proc/' + name + '/cmdline', 'utf8').split('\0').join(' ').trim();
+    } catch (e) { continue; }
+    if (!cmd) continue;
+    // 探测类进程排除（ssh 命令行、bash -c 包装、grep/pgrep/ps 自身）
+    if (/(^|\s)(ssh|expect|grep|pgrep|ps|scp|rsync|tail|cat)(\s|$)/.test(cmd)) continue;
+    if (/\b(?:bash|sh)\s+-c\b/.test(cmd)) continue;
+    // 09-19：改用 isVllmProcCmd 统一判定——旧正则 `(^|\s)vllm\s+serve` 匹配不到
+    // 容器栈的 `/usr/local/bin/vllm serve`（token 前是 `/` 非空白），导致 docker
+    // 实例日志面板无源可回。
+    if (isVllmProcCmd(cmd)) {
+      out.vllm.push({ pid, cmd });
+    } else if (/(^|\s)-m\s+sglang\.launch_server/.test(cmd) ||
+               /(^|\s)sglang\.launch_server(\s|$)/.test(cmd)) {
+      out.sglang.push({ pid, cmd });
+    }
+  }
+  out.vllm.sort((a, b) => a.pid - b.pid);
+  out.sglang.sort((a, b) => a.pid - b.pid);
+  return out;
+}
+
+// 该日志文件是否属于某个实例：文件首/尾若干 KB 里出现实例 cmdline 的模型路径即认定归属。
+// 为什么需要（2026-09-16 实锤）：同一端口换过启动栈（18420 先跑 NVFP4 栈、后换
+// W4A16-1M 栈）后，旧栈按端口推导命名的日志文件仍残留在磁盘上；旧逻辑
+// 「端口推导语径存在就返回」会一直显示旧栈的陈错误行，真实日志完全看不到。
+function logFileMentions(file, needle, maxBytes) {
+  if (!file || !needle) return false;
+  const N = maxBytes || 262144;
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const sz = fs.fstatSync(fd).size;
+    const len = Math.min(N, sz);
+    if (!len) return false;
+    const buf = Buffer.alloc(len);
+    const chunks = [];
+    fs.readSync(fd, buf, 0, len, 0);
+    chunks.push(buf.toString('utf8'));
+    if (sz > len) {
+      fs.readSync(fd, buf, 0, len, sz - len);
+      chunks.push(buf.toString('utf8'));
+    }
+    return chunks.some(c => c.indexOf(needle) >= 0);
+  } catch (e) { return false; }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch (e2) {} } }
+}
+
+// 在「端口推导语径 + 注册的 sm.log（+ altLogs）」候选里，为在跑实例挑真正属于它的日志：
+// ① 内容命中实例模型路径 +10（决定性）② 新鲜度（≤5min +4 / ≤60min +2 / ≤24h +1）
+// ③ 等于注册名 sm.log +1（同分时优先，端口推导语径最易撞遗留文件）。
+// 结果按 5s TTL 记忆，避免前端 2s 轮询反复读大文件。
+function pickScriptModelLogFile(inst, sm) {
+  if (!inst) return null;
+  const memo = (global.__scriptLogPick = global.__scriptLogPick || new Map());
+  const memoKey = (inst.pid || 0) + ':' + (inst.port || 0);
+  const hit = memo.get(memoKey);
+  if (hit && Date.now() - hit.at < 5000) return hit.file;
+  const cands = [];
+  if (inst.port) cands.push(path.join(__dirname, 'vllm-flash-next-' + inst.port + '.log'));
+  if (sm && sm.log) cands.push(sm.log);
+  if (sm && Array.isArray(sm.altLogs)) sm.altLogs.forEach(f => f && cands.push(f));
+  let needle = null;
+  try {
+    const cmd = fs.readFileSync('/proc/' + inst.pid + '/cmdline', 'utf8').split('\0').join(' ');
+    const m = cmd.match(/(?:serve|--model(?:-path)?)\s+(\/\S+)/);
+    if (m) needle = m[1];
+  } catch (e) {}
+  let best = null, bestScore = -1, bestMtime = -1;
+  for (const f of cands) {
+    if (!f) continue;
+    let st;
+    try { st = fs.statSync(f); if (!st.isFile()) continue; } catch (e) { continue; }
+    const owned = needle && logFileMentions(f, needle) ? 10 : 0;
+    const ageMin = (Date.now() - st.mtimeMs) / 60000;
+    const fresh = ageMin <= 5 ? 4 : (ageMin <= 60 ? 2 : (ageMin <= 1440 ? 1 : 0));
+    const reg = (sm && f === sm.log) ? 1 : 0;
+    const score = owned + fresh + reg;
+    if (score > bestScore || (score === bestScore && st.mtimeMs > bestMtime)) {
+      bestScore = score; bestMtime = st.mtimeMs; best = f;
+    }
+  }
+  if (memo.size > 32) memo.clear();
+  memo.set(memoKey, { file: best, at: Date.now() });
+  return best;
+}
+
+// Resolve the log file the running vLLM process actually writes to.
+// Returns { file, tty }. When vLLM was started from a terminal, its stdout is
+// a TTY (/dev/pts/N) — reading it with readFileSync would BLOCK THE EVENT
+// LOOP FOREVER (a tty read waits for input/EOF that never comes). Mark it and
+// let the endpoint answer with a friendly notice instead of reading it.
+// 优先级：① 脚本化模型（chroot 内 root 进程，日志路径由 SCRIPT_MODELS 注册，最可靠）
+//         ② 主实例端口(config.vllmPort)对应的 vLLM 进程 stdout
+//         ③ 其它 vLLM 进程 stdout  ④ SGLang 日志  ⑤ ./vllm.log
+function getVllmLogSource() {
+  const procs = scanInferenceProcs();
+  // ① 脚本化模型（Flash-Next 等 chroot 镜像实例）：逐个条目定位「真正属于在跑实例」的
+  //    日志文件（见 pickScriptModelLogFile），多实例时取最近写过的那个。
+  try {
+    const picks = [];
+    for (const k of Object.keys(SCRIPT_MODELS)) {
+      const sm = SCRIPT_MODELS[k];
+      const inst = scriptModelInstance(sm);
+      if (!inst) continue;
+      const f = pickScriptModelLogFile(inst, sm);
+      if (!f) continue;
+      let mt = 0;
+      try { mt = fs.statSync(f).mtimeMs; } catch (e) {}
+      picks.push({ file: f, tty: false, pid: inst.pid, port: inst.port, mtime: mt });
+    }
+    if (picks.length) {
+      picks.sort((a, b) => b.mtime - a.mtime);
+      return { file: picks[0].file, tty: false, pid: picks[0].pid, port: picks[0].port };
+    }
+  } catch (e) { /* ignore */ }
+  // ①½ docker 容器化 vLLM（09-19）：容器 json 日志属 root 不可直读，
+  //     返回 cid 交给 handler 用 docker logs（ll 可经 daemon 读取）拉取。
+  for (const c of procs.vllm) {
+    const cid = dockerCidForPid(c.pid);
+    if (cid) {
+      const pm = c.cmd.match(/--port\s+(\d+)/);
+      return { docker: cid, tty: false, pid: c.pid, port: pm ? parseInt(pm[1]) : null, file: 'docker:' + cid };
+    }
+  }
+  // ②③ 普通 vLLM：读 stdout fd 目标（控制台启动=./vllm.log，脚本启动=各自日志）
+  const mainPort = (typeof config !== 'undefined' && config && config.vllmPort) ? String(config.vllmPort) : '';
+  const isMain = (c) => mainPort && new RegExp('--port\\s+' + mainPort + '(\\s|$)').test(c.cmd);
+  const ordered = procs.vllm.slice().sort((a, b) => (isMain(a) ? 0 : 1) - (isMain(b) ? 0 : 1) || a.pid - b.pid);
+  for (const c of ordered) {
+    try {
+      const link = fs.readlinkSync('/proc/' + c.pid + '/fd/1');
+      if (link.startsWith('/') && fs.existsSync(link)) {
+        try {
+          if (fs.statSync(link).isFile()) return { file: link, tty: false, pid: c.pid };
+        } catch (e2) {}
+        return { file: link, tty: true, pid: c.pid };
+      }
+    } catch (e) { /* fd 不可读（root 进程）：继续找下一个 */ }
+  }
+  // ④ SGLang
+  if (procs.sglang.length && fs.existsSync(SGLANG_LOG_PATH)) {
+    return { file: SGLANG_LOG_PATH, tty: false, pid: procs.sglang[0].pid };
+  }
+  // ⑤ 兜底
+  return { file: path.join(__dirname, 'vllm.log'), tty: false };
+}
+
+function resolveVllmLogPath() {
+  return getVllmLogSource().file;
+}
+
+// Detect the model label (|{...}) used by cumulative metrics, plus the
+// source-label prefix used by prompt_tokens_by_source_total
+function detectModelLabels(m) {
+  let modelLabel = '';
+  for (const k of Object.keys(m)) {
+    const pipeIdx = k.indexOf('|');
+    if (pipeIdx > 0 && k.substring(0, pipeIdx) === 'vllm:num_requests_running') {
+      modelLabel = k.substring(pipeIdx);
+      break;
+    }
+  }
+  let sourceLabel = modelLabel;
+  for (const k of Object.keys(m)) {
+    if (k.startsWith('vllm:prompt_tokens_by_source_total|')) {
+      const labelPart = k.substring(k.indexOf('|'));
+      const sIdx = labelPart.indexOf('"source"');
+      if (sIdx > 0) { sourceLabel = labelPart.substring(0, sIdx); break; }
+    }
+  }
+  return { modelLabel, sourceLabel };
+}
+
+// Capture current raw values of all cumulative metrics (the reset baseline)
+function captureResetBlock(m, modelLabel, sourceLabel) {
+  const r = {};
+  const add = (k) => { if (m[k] !== undefined) r[k] = m[k]; };
+  add('vllm:generation_tokens_total' + modelLabel);
+  add('vllm:prompt_tokens_total' + modelLabel);
+  add('vllm:prompt_tokens_by_source_total' + sourceLabel + '"source":"local_cache_hit"}');
+  add('vllm:prompt_tokens_by_source_total' + sourceLabel + '"source":"local_compute"}');
+  add('vllm:request_generation_tokens_count' + modelLabel);
+  add('vllm:request_generation_tokens_sum' + modelLabel);
+  add('vllm:request_decode_time_seconds_count' + modelLabel);
+  add('vllm:request_decode_time_seconds_sum' + modelLabel);
+  add('vllm:request_prefill_time_seconds_count' + modelLabel);
+  add('vllm:request_prefill_time_seconds_sum' + modelLabel);
+  add('vllm:request_prompt_tokens_count' + modelLabel);
+  add('vllm:request_prompt_tokens_sum' + modelLabel);
+  add('vllm:time_to_first_token_seconds_count' + modelLabel);
+  add('vllm:time_to_first_token_seconds_sum' + modelLabel);
+  add('vllm:request_time_per_output_token_seconds_count' + modelLabel);
+  add('vllm:request_time_per_output_token_seconds_sum' + modelLabel);
+  return r;
+}
+
+// Return a copy of m with the reset baseline subtracted from cumulative metrics
+function applyResetView(m, reset) {
+  const mj = Object.assign({}, m);
+  for (const k of Object.keys(reset || {})) {
+    const v = (m[k] || 0) - (reset[k] || 0);
+    mj[k] = v > 0 ? v : 0;
+  }
+  return mj;
+}
+
+// ====== Live per-request prefill progress (vLLM 插件实时回传) ======
+// dsh_vllm_logger 插件（vllm.stat_logger_plugins 入口）把每个 prefill chunk 的
+// 每请求数据写成 JSONL：{t, sid, pid, model, rid, arrival, prompt_total,
+// computed, cached}（computed/cached 为请求级累计）。本函数 tail 读该文件并
+// 按 sid 缓存成 Map(rid -> 最新记录)，供 computeConcurrencyDetails 匹配 REQ 行。
+// sid 在插件初始化时随机生成：vLLM 重启 → sid 变化 → 控制台自动重置匹配。
+const LIVE_PREFILL_PATH = path.join(__dirname, 'vllm-live-prefill.jsonl');
+if (!global.__livePrefill) {
+  global.__livePrefill = { sid: null, updatedAt: 0, byRid: new Map(), order: [], lastFileSize: 0, lastReadAt: 0 };
+}
+// pid 可选：多卡多实例共用同一 jsonl（每实例独立 sid+pid）。指定 pid 时只选
+// 该实例的 sid（否则主实例的匹配会被更活跃的从实例 sid 抢走）；不指定时选
+// 最近更新的 sid（旧行为）。
+function readLivePrefill(pid) {
+  const lp = global.__livePrefill;
+  const now = Date.now();
+  try {
+    // 09-06 性能修复：原来每次调用都 statSync（即使限频命中也要 stat），
+    // stats 端点每 0.5s 轮询 → 每秒 2 次同步 stat。改为 2s 限频 + 缓存 stat 结果。
+    if (lp._lastStatAt && now - lp._lastStatAt < 400 && lp._lastStat) {
+      const st = lp._lastStat;
+      if (lp.byteOffset !== undefined && st.size === lp.byteOffset && lp.selectedPid === pid && now - (lp.lastReadAt || 0) < 500) return lp;
+    } else {
+      const st = fs.statSync(LIVE_PREFILL_PATH);
+      lp._lastStat = st;
+      lp._lastStatAt = now;
+      if (lp.byteOffset === undefined || st.size < lp.byteOffset) {
+        lp.byteOffset = Math.max(0, st.size - 4 * 1024 * 1024);
+        lp.sidMaps = new Map();
+        lp.orderMaps = new Map();
+        lp.firstTMaps = new Map();
+        lp.pending = '';
+        lp.sid = null; lp.byRid = null; lp.order = null; lp.firstT = null;
+      }
+    }
+    const st = lp._lastStat;
+    const fresh = (now - st.mtimeMs) < 10000;
+    if (lp.byteOffset !== undefined && st.size === lp.byteOffset && lp.selectedPid === pid && now - (lp.lastReadAt || 0) < 500) return lp;
+    lp.lastReadAt = now;
+    let text = lp.pending || '';
+    if (st.size > lp.byteOffset) {
+      const LEN = Math.min(4 * 1024 * 1024, st.size - lp.byteOffset);
+      const buf = Buffer.alloc(LEN);
+      const fd = fs.openSync(LIVE_PREFILL_PATH, 'r');
+      try { fs.readSync(fd, buf, 0, LEN, lp.byteOffset); } finally { fs.closeSync(fd); }
+      lp.byteOffset += LEN;
+      lp._lastStat = null; // 文件已增长，下次重新 stat
+      text += buf.toString('utf8');
+    }
+    // 单行消化：合并记录 cached 取历史最大值（完成记录可能被 decode 阶段
+    // cached=0 快照覆盖，覆盖会丢命中数）；首块记录首个 prefill 时刻。
+    const ingest = (r) => {
+      if (!r || typeof r.rid !== 'string' || !r.sid) return;
+      let m2 = lp.sidMaps.get(r.sid);
+      if (!m2) {
+        m2 = new Map();
+        lp.sidMaps.set(r.sid, m2);
+        lp.orderMaps.set(r.sid, []);
+        lp.firstTMaps.set(r.sid, new Map());
+      }
+      if (!m2.has(r.rid)) {
+        lp.orderMaps.get(r.sid).push(r.rid);
+        lp.firstTMaps.get(r.sid).set(r.rid, r.t || 0);
+        m2.set(r.rid, r);
+      } else {
+        const prev = m2.get(r.rid);
+        m2.set(r.rid, {
+          t: r.t, sid: r.sid, pid: r.pid, model: r.model,
+          rid: r.rid, arrival: r.arrival,
+          prompt_total: r.prompt_total, computed: r.computed,
+          cached: Math.max(prev.cached || 0, r.cached || 0),
+        });
+      }
+    };
+    const parts = text.split('\n');
+    lp.pending = parts.pop() || '';
+    for (const l of parts) {
+      if (!l.trim()) continue;
+      try { ingest(JSON.parse(l)); } catch (e) { /* 坏行跳过 */ }
+    }
+    // 无换行结尾的完整末行：能解析则立即纳入，半截行等下一轮补齐
+    if (lp.pending && lp.pending.trim()) {
+      try { ingest(JSON.parse(lp.pending)); lp.pending = ''; } catch (e) { /* 继续积压 */ }
+    }
+    // 每个 sid 的最新记录时刻 + 归属 pid（多实例文件里 sid 交错，插入序 ≠ 时间序，
+    // 不能再用「最后插入的 sid」当最新会话）
+    const sidStats = new Map(); // sid -> {maxT, pid}
+    for (const [sid, m2] of lp.sidMaps) {
+      let maxT = 0, sp = null;
+      for (const rec of m2.values()) {
+        const t = rec.t || 0;
+        if (t >= maxT) { maxT = t; sp = rec.pid != null ? rec.pid : null; }
+      }
+      sidStats.set(sid, { maxT, pid: sp });
+    }
+    // 只保留最近更新的 3 个 sid 的映射，防内存无限增长
+    for (const sid of [...sidStats.keys()].sort((a, b) => sidStats.get(b).maxT - sidStats.get(a).maxT).slice(3)) {
+      sidStats.delete(sid);
+      lp.sidMaps.delete(sid);
+      lp.orderMaps.delete(sid);
+      lp.firstTMaps.delete(sid);
+    }
+    // 选当前会话 sid：pid 指定时只在该实例的 sid 里选；否则选最近更新者
+    let bestSid = null, bestT = 0;
+    for (const [sid, sst] of sidStats) {
+      if (pid != null && sst.pid !== pid) continue;
+      if (sst.maxT > bestT) { bestT = sst.maxT; bestSid = sid; }
+    }
+    if (bestSid) {
+      lp.sid = bestSid;
+      lp.byRid = lp.sidMaps.get(bestSid);
+      lp.order = lp.orderMaps.get(bestSid) || [];
+      lp.firstT = lp.firstTMaps.get(bestSid) || new Map();
+      // 清理：超过 10 分钟没更新的请求记录丢弃（请求早该完成）
+      const cutoff = now / 1000 - 600;
+      for (const [rid, rec] of lp.byRid) {
+        if ((rec.t || 0) < cutoff) { lp.byRid.delete(rid); lp.firstT.delete(rid); }
+      }
+      lp.updatedAt = now;
+    }
+    lp.selectedPid = pid;
+    lp.fresh = fresh;
+  } catch (e) { /* 文件不存在 → 无实时数据，走估算 */ lp.fresh = false; }
+  return lp;
+}
+
+// ====== 控制台任务号（跨 GPU 关联同一任务）======
+// 每个经控制台代理转发的生成请求，到达时分配全局递增任务号 T<seq>。
+// PD 两步转发：prefill 腿到达即注册、decode 腿在 STEP2 真正转发（prefill 完成）
+// 时注册，两腿同任务号；常规单实例转发每请求一个。
+// REQ 跟踪器按端口给请求生 REQ-n 时按 FIFO 认领任务号 → 同一逻辑请求在
+// GPU0（预填充）与 GPU1（输出）两行显示相同的 T 号；前端按 T 号同色。
+let __taskSeq = 0;
+const __taskForward = new Map(); // port -> [{taskId, at, claimed, crid}]
+function nextTaskId() { return 'T' + (++__taskSeq); }
+function taskForwardRegister(port, taskId, crid) {
+  const key = String(port || 8000);
+  if (!__taskForward.has(key)) __taskForward.set(key, []);
+  const q = __taskForward.get(key);
+  if (q.length > 500) q.shift(); // 防异常堆积
+  q.push({ taskId, at: Date.now(), claimed: false, crid: crid || null });
+}
+// 认领任务号；返回 {taskId, crid}。crid 供行凭 clientReqId→rid 精确认领引擎序列。
+function taskForwardClaim2(port) {
+  const q = __taskForward.get(String(port || 8000));
+  if (!q || !q.length) return null;
+  const now = Date.now();
+  while (q.length && now - q[0].at > 120000) q.shift(); // 120s 未认领过期（客户端断开等）
+  for (const rec of q) { if (!rec.claimed) { rec.claimed = true; return { taskId: rec.taskId, crid: rec.crid || null }; } }
+  return null;
+}
+function taskForwardClaim(port) {
+  const c = taskForwardClaim2(port);
+  return c ? c.taskId : null;
+}
+// 消费指定任务号在指定端口的未认领记录：幂等。调用点：
+// ① PD 交棒——prefill 完成后 STEP2 转发 decode 腿时消费 prefill 腿；
+// ② 请求收尾——代理响应结束/客户端断开时消费该腿（快请求在两次 metrics
+//    轮询间跑完、fill 没认领的记录，靠这里清掉，否则滞留排队列表最多 120s）
+function taskForwardConsume(port, taskId) {
+  const q = __taskForward.get(String(port || 8000));
+  if (!q || !taskId) return;
+  for (const rec of q) if (!rec.claimed && rec.taskId === taskId) { rec.claimed = true; return; }
+}
+
+// port：实例端口（请求身份 tracker 按端口独立，ss 抓对端 IP 用该端口）
+// ticker：该端口的每秒 token ticker（多实例下各采各的，主实例传 global.__tokTicker）
+function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapsedMs, lastRunning, perReqTokens, livePrefill, port, ticker) {
+  const keyPrefix = 'vllm:';
+  // v2 采样兜底：stats 轮询时若该端口采样器 >2.5s 未更新（主 ticker 因
+  // 事件循环阻塞/实例刚上线漏采样），就地补采一次。
+  {
+    const sp0 = reqOutSamplerFor(port || config.vllmPort);
+    if (Date.now() - (sp0.lastSeenAt || 0) > 2500) sampleReqOutGauges(port || config.vllmPort);
+  }
+  // Build model label dynamically from available metrics keys
+  // parseMetrics encodes as |{json}, so search for | not {
+  let modelLabel = '';
+  const allLabels = Object.keys(m);
+  for (const k of allLabels) {
+    const pipeIdx = k.indexOf('|');
+    if (pipeIdx > 0 && k.substring(0, pipeIdx) === 'vllm:num_requests_running') {
+      modelLabel = k.substring(pipeIdx);
+      break;
+    }
+  }
+  // For prompt_tokens_by_source_total, extract model label from any _by_source metric
+  let sourceLabelPrefix = modelLabel;
+  let foundSource = false;
+  for (const k of allLabels) {
+    if (k.startsWith('vllm:prompt_tokens_by_source_total|')) {
+      const pipeIdx = k.indexOf('|');
+      const labelPart = k.substring(pipeIdx); // |{...}
+      // Find the source key portion
+      const sourceIdx = labelPart.indexOf('"source"');
+      if (sourceIdx > 0) {
+        // Extract everything before "source"
+        sourceLabelPrefix = labelPart.substring(0, sourceIdx);
+        foundSource = true;
+      }
+      break;
+    }
+  }
+  if (!foundSource) sourceLabelPrefix = modelLabel;
+  const running = Math.round(m[keyPrefix + 'num_requests_running' + modelLabel] || 0);
+  const queued = Math.round(m[keyPrefix + 'num_requests_waiting' + modelLabel] || 0);
+  const reqGenCount = m[keyPrefix + 'request_generation_tokens_count' + modelLabel] || 0;
+  const reqGenSum = m[keyPrefix + 'request_generation_tokens_sum' + modelLabel] || 0;
+  const reqDecodeCount = m[keyPrefix + 'request_decode_time_seconds_count' + modelLabel] || 0;
+  const reqDecodeSum = m[keyPrefix + 'request_decode_time_seconds_sum' + modelLabel] || 0;
+
+  const keyPrefillCount = keyPrefix + 'request_prefill_time_seconds_count' + modelLabel;
+  const keyPrefillSum = keyPrefix + 'request_prefill_time_seconds_sum' + modelLabel;
+  const keyPromptTokensCount = keyPrefix + 'request_prompt_tokens_count' + modelLabel;
+  const keyPromptTokensSum = keyPrefix + 'request_prompt_tokens_sum' + modelLabel;
+  const reqPrefillCount = m[keyPrefillCount] || 0;
+  const reqPrefillSum = m[keyPrefillSum] || 0;
+  const reqPromptTokensCount = m[keyPromptTokensCount] || 0;
+  const reqPromptTokensSum = m[keyPromptTokensSum] || 0;
+  const avgPrefillTime = reqPrefillCount > 0 ? (reqPrefillSum / reqPrefillCount) : 0;
+  const avgPrefillTokens = reqPromptTokensCount > 0 ? (reqPromptTokensSum / reqPromptTokensCount) : 0;
+
+  const uncachedTotal = m[keyPrefix + 'prompt_tokens_by_source_total' + sourceLabelPrefix + '"source":"local_compute"}'] || 0;
+  const cachedTotal   = m[keyPrefix + 'prompt_tokens_by_source_total' + sourceLabelPrefix + '"source":"local_cache_hit"}'] || 0;
+  const grandTotal    = uncachedTotal + cachedTotal;
+  const uncachedRatio = grandTotal > 0 ? (uncachedTotal / grandTotal) : 0;
+  const avgUncachedTokens = reqPromptTokensCount > 0 ? (avgPrefillTokens * uncachedRatio) : 0;
+  const avgCachedTokens = reqPromptTokensCount > 0 && grandTotal > 0 ? (avgPrefillTokens * (cachedTotal / grandTotal)) : 0;
+
+  const avgTokensPerReq = reqGenCount > 0 ? (reqGenSum / reqGenCount) : 0;
+  const avgDecodeTime = reqDecodeCount > 0 ? (reqDecodeSum / reqDecodeCount) : 0;
+
+  let totalSpeed = 0;
+  if (elapsedMs > 0 && genTokensTotal > lastGenTokensTotal) {
+    const delta = genTokensTotal - lastGenTokensTotal;
+    totalSpeed = (delta / elapsedMs) * 1000;
+  }
+
+  // Per-request speed estimation
+  let perRequestDecodeSpeed = 0;
+  let perRequestPrefillSpeed = 0;
+
+  if (avgDecodeTime > 0 && avgTokensPerReq > 0) {
+    perRequestDecodeSpeed = avgTokensPerReq / avgDecodeTime;
+  } else if (running > 0 && totalSpeed > 0) {
+    perRequestDecodeSpeed = totalSpeed / running;
+  }
+
+  if (avgPrefillTime > 0 && avgUncachedTokens > 0) {
+    perRequestPrefillSpeed = avgUncachedTokens / avgPrefillTime;
+  }
+
+  // ====== Request identity tracker（按端口独立）======
+  // vLLM metrics carry no per-request id. Track request births via the
+  // cumulative vllm:num_requests_total counter and attribute each new request
+  // to a newly-appeared TCP connection on the instance port (best-effort caller IP).
+  // Ids (REQ-n) and per-request token totals persist across polls.
+  // 多卡多实例：每个端口一个独立 tracker，两实例的 REQ 编号/live 列表/预填充
+  // 基线互不串扰（共用一个 tracker 会让两实例的 num_requests_total 相加、
+  // live 列表互相挤占，并发显示错乱）。
+  if (!global.__reqTrackers) global.__reqTrackers = new Map();
+  const rtKey = String(port || 8000);
+  let rt = global.__reqTrackers.get(rtKey);
+  if (!rt) {
+    rt = { seq: 0, lastTotal: null, live: [], conns: new Set() };
+    global.__reqTrackers.set(rtKey, rt);
+  }
+  let totalStarted = 0;
+  for (const k of Object.keys(m)) {
+    if (k.startsWith('vllm:num_requests_total')) totalStarted += (m[k] || 0);
+  }
+  // Established peer IPs on the instance port (server side)
+  let peers = new Set();
+  const ssPort = port || 8000;
+  try {
+    const ssOut = require('child_process').execSync(
+      `ss -tHn state established '( sport = :${ssPort} )' 2>/dev/null || true`,
+      { encoding: 'utf8', timeout: 4000 });
+    ssOut.split('\n').forEach(line => {
+      for (const c of line.trim().split(/\s+/)) {
+        if (c && c.includes(':') && !c.endsWith(':' + ssPort) && /^[\d.:]+$/.test(c)) {
+          peers.add(c.split(':')[0]);
+          break;
+        }
+      }
+    });
+  } catch (e) { /* ss unavailable — identities degrade to '—' */ }
+
+  if (rt.lastTotal === null) {
+    rt.lastTotal = totalStarted; // first sight: baseline, no retroactive ids
+  } else if (totalStarted < rt.lastTotal) {
+    // Counter went backwards: vLLM restart or stats-reset rebaselining
+    rt.lastTotal = totalStarted; rt.live = []; rt.conns = new Set();
+  } else {
+    const born = totalStarted - rt.lastTotal;
+    const newPeers = [...peers].filter(ip => !rt.conns.has(ip));
+    for (let i = 0; i < born; i++) {
+      // Keep-alive reuse: no fresh connection, but if there is exactly one
+      // connected client it is almost certainly the caller.
+      const ip = newPeers[i]
+        || (newPeers.length === 0 && peers.size === 1 ? [...peers][0] : '—');
+      {
+        const claim = taskForwardClaim2(port);
+        if (claim && claim.crid) linkTaskCrid(claim.taskId, claim.crid);
+        rt.live.push({ id: 'REQ-' + (++rt.seq), ip: ip, startedAt: Date.now(), tokens: 0, taskId: claim ? claim.taskId : null, crid: claim ? claim.crid : null });
+      }
+    }
+  }
+  rt.lastTotal = totalStarted;
+  rt.conns = peers;
+
+  // Align the live list with the running gauge. Completions are normally the
+  // oldest requests (FCFS), but a request that was born AND completed between
+  // two polls must not knock out a long-running one — retire young entries
+  // (<2s old) first.
+  // 排队请求保活：超过 running 的多余行，若「本轮刚出生」（仍排队未进 running
+  // 批次）则移到 rt.hold 保留身份（REQ 号/任务号），调度后优先回归，保证
+  // 排队→预填充→输出全程同一编号；1-2.5s 前出生的行视为出生+完成于两轮之间，
+  // 直接丢弃；其余按 FCFS 视为完成。
+  while (rt.live.length > running) {
+    const nowTs = Date.now();
+    let idx = rt.live.findIndex(r => nowTs - r.startedAt >= 1000 && nowTs - r.startedAt < 2500);
+    if (idx !== -1) { rt.live.splice(idx, 1); continue; }
+    idx = rt.live.findIndex(r => nowTs - r.startedAt < 1000);
+    if (idx !== -1) {
+      const r = rt.live.splice(idx, 1)[0];
+      // 仅「出生行」（fill 之前创建的排队行）可保活；fill 创建的行是 running
+      // 请求（刚启动的 prefill tokens 仍为 0、decodeStart 未设，不能误判为排队）
+      if (r && !r.tokens && !r.decodeStart && !r.filled) {
+        rt.hold = rt.hold || [];
+        if (rt.hold.length < 300) rt.hold.push(r); // 排队保活（上限防泄漏）
+      }
+      continue;
+    }
+    rt.live.shift();
+  }
+  // 排队保活行过期清理（客户端取消等，10 分钟未调度即丢弃）
+  if (rt.hold && rt.hold.length) {
+    const hc = Date.now() - 600000;
+    rt.hold = rt.hold.filter(r => Date.now() - r.startedAt < hc);
+  }
+  while (rt.live.length < running) {
+    // 最老的排队请求优先调度（FCFS 近似）：回归原行，身份（REQ 号/任务号）不丢
+    const held = (rt.hold && rt.hold.length) ? rt.hold.shift() : null;
+    if (held) { held.filled = true; rt.live.push(held); }
+    else {
+      // 本环境 metrics 无 num_requests_total（vLLM 0.27.1），请求不会走 birth
+      // 路径，REQ 行全靠这里创建 → 任务号也必须在此认领（FIFO 对应转发顺序）
+      {
+        const claim = taskForwardClaim2(port);
+        if (claim && claim.crid) linkTaskCrid(claim.taskId, claim.crid);
+        rt.live.push({ id: 'REQ-' + (++rt.seq), ip: '—', startedAt: Date.now(), tokens: 0, taskId: claim ? claim.taskId : null, crid: claim ? claim.crid : null, filled: true });
+      }
+    }
+  }
+
+  // ====== REQ 行 ↔ 引擎请求匹配（vLLM 实时 prefill 数据）======
+  // vLLM 请求没有客户端可见的 id，控制台的 REQ-n 是合成的。这里按到达时间
+  // （引擎侧 arrival）就近匹配，已匹配的行记住 ppRid 持续复用；vLLM 重启
+  // （sid 变化）时清除全部匹配重新建立。
+  // 容差说明：REQ 行的 startedAt 可能是「请求到达代理」或「请求进入 running
+  // 批次」（排队请求在 max-num-seqs 满时等待后被调度，行才创建）。两者与引擎
+  // arrival 的偏差可达排队时长（几十秒），故容差放宽到 120s；近距优先 + 已匹配
+  // 复用保证并发请求不会互相抢错。
+  if (livePrefill && livePrefill.sid && livePrefill.byRid && livePrefill.byRid.size > 0) {
+    const lpm = livePrefill.byRid;
+    const used = new Set();
+    for (let i = 0; i < rt.live.length; i++) {
+      const lv = rt.live[i];
+      if (!lv) continue;
+      if (rt.ppSid !== livePrefill.sid) {
+        // 会话变化（vLLM 重启）：旧匹配作废
+        lv.ppRid = null; lv.ppLastDone = undefined; lv.ppEstDone = undefined;
+      }
+      const target = lv.startedAt / 1000;
+      // v2 精确认领（09-17）：代理 tee 首帧捕获的引擎 rid（taskId→crid→rid 链，
+      // 见 __clientReqRid）若存在于本引擎流 → 直接绑定，跳过 arrival 最近邻。
+      // 并发同秒启动时最近邻会错绑（arrival 几乎相同），错绑行会显示别人的
+      // 输出序列——精确链把这类行全部救回。
+      if (lv.taskId || lv.crid) {
+        const _crid = lv.crid || (global.__taskCrid && global.__taskCrid.get(lv.taskId));
+        const _ce = _crid && global.__clientReqRid ? global.__clientReqRid.get(_crid) : null;
+        const _prid = _ce ? ridFind(lpm, _ce.rid) : null;
+        if (_prid) {
+          if (lv.ppRid !== _prid) {
+            lv.ppRid = _prid; lv.ppLastDone = undefined; lv.ppEstDone = undefined;
+            lv.cHist = []; // 换绑序列作废，防旧序列污染测速窗
+          }
+          lv.ppExact = true;
+          used.add(lv.ppRid);
+          continue;
+        } else if (lv.ppExact) lv.ppExact = false; // rid 记录已被清理：回落最近邻
+      }
+      // 已进入 decode 的行放宽回绑：只允许绑定「prefill 已完成」的引擎记录
+      // （computed+cached ≥ prompt_total，防止旧 decode 行把仍在 prefill 的
+      // 新请求记录抢走），容差 300s（覆盖 decode 阶段引擎快照生失效的间隔）；
+      // prefill/排队行保持 120s 就近匹配。
+      const isDecodeRow = !!lv.decodeStart || lv.tokens > 0;
+      // 09-06 修复：prefill 行绑定的引擎记录如果已完成（computed+cached >= prompt_total），
+      // 说明匹配错误（并发流量下 arrival 时间碰撞），清除重绑到未完成的记录。
+      if (lv.ppRid && lpm.has(lv.ppRid)) {
+        const prevRec = lpm.get(lv.ppRid);
+        const prevFinished = (prevRec.computed || 0) + (prevRec.cached || 0) >= Math.round(prevRec.prompt_total || 0);
+        if (!isDecodeRow && prevFinished && !lv.ppExact) {
+          // prefill 行绑到了已完成记录 → 匹配错误，清除重绑（exact 绑定的
+          // 已完成记录是真的完成了，不清）
+          lv.ppRid = null;
+          lv.ppLastDone = undefined;
+          lv.ppEstDone = undefined;
+        } else {
+          used.add(lv.ppRid);
+          continue;
+        }
+      }
+      let best = null, bestDist = isDecodeRow ? 300 : 120;
+      for (const [rid, rec] of lpm) {
+        if (used.has(rid)) continue;
+        if (isDecodeRow) {
+          const finished = (rec.computed || 0) + (rec.cached || 0) >= Math.round(rec.prompt_total || 0);
+          if (!finished) continue;
+        } else {
+          // prefill 行：优先匹配未完成的记录（正在 prefill 的请求）
+          const finished = (rec.computed || 0) + (rec.cached || 0) >= Math.round(rec.prompt_total || 0);
+          if (finished) continue;
+        }
+        const d = Math.abs((rec.arrival || 0) - target);
+        if (d < bestDist) { bestDist = d; best = rid; }
+      }
+      // 09-06：prefill 行第一轮只匹配未完成记录；如果全部已完成（无未完成记录），
+      // 第二轮放宽到全部记录（兜底，防止无匹配）
+      if (!best && !isDecodeRow) {
+        for (const [rid, rec] of lpm) {
+          if (used.has(rid)) continue;
+          const d = Math.abs((rec.arrival || 0) - target);
+          if (d < bestDist) { bestDist = d; best = rid; }
+        }
+      }
+      lv.ppRid = best || null;
+      if (best) used.add(best);
+    }
+    rt.ppSid = livePrefill.sid;
+  } else if (rt.ppSid) {
+    // 实时数据缺失/过期：清除匹配，回落估算逻辑
+    rt.ppSid = null;
+    for (const lv of rt.live) {
+      if (lv) { lv.ppRid = null; lv.ppLastDone = undefined; }
+    }
+  }
+
+  // ====== Determine per-request phases & speeds ======
+  let activeRequests = [];
+  const savedPerReq = perReqTokens || {};
+  const nowPerReq = {};
+
+  // ====== 实时预填充速度/大小（直方图增量实测，无需归属猜测）======
+  // vLLM 的 request_prefill_kv_computed_tokens 直方图在每次 prefill 完成时记录
+  // 「实际计算的 token 数」（不含缓存命中）。count/sum 的增量 = 刚完成的 prefill
+  // 的平均 uncached token 量；request_prefill_time_seconds 增量给出耗时 → 实测速度。
+  // 存入 rt.lastPrefillUncached / rt.lastPrefillSpeed：
+  // prefill 行用它估计「总需」，decode 行显示最近一次完成 prefill 的实测值，
+  // 每次 prefill 完成都会刷新 —— 替代原来「显示一个值就不动」的静态累计平均值。
+  // 注意：必须在 if(running>0) 之外执行 —— 空闲时也要持续更新基线，否则首个
+  // 请求进来时增量检测被跳过（基线未初始化），只能回落累计平均值。
+  const ppComputedCount = m[keyPrefix + 'request_prefill_kv_computed_tokens_count' + modelLabel] || 0;
+  const ppComputedSum = m[keyPrefix + 'request_prefill_kv_computed_tokens_sum' + modelLabel] || 0;
+  if (rt.lastPpComputedCount !== undefined && ppComputedCount > rt.lastPpComputedCount) {
+    const dCount = ppComputedCount - rt.lastPpComputedCount;
+    const dSum = ppComputedSum - rt.lastPpComputedSum;
+    if (dCount > 0 && dSum > 0) rt.lastPrefillUncached = Math.round(dSum / dCount);
+    if (reqPrefillCount > rt.lastPpTimeCount) {
+      const dTime = reqPrefillSum - rt.lastPpTimeSum;
+      if (dTime > 0.05) rt.lastPrefillSpeed = parseFloat((dSum / dTime).toFixed(1));
+    }
+  }
+  rt.lastPpComputedCount = ppComputedCount;
+  rt.lastPpComputedSum = ppComputedSum;
+  rt.lastPpTimeCount = reqPrefillCount;
+  rt.lastPpTimeSum = reqPrefillSum;
+
+  if (running > 0) {
+    // Capture previous-poll token counts (for prefill→decode transition detection)
+    for (let i = 0; i < running; i++) {
+      const lv = rt.live[i];
+      if (lv) lv.lastTokens = lv.tokens;
+    }
+    // 本轮显示基准：优先用最近一次实测预填充速度，无实测时回落累计平均值
+    const livePrefillSpeed = (rt.lastPrefillSpeed && rt.lastPrefillSpeed > 0)
+      ? rt.lastPrefillSpeed : perRequestPrefillSpeed;
+
+    // ====== Per-request phase: ground truth = has this request passed TTFT? ======
+    // A request is in PREFILL iff it has generated 0 tokens so far (never passed
+    // TTFT); once it has >=1 token it is in DECODE. We read this directly from the
+    // per-request cumulative token tracker (rt.live[i].tokens). This fixes the old
+    // bug where a prefill spanning more than one poll (newRequests==0, totalSpeed==0)
+    // fell into the "stale → assume all decode" branch and was wrongly shown as 输出中.
+    const phaseOf = new Array(running).fill('prefill');
+    const zeroTokenIdx = [];
+    for (let i = 0; i < running; i++) {
+      const lv = rt.live[i];
+      if (lv && lv.tokens > 0) phaseOf[i] = 'decode';
+      else zeroTokenIdx.push(i);
+    }
+    // Bootstrap: when tokens ARE being generated (totalSpeed>0), a request that just
+    // passed TTFT may not have been credited yet (0 tokens). Use the decode-count
+    // estimate to mark the most-recent 0-token requests as decode so they start
+    // accumulating. (totalSpeed==0: 0-token requests stay prefill — still prefilling.)
+    if (totalSpeed > 0 && zeroTokenIdx.length > 0) {
+      // 引擎并发数估计优先：hist 模式 nEw = λ̄×W（Little 定律，λ 完成率/W 驻留
+      // 均来自引擎直方图实测）> 「总吞吐÷历史平均单请求速度」间接推断。后者在
+      // 长短请求混跑时把 decodeCount 估歪——长 prompt 并发下 0-token 行被误留在
+      // 预填充相位（整行速度恒 --，且 numDecode 变小让其余行速度全偏）。
+      let decodeCount;
+      const _sp0 = global.__reqOutSamplers && global.__reqOutSamplers.get(String(port || config.vllmPort));
+      if (_sp0 && _sp0.nEw !== undefined && Date.now() - (_sp0.winLastAt || 0) < 4000) {
+        decodeCount = Math.max(1, Math.min(Math.round(_sp0.nEw), running));
+      } else {
+        const avgSpeedPerRequest = avgDecodeTime > 0 && avgTokensPerReq > 0 ? (avgTokensPerReq / avgDecodeTime) : 0;
+        const numActiveDecodes = avgSpeedPerRequest > 0 ? totalSpeed / avgSpeedPerRequest : 0;
+        decodeCount = Math.max(1, Math.min(Math.round(numActiveDecodes), running));
+      }
+      const tokenDecodeCount = running - zeroTokenIdx.length;
+      let bootstrap = Math.max(0, decodeCount - tokenDecodeCount);
+      bootstrap = Math.min(bootstrap, zeroTokenIdx.length);
+      for (let j = 0; j < bootstrap; j++) phaseOf[zeroTokenIdx[zeroTokenIdx.length - 1 - j]] = 'decode';
+    }
+
+    // 实际处于 decode 的行数（bootstrap 之后）。总生成速度（generation_tokens_total
+    // 增量）只由 decode 行产生，prefill 行产出为 0 —— 所以单行速度必须按 decode
+    // 行数分摊，而不是按 running（含 prefill 行）分摊。旧逻辑用 running 分摊，
+    // 混跑时（如 2 个 prefill + 2 个 decode）每行只拿到真实速度的一半，偏差可达数倍。
+    let numDecode = 0;
+    for (let i = 0; i < running; i++) if (phaseOf[i] === 'decode') numDecode++;
+    const numPrefill = running - numDecode; // 当前处于预填充的行数（守恒分摊用）
+    const decodeShareSpeed = numDecode > 0 ? (totalSpeed / numDecode) : 0;
+
+    // ======================================================================
+    // ====== 行级实时输出速度 v2（2026-09-17 全新设计） ======
+    // 数据源 = 本模块（文件头 v2 注释）：sampler 每秒读 /metrics 每请求
+    // gauge（带真实 rid）或直方图驻回退。归属两级：
+    //   ① 精确：行凭 taskId→crid→rid（代理 tee 首帧登记）直查该 rid 序列；
+    //   ② 最近邻：直连流量按「引擎到达时刻（ttft−dec）vs 行 startedAt」
+    //      全局最近邻 + 粘性绑定（orphan 守卫）；
+    //   ③ 直方图驻留：实例无 req_id gauge 时的 v2 引擎真值（桶差分保守下界）；
+    //   ④ 全无：undefined（前端显示 --），由调用方回落 tee/residual。
+    // 数值口径：滑窗 Δgen/Δdecode_time（2~6s，分母只用该请求自身 GPU
+    // 生成时长）——排队/首包等待/引擎停顿天然排除，并发零摊分。
+    // ======================================================================
+    const _nowV2 = Date.now();
+    const sp = reqOutSamplerFor(port);
+    sp.lastSeenAt = _nowV2; // 端口活跃标记（清理器据此回收死亡端口的采样器）
+    let v2Used = false; // 本轮存在 v2 真值行 → 后续 v1 回落路径整体跳过
+    const rowV2 = new Array(running).fill(null); // {spd,gen,src} 行 v2 速度
+    {
+      // ---- 归属阶段（幂等：已绑定行保持，新行重配） ----
+      const claimed = new Set(); // 本轮已被行占用的 rid（orphan/最近邻守卫）
+      // ① 精确认领：taskId→crid→rid（代理流量）
+      for (let i = 0; i < running; i++) {
+        const lv = rt.live[i];
+        if (!lv) continue;
+        if (lv.roRidExact && sp.reqs.has(lv.roRidExact)) {
+          claimed.add(lv.roRidExact);
+          if (lv.roRid !== lv.roRidExact) { lv.roRid = lv.roRidExact; lv.roRidStickyAt = _nowV2; }
+          continue;
+        }
+        if (lv.roRidExact && !sp.reqs.has(lv.roRidExact)) lv.roRidExact = null; // 引擎序列已消失
+      }
+      for (let i = 0; i < running; i++) {
+        const lv = rt.live[i];
+        if (!lv || lv.roRidExact || !lv.taskId) continue;
+        const crid = lv.crid || (global.__taskCrid ? global.__taskCrid.get(lv.taskId) : null);
+        if (!crid) continue;
+        const e = global.__clientReqRid.get(crid);
+        if (!e) continue;
+        const rid = ridFind(sp.reqs, e.rid); // 容忍引擎内部 rid 的 -yyy 尾缀
+        if (!rid || claimed.has(rid)) continue;
+        if (sp.reqs.has(rid)) { claimed.add(rid); lv.roRidExact = rid; lv.roRid = rid; lv.roRidStickyAt = _nowV2; }
+      }
+      // ② 最近邻兜底（直连流量）：粘性优先 + 未绑定行 × 空闲 rid 按
+      //    |(ttft − dec) − startedAt/1000| 全局最近邻一对一（≤30s）。
+      //    引擎到达时刻 = ttft − dec（decode 前近似请求进引擎时刻）。
+      //    粘性有效期 10s：超时（gauge 空窗/实例重启）则重配。
+      const freeRids = [];
+      for (const [rid, r] of sp.reqs) {
+        if (claimed.has(rid)) continue;
+        if (r.ttft === undefined || r.dec === undefined) continue;
+        freeRids.push({ rid, arrive: r.ttft - (r.dec || 0) });
+      }
+      // 清理：被占用但行已消失/超时的绑定（占用表按端口隔离 = sp.occ）
+      const occ = sp.occ;
+      const occCutoff = _nowV2 - 20000;
+      for (const [rid, t] of occ) { if (t < occCutoff) occ.delete(rid); }
+      for (let i = 0; i < running; i++) {
+        const lv = rt.live[i];
+        if (!lv || lv.roRidExact || !lv.roRid) continue;
+        const busy = occ.get(lv.roRid);
+        const mine = busy === undefined || busy === lv.startedAt;
+        const fresh = sp.reqs.has(lv.roRid) && lv.roRidStickyAt !== undefined && (_nowV2 - lv.roRidStickyAt) < 10000;
+        if (mine && fresh) { claimed.add(lv.roRid); occ.set(lv.roRid, lv.startedAt); }
+        else lv.roRid = null;
+      }
+      const pairs = [];
+      for (let i = 0; i < running; i++) {
+        const lv = rt.live[i];
+        if (!lv || lv.roRidExact || lv.roRid) continue;
+        const target = lv.startedAt / 1000;
+        for (const fr of freeRids) {
+          if (claimed.has(fr.rid)) continue;
+          const d = Math.abs(fr.arrive - target);
+          if (d < 30) pairs.push({ i, rid: fr.rid, d });
+        }
+      }
+      pairs.sort((a, b) => a.d - b.d);
+      for (const pr of pairs) {
+        const lv = rt.live[pr.i];
+        if (!lv || lv.roRid || lv.roRidExact || claimed.has(pr.rid)) continue;
+        claimed.add(pr.rid); lv.roRid = pr.rid; lv.roRidStickyAt = _nowV2;
+        occ.set(pr.rid, lv.startedAt);
+      }
+      // ---- 测速阶段 ----
+      for (let i = 0; i < running; i++) {
+        const lv = rt.live[i];
+        if (!lv || phaseOf[i] !== 'decode' || !lv.roRid) continue;
+        const r = sp.reqs.get(lv.roRid);
+        if (!r) continue;
+        const rs = reqOutSpeed(r, _nowV2);
+        if (rs) {
+          v2Used = true;
+          rowV2[i] = { spd: rs.spd, gen: rs.gen, src: lv.roRidExact ? 'exact' : 'nearest' };
+          // 输出真值直接接管累计（引擎值优先于估算；允许回落修正）
+          if (rs.gen > lv.tokens) lv.tokens = rs.gen;
+        } else if (r.hist && r.hist.length) {
+          const lastS = r.hist[r.hist.length - 1];
+          if (lastS.gen > lv.tokens) lv.tokens = lastS.gen; // 窗口未成熟：至少接管累计
+        }
+      }
+      // ---- v2 直方图驻留兜底（实例无 req_id gauge 时的引擎真值回退） ----
+      // 进入兜底前清除残留 rid 绑定（该实例本无 gauge；绑到上轮 rid = 错速错数）
+      if (sp.cfgOk === false) {
+        for (let i = 0; i < running; i++) {
+          const lv = rt.live[i];
+          if (lv && (lv.roRid || lv.roRidExact)) { lv.roRid = null; lv.roRidExact = null; }
+        }
+      }
+      // Little 定律：速度 = 实例短窗吞吐 thrWin ÷ N（N=在途 decode 驻留
+      // genAvgWin，桶差分保守下界）。驻留与吞吐都是引擎真值 → 每行分得
+      // 同值（齐步 decode 真值本就相同；非齐步时各自窗口差更准）。
+      if (!v2Used && sp.cfgOk === false) {
+        const hm = reqOutHistModeSpeed(sp, _nowV2);
+        if (hm && hm.n > 0 && hm.thr > 0.5 && numDecode > 0) {
+          // 并发数取「引擎估计 nEw」与「行数 numDecode」的平衡：nEw 偏离行数
+          // ≤1 视为一致→按行数均分（个体公平）；偏离大（phase 误判/行泄漏）
+          // →按 nEw（引擎守恒优先，宁可每行偏高不少给）。
+          const nEst = Math.abs(hm.n - numDecode) <= 1 ? numDecode : Math.max(1, Math.min(Math.round(hm.n), numDecode + 1));
+          const v2HistSpd = hm.thr / nEst;
+          for (let i = 0; i < running; i++) {
+            if (phaseOf[i] !== 'decode') continue;
+            rowV2[i] = { spd: v2HistSpd, gen: undefined, src: 'hist' }; // src 值 hist→前端映射 v2-hist
+          }
+          // 累计输出不做均分回填（hist 只提供速度）：每行 gen 仍由 tee 文本估
+          // / v1 守恒积分负责。不置 v2Used——保留 tee 采集与 residual 兜底。
+          rt.__v2Hist = { win: hm.win, thr: hm.thr, n: nEst };
+        }
+      }
+      {
+        // v2 命中统计（供守恒/诊断字段）
+        let v2N = 0, v2Sum = 0;
+        for (let i = 0; i < running; i++) if (rowV2[i]) { v2N++; v2Sum += rowV2[i].spd; }
+        rt.__v2 = { n: v2N, sum: v2Sum, reqs: sp.reqs.size, cfgOk: sp.cfgOk, hist: !!rt.__v2Hist };
+      }
+    }
+    // ====== 回落路径（v2 无数据时启用：实例级短窗吞吐 + tee/引擎滑窗）======
+    let instTotalThroughput;
+    // v2-hist 模式：直方图驻留已建立时优先用 sampler 同口径吞吐（避免与
+    // ticker 滑窗窗口不一致导致 boundScale 偏离 1）
+    if (rt.__v2Hist && sp.thrWin !== undefined && sp.thrWin > 0) {
+      instTotalThroughput = sp.thrWin;
+    } else if (numDecode > 0 && ticker && Array.isArray(ticker.genHist) && ticker.genHist.length >= 2) {
+      const _hnow = Date.now();
+      const _h = ticker.genHist.slice(-4);
+      const _b = _h[_h.length - 1];
+      if (_b && _hnow - _b.t <= 3500) {
+        const _a = _h[0];
+        const _dt = (_b.t - _a.t) / 1000;
+        if (_dt >= 0.5) {
+          instTotalThroughput = Math.max(0, (_b.g - _a.g) / _dt);
+        }
+      }
+    }
+
+    // ====== 行级实测速度（09-15c）：代理 tee 流 ↔ REQ 行绑定 ======
+    // 引擎 /metrics 没有每请求计数器，齐步 decode 的各行历来同值（=总吞吐
+    // ÷ decode 行数）。8889 代理层对每条流式响应做 tee（__liveStreams，
+    // entry.tokens = 每行增量文本的 token 估算（09-16 起；旧版按行计数，
+    // MTP 一步一行时齐步各行数值恒相同；直连流量无 tee）。
+    // 绑定 = 同实例端口 + sticky（沿用上轮绑定）+ 全局最近邻（|行到达−流到达|
+    // 最小优先，≤120s，一对一）。绑定行显示自己的实测速度；未绑定行的残差
+    // =（引擎短窗总吞吐 − 已绑定实测之和）÷ 未绑定行数，守恒（各行之和≈引擎
+    // 实测）；直连流量引擎侧本就没有每请求数据，只能拿残差分摊值，不编造。
+    const _bnow = Date.now();
+    const liveCands = [];
+    const lsMap = v2Used ? null : ((global.__liveStreams && global.__liveStreams.map) || null);
+    if (lsMap) {
+      for (const [, e] of lsMap) {
+        if (e.done || !Array.isArray(e.tk) || e.tk.length < 2) continue;
+        if (e.port !== undefined && String(e.port) !== String(port)) continue;
+        const b = e.tk[e.tk.length - 1];
+        if (!b || _bnow - b.t > 3500) continue;
+        const a = e.tk[Math.max(0, e.tk.length - 4)];
+        const dt = (b.t - a.t) / 1000;
+        liveCands.push({ e, spd: (dt >= 0.5 && b.n > a.n) ? (b.n - a.n) / dt : undefined });
+      }
+    }
+    // ====== 引擎每请求实测（09-16，09-17 修订）：decode 阶段每请求输出增量 ======
+    // 两个每请求数据源，都要求「窗口内确有新 token」且窗口 ≥1.0s：
+    //  ① vLLM scheduler 每步流式回传的 num_computed_tokens（live-prefill jsonl，
+    //     含直连流量，最准）；
+    //  ② 代理 tee 流的输出 token 估算（走 8889 的流量）。
+    // 关键修订（09-17，用户报「并发请求输出实时 tok/s 不准确」）：
+    //  - 旧版只取窗口首个样本做基线（lv.cHist[0]）：decode 每行 8 个样本
+    //    ≈13s 长窗 → 速度是十几秒的平均，瞬时变化完全跟不上；现按样本时间戳
+    //    取「距现在最远且 ≥1s」的样本为基线（滑窗 ~1-3s）。
+    //  - 旧版 token 零增量也出数：行刚进 decode、尚未产出任何 token 时，
+    //    残差均摊立刻给满速（实测 REQ-86 显示 131 tok/s 时 gen=0）→ 每行
+    //    头几秒系统性虚高。现无增量 → undefined（行显示 --，如实）。
+    //  - 旧版 engine 源与 tee 源各自独立取窗：并发下若 ppRid 错配会显示
+    //    别人的速度。现 tee 绑定行一律以自身流为准（每请求真值，与引擎
+    //    boundScale 对齐后误差远小于错配风险）。
+    const _spdNow = Date.now();
+    const _SPD_WIN_MIN_MS = 1000;   // 速度窗口下限：低于此不出数（防噪声）
+    const _SPD_WIN_MAX_MS = 3000;   // 速度窗口上限：瞬时性优先，不做长平均
+    const _SPD_STALE_MS = 4000;     // 最后一个样本陈旧阈值：流卡死/断开则不出数
+    // 通用滑窗测速：从 {t, c} 升序样本数组取「最远且 ≥winMin」的样本为基线
+    // （受 winMax 约束：若无样本落在 [now-winMax, now-winMin]，取距现在 ≥winMin
+    //  的最老样本）；末样本必须比基线新且有正增量。返回 {spd, span, idle}。
+    const windowRate = (hist, nowMs) => {
+      if (!Array.isArray(hist) || hist.length < 2) return null;
+      const last = hist[hist.length - 1];
+      if (!last || (nowMs - last.t) > _SPD_STALE_MS) return null;
+      let base = null;
+      for (let k = 0; k < hist.length - 1; k++) {
+        const smp = hist[k];
+        const age = nowMs - smp.t;
+        if (age < _SPD_WIN_MIN_MS) continue;
+        if (age <= _SPD_WIN_MAX_MS) { base = smp; break; }
+        if (!base) base = smp; // 首个超窗样本：暂选，继续找更靠近窗内的
+      }
+      if (!base) { base = hist[0]; if ((nowMs - base.t) < _SPD_WIN_MIN_MS) return null; }
+      const span = (last.t - base.t) / 1000;
+      if (span < 1.0) return null;
+      const d = (last.c || 0) - (base.c || 0);
+      if (d <= 0) return { spd: 0, span: 0, idle: true };
+      return { spd: d / span, span, idle: false };
+    };
+    const rowEngOut = new Array(running).fill(undefined);
+    {
+      const lpm2 = (livePrefill && livePrefill.byRid) || null;
+      if (lpm2) {
+        for (let i = 0; i < running; i++) {
+          if (phaseOf[i] !== 'decode') continue;
+          const lv = rt.live[i];
+          if (!lv || !lv.ppRid) continue;
+          const pr = lpm2.get(lv.ppRid);
+          if (!pr || pr.computed === undefined) continue;
+          if (!Array.isArray(lv.cHist)) lv.cHist = [];
+          const cl = lv.cHist[lv.cHist.length - 1];
+          if (!cl || cl.c !== pr.computed) {
+            lv.cHist.push({ t: _spdNow, c: pr.computed });
+            if (lv.cHist.length > 12) lv.cHist.shift();
+          }
+          if (pr.prompt_total) rowEngOut[i] = Math.max(0, Math.round(pr.computed - pr.prompt_total));
+          // v2 引擎每请求流测速（实例不导出 Prometheus req_id gauge 时的每请求
+          // 真值通道：dsh_vllm_logger 按 rid 流式上报 computed，computed−
+          // prompt_total = 该请求已生成 token）。占用 rowV2 覆盖 hist 均摊行；
+          // 窗口无增量=流冻结，保留 hist 聚合值（分层降级，均不出编造值）。
+          const wrE = windowRate(lv.cHist, _spdNow);
+          if (wrE && !wrE.idle) {
+            let exactE = false;
+            if (lv.taskId || lv.crid) {
+              const _crid = lv.crid || global.__taskCrid.get(lv.taskId);
+              const _e = _crid ? global.__clientReqRid.get(_crid) : null;
+              if (_e && ridMatches(_e.rid, lv.ppRid)) exactE = true; // tee 首帧确认 rid
+            }
+            rowV2[i] = { spd: wrE.spd, gen: rowEngOut[i], src: exactE ? 'exact' : 'eng' };
+          }
+        }
+      }
+    }
+    // 代理 tee 流 → 与 REQ 行绑定（sticky 沿用 + 全局最近邻一对一，≤120s）。
+    // 09-17：绑定改用 windowRate 滑窗（旧版固定取 tk 前 4 样本 ≈3s 定窗）。
+    const rowLiveSpd = new Array(running).fill(undefined);
+    const rowLiveSpan = new Array(running).fill(undefined);
+    const usedLiveIds = new Set();
+    if (liveCands.length > 0) {
+      for (let i = 0; i < running; i++) {
+        if (phaseOf[i] !== 'decode') continue;
+        const lv = rt.live[i];
+        if (!lv || !lv.boundLiveId) continue;
+        const c = liveCands.find(c2 => c2.e.id === lv.boundLiveId && !usedLiveIds.has(c2.e.id));
+        if (c) {
+          usedLiveIds.add(c.e.id);
+          const wr = windowRate(c.e.tk.map(x => ({ t: x.t, c: x.n })), _bnow);
+          if (wr) { rowLiveSpd[i] = wr.spd; rowLiveSpan[i] = wr.span; }
+          lv.boundLive = c.e;
+          lv.boundSpd = c.spd;
+        } else { lv.boundLiveId = null; lv.boundLive = null; lv.boundSpd = undefined; }
+      }
+      const pairs = [];
+      for (let i = 0; i < running; i++) {
+        if (phaseOf[i] !== 'decode' || rowLiveSpd[i] !== undefined) continue;
+        const lv = rt.live[i];
+        if (!lv) continue;
+        for (let j = 0; j < liveCands.length; j++) {
+          const c = liveCands[j];
+          if (usedLiveIds.has(c.e.id)) continue;
+          const d = Math.abs((lv.startedAt || 0) - c.e.startedAt);
+          if (d < 120000) pairs.push({ i, j, d });
+        }
+      }
+      pairs.sort((a, b) => a.d - b.d);
+      for (const p of pairs) {
+        if (rowLiveSpd[p.i] !== undefined || usedLiveIds.has(liveCands[p.j].e.id)) continue;
+        usedLiveIds.add(liveCands[p.j].e.id);
+        const wr = windowRate(liveCands[p.j].e.tk.map(x => ({ t: x.t, c: x.n })), _bnow);
+        if (wr) { rowLiveSpd[p.i] = wr.spd; rowLiveSpan[p.i] = wr.span; }
+        rt.live[p.i].boundLiveId = liveCands[p.j].e.id;
+        rt.live[p.i].boundLive = liveCands[p.j].e;
+        rt.live[p.i].boundSpd = liveCands[p.j].spd;
+      }
+    }
+    // ====== 行级速度仲裁 + 守恒分摊（09-17） ======
+    // 每行候选值优先级：tee 绑定行实测 > 引擎每请求实测 > 残差。
+    // boundScale 用「所有每请求候选值之和」对齐引擎短窗总吞吐（限 [0.5,3]），
+    // 无每请求数据的行（直连流量）按缩放后的候选值之和分摊剩余吞吐——
+    // 各行之和 ≈ 引擎实测，任何行都不再凭空满速。
+    const rowCandSpd = new Array(running).fill(undefined); // 参与校准的每请求候选值（未缩放）
+    const rowCandKind = new Array(running).fill(null);      // 'v2' | 'tee' | 'engine'
+    for (let i = 0; i < running; i++) {
+      if (phaseOf[i] !== 'decode') continue;
+      // v2 每请求真值优先（decode 时间滑窗，精确到请求个体）；v1 tee/引擎作次选
+      if (rowV2[i] !== null && rowV2[i].src !== 'hist') { rowCandSpd[i] = rowV2[i].spd; rowCandKind[i] = 'v2-' + rowV2[i].src; }
+      else if (rowLiveSpd[i] !== undefined) { rowCandSpd[i] = rowLiveSpd[i]; rowCandKind[i] = 'tee'; }
+    }
+    let candSum = 0, candN = 0, unboundDecode = 0;
+    for (let i = 0; i < running; i++) {
+      if (phaseOf[i] !== 'decode') continue;
+      if (rowCandSpd[i] !== undefined) { candSum += rowCandSpd[i]; candN++; }
+      else unboundDecode++;
+    }
+    // 守恒校准（v2 修订）：行值整体缩放以对齐「引擎实例短窗总吞吐 ∪ Σv2」
+    // （两者都实测；Σv2 在部分行窗口未成熟时可能低于总量，取大者保证不被
+    // 低估）。缩放限 [0.5,3]：字符估算口径误差可双向；纯 v2 场景 Σ≈真值。
+    const instThrEff = Math.max(instTotalThroughput !== undefined ? instTotalThroughput : 0, rt.__v2 ? rt.__v2.sum : 0);
+    let boundScale = 1;
+    if (candN > 0 && instThrEff > 0 && candSum > 0.5) {
+      const estDenom = candSum + (candSum / candN) * unboundDecode;
+      boundScale = Math.min(3, Math.max(0.5, instThrEff / estDenom));
+    }
+    let residualSpd;
+    if (!v2Used && instThrEff > 0 && unboundDecode > 0) {
+      residualSpd = Math.max(0, instThrEff - candSum * boundScale) / unboundDecode;
+    }
+
+    // Decode speed estimate from avg_decode_time
+    // avg_decode_time = average time per token per request (seconds)
+    // So 1/avg_decode_time = tokens per second per request
+    let estimatedDecodeSpeed = 0;
+    if (avgDecodeTime > 0) {
+      estimatedDecodeSpeed = parseFloat((1 / avgDecodeTime).toFixed(1));
+    } else if (perRequestDecodeSpeed > 0) {
+      estimatedDecodeSpeed = perRequestDecodeSpeed;
+    }
+
+    for (let i = 0; i < running; i++) {
+      const isPrefill = phaseOf[i] === 'prefill';
+      const reqId = i + 1;
+      const live = rt.live[i] || { id: 'REQ-' + reqId, ip: '—', startedAt: Date.now(), tokens: 0 };
+      let reqSpeed = 0;
+      let reqPhase;
+      let justEnteredDecode = false;
+
+      if (isPrefill) {
+        reqPhase = 'prefill';
+        nowPerReq[reqId] = 0;
+      } else {
+        reqPhase = 'decode';
+        // 首次进入 decode（越过 TTFT）记下时刻，作为「输出阶段」的起点：
+        // avg_speed 只按 decode 时长求平均，不再把 prefill/排队/TTFT 等待算进
+        // 分母（旧逻辑用整个生命周期做分母，长 prompt 请求显示值被严重拉低）。
+        // 本轮不发放 token 积分（无法确定何时越过 TTFT，按整窗摊分会虚高），
+        // 从下一轮起再开始累计。
+        justEnteredDecode = !live.decodeStart;
+        if (justEnteredDecode) live.decodeStart = Date.now();
+        // 累计输出（tokens_generated / avg_speed 的数据源）优先每请求真值
+        // （09-17）：旧版一律按 decodeShareSpeed 均摊积分，直连请求会吃掉
+        // 代理请求的产出（两行同值）、并发下还会互相污染。每请求真值：
+        //  ① 引擎 computed − prompt_total（rowEngOut）；② 代理 tee 流文本估
+        //     （lv.boundLive.tokens，走 8889 的流量）。都没有才回落均摊积分。
+        reqSpeed = 0;
+        nowPerReq[reqId] = savedPerReq[reqId] || 0;
+      }
+
+      // 每请求真值累计回填（09-17，09-17b 修正）：每请求真值
+      // （引擎 computed−prompt_total / 代理 tee 流文本估）可能因 rid 匹配
+      // 漂移、字符估算口径而短暂低于已持有的累计值（含旧均摊积分，只高不低
+      // 会误伤），故只有真值 ≥ 当前累计才覆盖；真值回落后又抬升时取抬升值。
+      // 效果：单调不减，消除「gen 冻结 → 恢复跳变」的显示锯齿。
+      if (reqPhase === 'decode') {
+        let trueTok = -1;
+        if (rowV2[i] !== null && rowV2[i].gen !== undefined) trueTok = Math.max(trueTok, rowV2[i].gen);
+        if (rowEngOut[i] !== undefined) trueTok = Math.max(trueTok, rowEngOut[i]);
+        const _blv = rt.live[i] && rt.live[i].boundLive;
+        if (_blv && !_blv.done) trueTok = Math.max(trueTok, Math.round(_blv.tokens || 0));
+        if (trueTok >= 0 && trueTok >= live.tokens) live.tokens = trueTok;
+      }
+      // tokens_since_last: 本轮该行新增输出（优先每请求真值差，回落均摊）
+      let tokensSinceLast = 0;
+      {
+        const prevTk = savedPerReq[reqId] || 0;
+        if (reqPhase === 'decode' && (rowV2[i] !== null || (rt.live[i] && rt.live[i].boundLive))) {
+          tokensSinceLast = Math.max(0, live.tokens - prevTk);
+        } else if (reqPhase === 'decode' && elapsedMs > 0 && totalSpeed > 0) {
+          tokensSinceLast = parseFloat((decodeShareSpeed * elapsedMs / 1000).toFixed(1));
+        }
+      }
+
+      // A request born DURING this interval only existed part of it — crediting
+      // the full interval share inflates its cumulative (and its average).
+      const bornThisInterval = live.startedAt > (Date.now() - (elapsedMs || 0));
+      if (reqPhase === 'decode' && tokensSinceLast > 0 && !bornThisInterval && !justEnteredDecode) {
+        live.tokens += (rowV2[i] !== null || (rt.live[i] && rt.live[i].boundLive)) ? 0 : tokensSinceLast;
+      }
+      if (reqPhase === 'decode') nowPerReq[reqId] = Math.round(live.tokens);
+      // 行级瞬时速度（v2 定版）：v2 真值（exact/nearest/hist）> 代理 tee
+      // 实测 > 引擎实时实测（v1）> 残差分摊（仅 v2 全无时）。
+      //  ① v2 hist 行由测速阶段统一发放（已按实例吞吐校准，scale=1）；
+      //  ② v2 exact/nearest 与 tee/engine 候选同乘 boundScale：各行之和
+      //     恒 ≈ 引擎短窗总吞吐（守恒）；
+      //  ③ 刚进 decode 只用该行 tee 即时值，绝不用残差（旧版「刚输出就
+      //     满速」的根因）；
+      //  ④ residual 仅在 v2Used=false（无任何每请求真值）时才存在。
+      let reqSpeed3s;
+      let reqSpdSrc;
+      if (reqPhase === 'decode') {
+        if (rowV2[i] !== null && rowV2[i].src !== 'hist') {
+          // v2 精确/最近邻每请求真值（decode 时间滑窗；引擎绝对值不缩放）
+          reqSpeed3s = parseFloat(rowV2[i].spd.toFixed(1)); reqSpdSrc = 'v2-' + rowV2[i].src;
+        } else if (rowV2[i] !== null && rowV2[i].src === 'hist') {
+          // v2 直方图驻留（每行同值 = 实例吞吐÷引擎测得并发数 λ̄×W）。优先于
+          // 逐行 tee：无每请求 gauge 的实例上 tee 依赖易漂移的 行↔流 配对，
+          // 错配时各行显示互相错位的值（历史顽疾）；齐步 decode 下每行真值
+          // 本就相同——引擎守恒值即真值，且天然稳定。
+          reqSpeed3s = parseFloat(rowV2[i].spd.toFixed(1)); reqSpdSrc = 'v2-hist';
+        } else if (rowCandSpd[i] !== undefined) {
+          reqSpeed3s = parseFloat((rowCandSpd[i] * boundScale).toFixed(1));
+          reqSpdSrc = rowCandKind[i];
+        } else if (justEnteredDecode) {
+          const _b0 = rt.live[i] && rt.live[i].boundSpd;
+          if (_b0 !== undefined && _b0 > 0) {
+            reqSpeed3s = parseFloat((_b0 * boundScale).toFixed(1)); reqSpdSrc = 'tee';
+          }
+        } else if (residualSpd !== undefined) {
+          reqSpeed3s = parseFloat(residualSpd.toFixed(1)); reqSpdSrc = 'residual';
+        }
+      }
+      // Per-request actual throughput = its own cumulative tokens / its own
+      // DECODE-phase elapsed time (自 TTFT 之后起算)。这样「输出中」行显示的值
+      // 就是它真实产出 token 的平均速度，prefill/TTFT 等待不再拉低分母；
+      // 引擎真正停顿时（本轮增量 0、token 不再累计）均值会如实回落。
+      const liveElapsed = (Date.now() - live.startedAt) / 1000;
+      const decodeElapsed = (Date.now() - (live.decodeStart || live.startedAt)) / 1000;
+      const avgDenom = decodeElapsed >= 0.5 ? decodeElapsed : liveElapsed;
+      // Tokens THIS request produced in the last 1 second (server-side ticker):
+      // the batch's measured last-second token total split across decode rows.
+      // In lockstep decode every row gets the same count — that is the truth.
+      const tk = (ticker && ticker.lastSecond) ? ticker.lastSecond : { tokens: 0 };
+      const tokLastSec = reqPhase === 'decode' && numDecode > 0
+        ? Math.max(0, Math.round((tk.tokens || 0) / numDecode))
+        : 0;
+
+      // ====== 本行预填充统计：引擎实测 > 实测聚合守恒分摊 > 历史估算 ======
+      // 1) 引擎实测（prefill_exact=true，vLLM 插件实时回传）：该请求的
+      //    prompt_total / computed / cached 全为引擎值，进度与速率精确。
+      // 2) 守恒分摊（无每请求数据时）：把 ticker 每秒实测的未缓存预填充吞吐
+      //    （prompt_tokens_by_source local_compute 增量）按并发预填充行数均分
+      //    —— 各行之和 = 实测聚合，可溯源；进度 = 分摊速率 × 耗时的累计。
+      // 3) 兜底（无引擎实测也无实时聚合信号）：最近一次完成 prefill 的直方图
+      //    实测值（原逻辑），前端标「估」。
+      const ppRec = (livePrefill && livePrefill.byRid && live.ppRid)
+        ? livePrefill.byRid.get(live.ppRid) : null;
+      const ppTicker = (ticker && ticker.lastSecond) || {};
+      const aggPP = ppTicker.uncachedPPS || 0; // 实测未缓存预填充吞吐（tok/s）
+      const ppDt = elapsedMs > 0 ? elapsedMs / 1000 : 0;
+      let prefillExact = false;
+      let prefillS = 0;        // 预填充执行耗时（精确；完成时才有值）
+      let prefillCached = 0;
+      let prefillTotalUncached = rt.lastPrefillUncached || Math.round(avgUncachedTokens);
+      let prefillDoneUncached = prefillTotalUncached;
+      let rowPrefillTps = 0;
+      if (ppRec) {
+        prefillExact = true;
+        prefillCached = Math.round(ppRec.cached || 0);
+        prefillTotalUncached = Math.max(0, Math.round((ppRec.prompt_total || 0) - prefillCached));
+        // 不含缓存命中口径：调度器 num_computed_tokens 包含缓存采纳的 token
+        // （采纳瞬时计入，见 vllm scheduler num_computed_tokens 赋值），
+        // 扣除 cached 即为真实计算量；完成判定 = 采纳 + 计算 ≥ 总 prompt。
+        const ppComputed = Math.max(0, Math.round(ppRec.computed || 0));
+        const ppFinished = (ppComputed + prefillCached) >= Math.round(ppRec.prompt_total || 0);
+        prefillDoneUncached = ppFinished
+          ? prefillTotalUncached
+          : Math.min(prefillTotalUncached, Math.max(0, ppComputed - prefillCached));
+        const ppDone = ppFinished || prefillDoneUncached >= prefillTotalUncached;
+        // 本版 vLLM 的 prefill_stats 只在 prefill 完成（首个 token 输出）时回传
+        // 一次，携带完整请求数据。完成时：执行耗时 = 完成时刻 − 引擎到达时刻
+        // （含排队，并发≤2 时排队≈0）；速率 = 该请求 uncached 总量 / 耗时。
+        if (ppDone && (ppRec.t || 0) > 0 && (ppRec.arrival || 0) > 0) {
+          const dur = Math.max(0, ppRec.t - ppRec.arrival);
+          prefillS = parseFloat(dur.toFixed(2));
+          rowPrefillTps = dur > 0.05 && prefillDoneUncached > 0
+            ? parseFloat((prefillDoneUncached / dur).toFixed(1)) : 0;
+        } else if (!isPrefill) {
+          // decode 行但引擎数据未标记完成（理论不应发生）：用累计均值兜底
+          const ppAge = (ppRec.arrival || 0) > 0 ? (Date.now() / 1000 - ppRec.arrival) : 0;
+          rowPrefillTps = ppAge > 0.5 && prefillDoneUncached > 0
+            ? parseFloat((prefillDoneUncached / ppAge).toFixed(1)) : 0;
+        } else {
+          // 预填充中：速率 = 引擎两次进度更新间的平均速率。
+          // 引擎 prefill 快照可能数秒才更新一次（DFlash2 实例每 chunk 计算
+          // ~数秒），0.5s 轮询下相邻轮 done 常无变化 → 不能用「本轮窗口」算
+          // 增量（会闪 0 或虚高）。改为：done 变化时用「自上次变化以来的真实
+          // 时间」算速率并记住；引擎 8s 内未推进则保持该最近实测值，超过才归 0。
+          const nowMs = Date.now();
+          if (live.ppLastDone !== undefined) {
+            const dDone = prefillDoneUncached - live.ppLastDone;
+            if (dDone > 0) {
+              const dT = (nowMs - (live.ppLastDoneAt || nowMs)) / 1000;
+              if (dT > 0) {
+                rowPrefillTps = parseFloat((dDone / dT).toFixed(1));
+                live.ppRate = rowPrefillTps;
+                live.ppRateAt = nowMs;
+              }
+              live.ppLastDoneAt = nowMs; // 仅进度变化时推进时间基准
+            } else if (live.ppRate !== undefined && (nowMs - (live.ppRateAt || 0)) < 8000) {
+              rowPrefillTps = live.ppRate; // 引擎未推进：保持最近实测速率
+            } else {
+              rowPrefillTps = 0;
+            }
+          } else {
+            // 首轮（尚无历史）：到达时刻起算的累计均值兜底
+            const ppAge = (ppRec.arrival || 0) > 0 ? (nowMs / 1000 - ppRec.arrival) : 0;
+            rowPrefillTps = ppAge > 0.5 && prefillDoneUncached > 0
+              ? parseFloat((prefillDoneUncached / ppAge).toFixed(1)) : 0;
+            if (rowPrefillTps > 0) { live.ppRate = rowPrefillTps; live.ppRateAt = nowMs; }
+            live.ppLastDoneAt = nowMs; // 首轮也建立时间基准
+          }
+          live.ppLastDone = prefillDoneUncached;
+        }
+      } else if (isPrefill && numPrefill > 0 && aggPP > 0) {
+        // 守恒分摊：实测聚合按并发预填充行数均分（不再伪造行间抖动）
+        rowPrefillTps = parseFloat((aggPP / numPrefill).toFixed(1));
+        if (live.ppEstDone === undefined) live.ppEstDone = 0;
+        if (ppDt > 0) live.ppEstDone += rowPrefillTps * ppDt;
+        prefillDoneUncached = Math.min(prefillTotalUncached, Math.max(0, Math.round(live.ppEstDone)));
+      } else if (isPrefill) {
+        // 兜底估算（无引擎实测也无实时聚合信号）：最近完成 prefill 的实测值
+        const estSpeed = (live.prefillSpeed && live.prefillSpeed > 0) ? live.prefillSpeed : livePrefillSpeed;
+        rowPrefillTps = parseFloat(estSpeed.toFixed(1));
+        prefillDoneUncached = Math.min(prefillTotalUncached, Math.max(0, Math.round(liveElapsed * estSpeed)));
+      } else {
+        // decode 行无引擎数据：填满总需（与旧逻辑一致），速度用最近完成实测值
+        rowPrefillTps = parseFloat((livePrefillSpeed || 0).toFixed(1));
+        prefillDoneUncached = prefillTotalUncached;
+      }
+
+      activeRequests.push({
+        id: live.id,
+        taskId: live.taskId || null, // 控制台任务号：PD 两腿同号，跨 GPU 关联
+        ip: live.ip,
+        started_at: live.startedAt,
+        elapsed_s: Math.round(liveElapsed),
+        tok_last_sec: tokLastSec,
+        avg_speed: liveElapsed > 0.5 ? parseFloat((live.tokens / Math.max(avgDenom, 0.5)).toFixed(1)) : 0,
+        // 行级瞬时输出速度（09-15c）：绑定到代理 tee 流的行显示自己实测值，
+        // 未绑定的 decode 行显示残差分摊值；前端既有契约优先显示此字段并标
+        // 「近3s tok/s」，undefined 时回落 avg_speed 历史均值。
+        avg_speed_3s: reqSpeed3s,
+        // 瞬时速度来源（调试/审计用，前端不消费）：measured=该行代理流实测；
+        // residual=无该流（直连流量）时的引擎残差分摊。
+        speed_src: reqSpdSrc,
+        // v2 诊断（绑定链可观测性）：pp=行绑定的引擎 rid 尾段，ex=是否 tee
+        // 精确确认，cn=cHist 样本数（测速窗料），ck=taskId 是否认领到 crid。
+        pp_rid: live.ppRid ? String(live.ppRid).slice(-8) : null,
+        pp_exact: !!live.ppExact,
+        chist_n: Array.isArray(live.cHist) ? live.cHist.length : 0,
+        has_crid: !!(live.crid || (live.taskId && global.__taskCrid && global.__taskCrid.get(live.taskId))),
+        speed: reqPhase === 'prefill' ? 0 : reqSpeed,
+        prefill_tps: rowPrefillTps,
+        phase: reqPhase,
+        tokens_generated: Math.round(live.tokens),
+        tokens_prefill: Math.round(prefillTotalUncached),
+        tokens_since_last: tokensSinceLast,
+        prefill_total_uncached: prefillTotalUncached,
+        prefill_done_uncached: prefillDoneUncached,
+        prefill_cached: prefillCached,
+        prefill_exact: prefillExact,
+        prefill_s: prefillS,
+      });
+    }
+  }
+
+  if (running === 0 && reqGenCount > 0) {
+    perRequestDecodeSpeed = avgTokensPerReq / avgDecodeTime;
+  }
+  // 排队中请求 = tracker 保活行（REQ+taskId）+ 代理已转发但尚未被认领的请求
+  // （仍在等待调度，仅 taskId；认领发生在 fill 时 → 一进 running 即从排队
+  // 消失、以同 T 号出现在 active）。1.5s 内的未认领记录视为刚转发即将运行，
+  // 不显示；120s 未认领过期清理。
+  // PD 幽灵清理：任务已在 decode 端口被认领（decode 腿已开跑）→ 其 prefill
+  // 腿的未认领记录是已完成阶段的残留（prefill 太快没触发 fill 认领），不显示。
+  const fwdQ = __taskForward.get(String(port || 8000)) || [];
+  const fnow = Date.now();
+  const decodePorts = new Set();
+  for (const pm of Object.values(PD_MODEL_PORTS)) {
+    if (pm && pm.decode) decodePorts.add(String(pm.decode));
+  }
+  const claimedOnDecode = new Set();
+  for (const [pk, pq] of __taskForward) {
+    if (!decodePorts.has(pk)) continue;
+    for (const r2 of pq) if (r2.claimed && r2.taskId) claimedOnDecode.add(r2.taskId);
+  }
+  const fwdWaiting = fwdQ
+    .filter(rec => !rec.claimed
+      && !claimedOnDecode.has(rec.taskId)
+      && (fnow - rec.at) > 1500
+      && (fnow - rec.at) < 120000)
+    .map(rec => ({ id: null, taskId: rec.taskId, ip: null, startedAt: rec.at }));
+  const holdRows = (rt.hold || [])
+    .filter(h => !h.taskId || !claimedOnDecode.has(h.taskId)) // PD 幽灵行同清
+    .map(h => ({ id: h.id, taskId: h.taskId || null, ip: h.ip, startedAt: h.startedAt }));
+  const allWaiting = holdRows.concat(fwdWaiting).slice(0, 20);
+
+  return {
+    active_requests: activeRequests,
+    waiting_requests: allWaiting,
+    connected_clients: [...peers],
+    running: running,
+    queued: queued,
+    total_completed_requests: Math.round(reqGenCount),
+    avg_tokens_per_request: Math.round(avgTokensPerReq),
+    avg_prefill_tokens_per_request: Math.round(avgUncachedTokens),
+    avg_cached_tokens_per_request: Math.round(avgCachedTokens),
+    avg_decode_time_seconds: parseFloat(avgDecodeTime.toFixed(3)),
+    avg_prefill_time_seconds: parseFloat(avgPrefillTime.toFixed(3)),
+    avg_speed_per_request: parseFloat(perRequestDecodeSpeed.toFixed(1)),
+    total_generated_tokens_all_time: Math.round(reqGenSum),
+    total_speed: totalSpeed,
+    _perReqTokens: nowPerReq,
+  };
+}
+
+// ====== 多卡多实例：从实例并发明细 ======
+// 主实例的并发在 /v1/internal/stats 内联计算（快照落盘 metrics-snapshot.json）；
+// 从实例（每张卡独立跑一个 vllm serve）用内存快照（控制台重启丢失，仅影响
+// 速度类增量的首窗，可忽略）。每行 active_requests 打 port/gpu/model 标签，
+// 前端按卡分组显示。
+if (!global.__instSnapshots) global.__instSnapshots = new Map();
+
+// KV Cache 池信息（主/从实例同口径）：usage_pct 取 vllm:kv_cache_usage_perc，
+// 池容量取 vllm:cache_config_info 的 kv_cache_size_tokens（vLLM 0.27+ 提供），
+// 按 model 标签对齐取值。
+function buildKvCacheInfo(m) {
+  const mlCachePct = 'vllm:kv_cache_usage_perc' + buildModelLabelFromMetrics(m, 'vllm:kv_cache_usage_perc{');
+  const usage = m[mlCachePct] || 0;
+  const out = { usage_pct: usage, max_tokens: 0, used_tokens: 0, block_size: 0, num_gpu_blocks: 0, prefix_cache_hits: 0 };
+  const usageModel = mlCachePct ? ((mlCachePct.match(/"model_name":"([^"]*)"/) || [])[1] || '') : '';
+  for (const k of Object.keys(m)) {
+    if (k.indexOf('vllm:cache_config_info|') !== 0) continue;
+    try {
+      const labels = JSON.parse(k.substring(k.indexOf('|') + 1));
+      if (usageModel && labels.model_name && labels.model_name !== usageModel) continue;
+      const maxT = parseInt(labels.kv_cache_size_tokens);
+      if (!isNaN(maxT) && maxT > 0) {
+        out.max_tokens = maxT;
+        out.block_size = parseInt(labels.block_size) || 0;
+        out.num_gpu_blocks = parseInt(labels.num_gpu_blocks) || 0;
+        break;
+      }
+    } catch (e) { /* 忽略无法解析的 info 行 */ }
+  }
+  // 已缓存 token 数 = 池容量 × 当前使用率（usage 为 0~1 的 block 级占用比例）
+  out.used_tokens = out.max_tokens > 0 ? Math.round(out.max_tokens * usage) : 0;
+  // 累计前缀缓存命中 token（vllm:prefix_cache_hits_total，counter，只增不减；按 model 标签对齐）
+  const mlHits = 'vllm:prefix_cache_hits_total' + buildModelLabelFromMetrics(m, 'vllm:prefix_cache_hits_total{');
+  out.prefix_cache_hits = Math.round(m[mlHits] || 0);
+  return out;
+}
+
+function buildInstanceConcurrency(inst, data) {
+  const m = parseMetrics(data);
+  if (metricsNamespace(m) !== 'vllm') return null; // 只处理 vllm 实例
+  const mlRunning = 'vllm:num_requests_running' + buildModelLabelFromMetrics(m, 'vllm:num_requests_running{');
+  const running = Math.round(m[mlRunning] || 0);
+  const genTokensTotal = Math.round(m['vllm:generation_tokens_total' + buildModelLabelFromMetrics(m, 'vllm:generation_tokens_total{')] || 0);
+  let st = global.__instSnapshots.get(inst.port);
+  if (!st) {
+    st = { lastGen: genTokensTotal, lastTime: Date.now(), lastRunning: 0, perReqTokens: {} };
+    global.__instSnapshots.set(inst.port, st);
+  }
+  // 计数器回退（实例重启）→ 重新定基线
+  if (st.lastGen > genTokensTotal + 1000) {
+    st.lastGen = genTokensTotal; st.lastTime = Date.now(); st.perReqTokens = {};
+  }
+  const elapsedMs = Date.now() - st.lastTime;
+  const livePrefill = readLivePrefill(inst.pid);
+  const ticker = getTicker(inst.port);
+  const concurrency = computeConcurrencyDetails(
+    m, genTokensTotal, st.lastGen, elapsedMs,
+    st.lastRunning || 0, st.perReqTokens || {}, livePrefill, inst.port, ticker
+  );
+  st.lastGen = genTokensTotal;
+  st.lastTime = Date.now();
+  st.lastRunning = running;
+  st.perReqTokens = concurrency._perReqTokens || {};
+  const model = inst.servedName || inst.modelPath || '';
+  for (const r of concurrency.active_requests) {
+    r.port = inst.port; r.gpu = inst.gpu; r.model = model;
+    r.gpus = (inst.gpus && inst.gpus.length) ? inst.gpus.slice() : (inst.gpu != null ? [inst.gpu] : null);
+  }
+  return {
+    port: inst.port,
+    gpu: inst.gpu,
+    gpus: inst.gpus || (inst.gpu != null ? [inst.gpu] : []),
+    model,
+    running: concurrency.running,
+    queued: concurrency.queued,
+    active_requests: concurrency.active_requests,
+    waiting_requests: concurrency.waiting_requests || [],
+    last_second: ticker.lastSecond || null,
+    kv: buildKvCacheInfo(m),
+    primary: false,
+    gen_speed_1s: (ticker.lastSecond && ticker.lastSecond.speed) || 0,
+  };
+}
+
+// ====== 09-20 性能优化：/metrics 缓存 + 单飞合并 ======
+// 前端 stats 卡 500ms×2 轮询，此前每次请求都实时抓上游 vLLM /metrics（约 64KB，
+// 序列化发生在 vLLM API 线程上），多标签页叠加会持续干扰推理服务。
+// 同一 URL 在 TTL 内复用文本结果；并发请求共享同一个在途抓取（单飞）。
+// 抓取失败时若有旧数据则回落旧数据（宁旧勿断供）。
+const __metricsCache = new Map(); // url -> { at, text, inflight }
+function fetchMetricsCached(url, ttlMs, timeoutMs) {
+  ttlMs = ttlMs == null ? 400 : ttlMs;
+  timeoutMs = timeoutMs == null ? 3000 : timeoutMs;
+  const now = Date.now();
+  let e = __metricsCache.get(url);
+  if (!e) { e = { at: 0, text: null, inflight: null }; __metricsCache.set(url, e); }
+  if (e.text != null && now - e.at < ttlMs) return Promise.resolve(e.text);
+  if (e.inflight) return e.inflight;
+  e.inflight = new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
+    let req;
+    try {
+      req = http.get(url, { timeout: timeoutMs, headers: { 'User-Agent': 'dsh-console' } }, (proxyRes) => {
+        let data = '';
+        proxyRes.on('data', (c) => { data += c; if (data.length > 8e6) { try { req.destroy(); } catch (_) {} } });
+        proxyRes.on('error', (err) => { e.inflight = null; done(reject, err); });
+        proxyRes.on('end', () => {
+          e.at = Date.now(); e.text = data; e.inflight = null;
+          done(resolve, data);
+        });
+      });
+      req.on('error', (err) => {
+        e.inflight = null;
+        if (e.text != null) done(resolve, e.text); // 失败回落旧数据
+        else done(reject, err);
+      });
+      req.setTimeout(timeoutMs, () => { try { req.destroy(new Error('metrics timeout')); } catch (_) {} });
+    } catch (err) {
+      e.inflight = null;
+      if (e.text != null) done(resolve, e.text); else done(reject, err);
+    }
+  });
+  return e.inflight;
+}
+
+function fetchInstanceConcurrency(inst) {
+  // 09-20：走 /metrics 缓存+单飞（400ms TTL），多标签页共享一次上游抓取
+  return fetchMetricsCached(`http://${config.vllmHost}:${inst.port}/metrics`, 400, 2500)
+    .then((data) => { try { return buildInstanceConcurrency(inst, data); } catch (e) { return null; } })
+    .catch(() => null);
+}
+
+// ====== 08-30 跨运行时：SGLang 实例行构建（vLLM 主分支下 GPU1 的 sglang 也进并发卡片）======
+// 从 SGLang 实例抓 /metrics 并构建并发卡片行（与 vLLM 从实例同形）
+// 速度历史按端口隔离（独立数组），不污染主实例的 __sglPpHist/__sglGenThrHist
+async function fetchSglangInstanceConcurrency(inst) {
+  if (!inst || !inst.port) return null;
+  const data = await new Promise((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port: inst.port, path: '/metrics', headers: { 'User-Agent': 'dsh-console' }, timeout: 2500 }, res => {
+      let body = ''; res.setEncoding('utf8');
+      res.on('data', d => { body += d; if (body.length > 4e6) req.destroy(); });
+      res.on('end', () => resolve(body));
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(2500, () => { try { req.destroy(new Error('sg instance metrics timeout')); } catch (e) {} resolve(null); });
+  });
+  if (!data) return null;
+  let m; try { m = parseMetrics(data); } catch (e) { return null; }
+  if (metricsNamespace(m) !== 'sglang') return null;
+  const sub = (global.__sglSubHist = global.__sglSubHist || new Map());
+  let h = sub.get(inst.port);
+  if (!h) { h = { pp: [], gen: [] }; sub.set(inst.port, h); }
+  const sg2 = buildSglangStats(m, null);
+  const genSpeed1s = buildSglangGenSpeed1s(m, h.gen);
+  const prefillSpeed3s = buildSglangPrefillSpeed3s(m, h.pp);
+  const ppTotalNow = Math.round(counterByLabel(m, 'sglang:prefill_effective_tokens_total', 'mode', 'input'));
+  let modelName = inst.model || '';
+  try {
+    const mk = Object.keys(m).find(x => x.indexOf('sglang:num_running_reqs|') === 0);
+    if (mk) {
+      const mm = JSON.parse(mk.substring(mk.indexOf('|') + 1));
+      if (mm && mm.model_name) modelName = mm.model_name;
+    }
+  } catch (e) {}
+  // live 流：__liveStreams = {seq, map: Map}（共享，多模型并发时），按流的 model 字段过滤出本实例的
+  const liveMap = new Map();
+  if (global.__liveStreams && global.__liveStreams.map) {
+    for (const [id, e] of global.__liveStreams.map) {
+      if (e && !e.done && e.model === modelName) liveMap.set(id, e);
+    }
+  }
+  // 08-30：每请求缓存命中真值 = 本实例日志 "Prefill batch" 行 #cached-token（vLLM 口径对齐）
+  const logLines = readSglangPrefillLines(inst.port, inst.pid);
+  const rows = buildSglangActiveRequests(sg2, { map: liveMap }, genSpeed1s, prefillSpeed3s, ppTotalNow,
+    (e) => sglangCachedForRequest(logLines, e, e.promptTokens));
+  return {
+    port: inst.port,
+    gpu: inst.gpu,
+    gpus: inst.gpus || (inst.gpu != null ? [inst.gpu] : []),
+    model: modelName,
+    running: sg2.running || 0,
+    queued: sg2.queued || 0,
+    active_requests: rows,
+    waiting_requests: [],
+    last_second: null,
+    kv: sg2.kv_cache || null,
+    primary: false,
+    runtime: 'sglang',
+    gen_speed_1s: (genSpeed1s !== undefined && genSpeed1s >= 0) ? genSpeed1s : 0,
+  };
+}
+
+// ====== Model Manager ======
+const MODELS_DIR = '/media/ll/data/models';
+// 额外模型根目录（2026-09-14）：Flash-Next-NVFP4（126G）在数据盘 /media/ll/data/models，
+// chroot 内 /media/ll/data 与宿主为同一份挂载，一并参与「模型启动页」列表扫描。
+const EXTRA_MODELS_DIRS = [];
+const VLLM_DEPLOY_DIR = '/home/ll/vllm-deploy';
+const VLLM_START_SH = path.join(VLLM_DEPLOY_DIR, 'start.sh');
+const VLLM_ENV = '/home/ll/vllm-env';
+
+function discoverModels(callback) {
+  // 多根扫描（2026-09-14）：/home/ll/models 之外，数据盘上的模型
+  // （如 Qwen3.8-Flash-Next-NVFP4 126G）也要出现在「模型启动页」列表里。
+  const roots = [MODELS_DIR].concat(EXTRA_MODELS_DIRS);
+  const results = [];
+  let rootsPending = roots.length;
+  let done = false;
+  const finish = () => {
+    if (done || rootsPending > 0) return;
+    done = true;
+    callback(results);
+  };
+  roots.forEach(root => {
+    fs.readdir(root, (err, dirs) => {
+      if (err) { rootsPending--; finish(); return; }
+      const candidates = (dirs || []).filter(d => !d.startsWith('.'));
+      let pending = candidates.length;
+      if (pending === 0) { rootsPending--; finish(); return; }
+      candidates.forEach(d => {
+        const dirPath = path.join(root, d);
+        const step = () => { if (--pending === 0) { rootsPending--; finish(); } };
+        fs.stat(dirPath, (err1, stat) => {
+          if (err1 || !stat.isDirectory()) return step();
+          // Check for config.json to confirm it's a valid model
+          fs.stat(path.join(dirPath, 'config.json'), (err2) => {
+            if (err2) return step();
+            if (!results.some(r => r.name === d)) {
+              const totalSize = estimateDirSize(dirPath);
+              results.push({
+                name: d,
+                path: dirPath,
+                size_gb: totalSize > 0 ? (totalSize / 1024 / 1024 / 1024).toFixed(1) : '--',
+                size_bytes: totalSize,
+              });
+            }
+            step();
+          });
+        });
+      });
+    });
+  });
+}
+
+function estimateDirSize(dirPath) {
+  let total = 0;
+  try {
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    const walk = (dir) => {
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const e of entries) {
+          const full = path.join(dir, e.name);
+          if (e.isFile()) {
+            try { total += fs.statSync(full).size; } catch (e) {}
+          } else if (e.isDirectory()) {
+            walk(full);
+          }
+        }
+      } catch (e) {}
+    };
+    walk(dirPath);
+  } catch (e) {}
+  return total;
+}
+
+function isVllmRunning(callback) {
+  const { execSync } = require('child_process');
+  try {
+    // Try to get the actual vllm process via ps first
+    const output = execSync('ps aux | grep "[v]llm serve" || true', { encoding: 'utf8', timeout: 5000 });
+    const model = getCurrentVllmModel();
+    // Get PID from ps output
+    let pid = null;
+    const lines = output.trim().split('\n');
+    for (const line of lines) {
+      if (line) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 2) {
+          pid = parseInt(parts[1]);
+          break;
+        }
+      }
+    }
+    if (pid && !isNaN(pid)) {
+      callback({ running: true, pid: pid, model: model });
+    } else {
+      // Fallback to lsof
+      const lsofPid = execSync('lsof -ti:8000 2>/dev/null || true', { encoding: 'utf8', timeout: 5000 }).trim();
+      if (lsofPid) {
+        callback({ running: true, pid: parseInt(lsofPid.split('\n')[0]), model: model });
+      } else {
+        callback({ running: false, pid: null, model: null });
+      }
+    }
+  } catch (e) {
+    callback({ running: false, pid: null, model: null });
+  }
+}
+
+function getCurrentVllmModel() {
+  // 5s 缓存：原实现每次调用都 execSync('ps aux | grep ...') spawn 子进程，
+  // stats 端点每 0.5s 轮询一次 → 每分钟 120 次子进程 spawn，是 node CPU 57% 的主因之一
+  const now = Date.now();
+  if (__curModelCache.at && now - __curModelCache.at < 5000) return __curModelCache.val;
+  let val = null;
+  try {
+    const vllmInsts = listVllmInstances();
+    if (vllmInsts.length) {
+      val = vllmInsts[0].modelPath || vllmInsts[0].servedName || null;
+    }
+    if (!val) {
+      const sgInsts = listSglangInstances();
+      if (sgInsts.length) {
+        val = sgInsts[0].modelPath || sgInsts[0].servedName || null;
+      }
+    }
+  } catch (e) {}
+  __curModelCache = { at: now, val };
+  return val;
+}
+let __curModelCache = { at: 0, val: null };
+
+// ====== Billing (实时费用计算) ======
+const BILLING_CONFIG_PATH = path.join(__dirname, 'billing-config.json');
+const BILLING_PRICE_FIELDS = ['cached_input_price_per_1m', 'uncached_input_price_per_1m', 'output_price_per_1m'];
+
+// 09-06 性能修复：billing-config.json 原来每次 computeBilling/accumulateBilling 都 readFileSync，
+// stats 端点每 0.5s 轮询 → 每秒 2-4 次同步读。改为 10s 缓存（配置很少变）。
+let __billingCfgCache = { at: 0, val: null };
+function loadBillingConfig() {
+  const now = Date.now();
+  if (__billingCfgCache.val && now - __billingCfgCache.at < 10000) return __billingCfgCache.val;
+  let cfg = { models: {}, currency: 'CNY', unit: '元' };
+  try {
+    const raw = JSON.parse(fs.readFileSync(BILLING_CONFIG_PATH, 'utf8'));
+    if (raw && typeof raw === 'object') {
+      if (!raw.models || typeof raw.models !== 'object') raw.models = {};
+      cfg = raw;
+    }
+  } catch (e) {}
+  __billingCfgCache = { at: now, val: cfg };
+  return cfg;
+}
+
+function saveBillingConfig(cfg) {
+  fs.writeFileSync(BILLING_CONFIG_PATH, JSON.stringify(cfg, null, 2));
+  __billingCfgCache = { at: 0, val: null }; // 失效缓存
+}
+
+// Match running model path (e.g. /home/ll/models/qwen3.6-35b-a3b-fp8) to a
+// billing config key (e.g. qwen3.6-35b-a3b-fp8). Fuzzy: basename first, then
+// substring, then single-entry fallback.
+function matchBillingModel(modelPath) {
+  const cfg = loadBillingConfig();
+  const keys = Object.keys(cfg.models || {});
+  if (!keys.length || !modelPath) return null;
+  const base = String(modelPath).replace(/\/+$/, '').split('/').pop();
+  let hit = keys.find(k => k === base);
+  if (!hit) hit = keys.find(k => base.indexOf(k) !== -1 || k.indexOf(base) !== -1);
+  if (!hit) {
+    const num = base.replace(/[^0-9.]/g, '');
+    if (num) hit = keys.find(k => {
+      const kn = k.replace(/[^0-9.]/g, '');
+      return kn && (kn.indexOf(num) !== -1 || num.indexOf(kn) !== -1);
+    });
+  }
+  if (!hit && keys.length === 1) hit = keys[0];
+  return hit || null;
+}
+
+// Compute real-time cost for the token counters present in `result`
+// (cached_input_tokens / uncached_input_tokens / total_output_tokens).
+function computeBilling(result, modelPath) {
+  try {
+    const cfg = loadBillingConfig();
+    const key = matchBillingModel(modelPath);
+    const entry = key ? cfg.models[key] : null;
+    const pricing = entry && entry.pricing ? entry.pricing : {};
+    const pCached = parseFloat(pricing.cached_input_price_per_1m) || 0;
+    const pInput = parseFloat(pricing.uncached_input_price_per_1m) || 0;
+    const pOutput = parseFloat(pricing.output_price_per_1m) || 0;
+    const cached = result.cached_input_tokens || 0;
+    const uncached = result.uncached_input_tokens || 0;
+    const output = result.total_output_tokens || 0;
+    const cCost = (cached / 1e6) * pCached;
+    const iCost = (uncached / 1e6) * pInput;
+    const oCost = (output / 1e6) * pOutput;
+    return {
+      enabled: true,
+      configured: !!entry,
+      model: key || null,
+      model_path: modelPath || null,
+      currency: cfg.currency || 'CNY',
+      unit: cfg.unit || '元',
+      price_per_1m: {
+        cached_input: pCached,
+        uncached_input: pInput,
+        output: pOutput
+      },
+      tokens: {
+        cached_input: cached,
+        uncached_input: uncached,
+        output: output
+      },
+      cost: {
+        cached_input: cCost,
+        uncached_input: iCost,
+        output: oCost,
+        total: cCost + iCost + oCost
+      },
+      cost_display: {
+        cached_input: cCost < 0.0001 ? cCost.toFixed(6) : cCost.toFixed(4),
+        uncached_input: iCost < 0.0001 ? iCost.toFixed(6) : iCost.toFixed(4),
+        output: oCost < 0.0001 ? oCost.toFixed(6) : oCost.toFixed(4),
+        total: (cCost + iCost + oCost).toFixed(4)
+      }
+    };
+  } catch (e) {
+    return { enabled: false, error: e.message };
+  }
+}
+
+// ====== Billing state persistence ======
+// 新费用(current)/历史总费用(history) 两个桶持久化到 billing-state.json：
+//  - 重启不丢（落盘）
+//  - 与「重置统计」完全无关（独立状态文件，基于 vLLM 原始累计计数器算差值）
+const BILLING_STATE_PATH = path.join(__dirname, 'billing-state.json');
+const BILLING_ZERO_BUCKET = () => ({ cost: { cached_input: 0, uncached_input: 0, output: 0 }, tokens: { cached_input: 0, uncached_input: 0, output: 0 } });
+
+// ====== 每日费用明细（持久化，可手动删除） ======
+const BILLING_MAX_DAYS = 120; // 最多保留最近 120 个有费用的日期
+const BILLING_DAY_FIELDS = ['cached_input', 'uncached_input', 'output'];
+
+// 服务器本地日期 YYYY-MM-DD（与「每天」的直觉一致）
+function billingDayKey(d) {
+  const t = d || new Date();
+  const p = n => String(n).padStart(2, '0');
+  return t.getFullYear() + '-' + p(t.getMonth() + 1) + '-' + p(t.getDate());
+}
+
+function ensureBillingDay(st, date) {
+  if (!st.days || typeof st.days !== 'object') st.days = {};
+  if (!st.days[date] || typeof st.days[date].cost !== 'object') st.days[date] = BILLING_ZERO_BUCKET();
+  return st.days[date];
+}
+
+// 输出用：附加 total，按日期倒序
+function buildBillingDays(st) {
+  const days = {};
+  for (const [date, bk] of Object.entries((st && st.days) || {})) {
+    const c = bk.cost || {}, tk = bk.tokens || {};
+    days[date] = {
+      cost: {
+        cached_input: c.cached_input || 0,
+        uncached_input: c.uncached_input || 0,
+        output: c.output || 0,
+        total: (c.cached_input || 0) + (c.uncached_input || 0) + (c.output || 0)
+      },
+      tokens: {
+        cached_input: tk.cached_input || 0,
+        uncached_input: tk.uncached_input || 0,
+        output: tk.output || 0
+      }
+    };
+  }
+  return days;
+}
+
+// 09-06 性能修复：billing-state.json 原来每次 stats 请求都 readFileSync+writeFileSync
+// （accumulateBilling 内 load+save），前端 0.5s 轮询 → 每秒 2 次同步磁盘读写阻塞事件循环。
+// 改为内存缓存 + 5s 节流落盘。
+let __billingStateMem = null;
+function loadBillingState() {
+  if (__billingStateMem) return __billingStateMem;
+  try {
+    const st = JSON.parse(fs.readFileSync(BILLING_STATE_PATH, 'utf8'));
+    if (st && typeof st === 'object') {
+      if (!st.current || typeof st.current.cost !== 'object') st.current = BILLING_ZERO_BUCKET();
+      if (!st.history || typeof st.history.cost !== 'object') st.history = BILLING_ZERO_BUCKET();
+      if (!st.lastRaw || typeof st.lastRaw !== 'object') st.lastRaw = {};
+      if (!st.days || typeof st.days !== 'object') st.days = {};
+      __billingStateMem = st;
+      return st;
+    }
+  } catch (e) {}
+  const st = { current: BILLING_ZERO_BUCKET(), history: BILLING_ZERO_BUCKET(), lastRaw: {} };
+  st.days = {};
+  __billingStateMem = st;
+  return st;
+}
+
+function saveBillingState(st) {
+  __billingStateMem = st;
+  const now = Date.now();
+  if (now - (saveBillingState._lastSave || 0) < 5000) return; // 5s 节流
+  saveBillingState._lastSave = now;
+  try { fs.writeFileSync(BILLING_STATE_PATH, JSON.stringify(st, null, 2)); } catch (e) {}
+}
+
+// 用 vLLM RAW 累计计数器（未减重置基线）算差值，按当前模型单价把增量费用
+// 同时计入 current 与 history 两桶。计数器回退（vLLM 重启/换模型）时重新
+// 定基线，不计负值。
+function accumulateBilling(raw) {
+  const st = loadBillingState();
+  const delta = { cached_input: 0, uncached_input: 0, output: 0 };
+  const pairs = [['cached_input', 'cached'], ['uncached_input', 'uncached'], ['output', 'gen']];
+  for (const [field, rk] of pairs) {
+    const r = Math.round(raw[rk] || 0);
+    const prev = st.lastRaw[rk];
+    if (prev === undefined || r < prev) { st.lastRaw[rk] = r; continue; } // 首次/回退：定基线
+    if (r > prev) { delta[field] = r - prev; st.lastRaw[rk] = r; }
+  }
+  if (delta.cached_input + delta.uncached_input + delta.output > 0) {
+    const cfg = loadBillingConfig();
+    const key = matchBillingModel(getCurrentVllmModel());
+    const entry = key ? cfg.models[key] : null;
+    const pr = (entry && entry.pricing) || {};
+    const p = {
+      cached_input: parseFloat(pr.cached_input_price_per_1m) || 0,
+      uncached_input: parseFloat(pr.uncached_input_price_per_1m) || 0,
+      output: parseFloat(pr.output_price_per_1m) || 0,
+    };
+    for (const bucket of [st.current, st.history]) {
+      bucket.cost.cached_input = (bucket.cost.cached_input || 0) + delta.cached_input / 1e6 * p.cached_input;
+      bucket.cost.uncached_input = (bucket.cost.uncached_input || 0) + delta.uncached_input / 1e6 * p.uncached_input;
+      bucket.cost.output = (bucket.cost.output || 0) + delta.output / 1e6 * p.output;
+      bucket.tokens.cached_input = (bucket.tokens.cached_input || 0) + delta.cached_input;
+      bucket.tokens.uncached_input = (bucket.tokens.uncached_input || 0) + delta.uncached_input;
+      bucket.tokens.output = (bucket.tokens.output || 0) + delta.output;
+    }
+    // 每日明细：按服务器本地日期归桶（单价为入账时点的当前单价）
+    const day = ensureBillingDay(st, billingDayKey());
+    for (const f of BILLING_DAY_FIELDS) {
+      day.cost[f] = (day.cost[f] || 0) + delta[f] / 1e6 * p[f];
+      day.tokens[f] = (day.tokens[f] || 0) + delta[f];
+    }
+    // 只保留最近 BILLING_MAX_DAYS 个有费用的日期
+    const dayKeys = Object.keys(st.days).sort();
+    while (dayKeys.length > BILLING_MAX_DAYS) delete st.days[dayKeys.shift()];
+  }
+  saveBillingState(st);
+  return st;
+}
+
+function resetBillingBucket(scope) {
+  const st = loadBillingState();
+  if (scope === 'current' || scope === 'history') st[scope] = BILLING_ZERO_BUCKET();
+  saveBillingState._lastSave = 0; // 强制立即落盘（重置操作不能等 5s 节流）
+  saveBillingState(st);
+  return st;
+}
+
+function buildModelLabelFromMetrics(m, metricPrefix) {
+  // parseMetrics encodes labels as |{json}, so key looks like:
+  //   vllm:generation_tokens_total|{"engine":"0","model_name":"foo"}
+  // metricPrefix is like 'vllm:generation_tokens_total{'
+  // We need to find keys where the name part matches, then return the |{json} suffix.
+  for (const k of Object.keys(m)) {
+    // Key format: name|{json_labels}
+    // metricPrefix ends with '{', so we need name part == metricPrefix without trailing '{'
+    const nameWithoutBrace = metricPrefix.slice(0, -1); // e.g. 'vllm:generation_tokens_total'
+    const pipeIdx = k.indexOf('|');
+    if (pipeIdx > 0 && k.substring(0, pipeIdx) === nameWithoutBrace) {
+      return k.substring(pipeIdx); // e.g. '|{"engine":"0","model_name":"foo"}'
+    }
+  }
+  return '';
+}
+
+// 判断某 PID 是否仍是存活的 vLLM 相关进程（APIServer cmdline 含 "vllm serve"，
+// EngineCore 的进程标题为 "VLLM::EngineCore"）。
+// 关键修复：vLLM 0.27 的 EngineCore 在父 APIServer 被杀后会被重新挂到仍然存活的
+// systemd --user（subreaper）名下（PPID=1293 之类），PPID 不再是 1、父进程也"活着"，
+// 旧逻辑 `ppid==='1' || !parentAlive` 永远判不出它是孤儿 → EngineCore 不退出，
+// GPU 显存一直不释放（CUDA out of memory）。正确判据：父进程是否仍是 vLLM 进程。
+function parentIsVllmProcess(ppid) {
+  if (!ppid || ppid === '1') return false;
+  try {
+    const cmd = fs.readFileSync(`/proc/${ppid}/cmdline`, 'utf8').split('\0').join(' ');
+    // 识别全部 vLLM 主进程形式：CLI（vllm serve）、模块（vllm.entrypoints.*，含
+    // 0.28 的 cli.main）与 EngineCore 自身；漏判会让活着的 EngineCore 被判孤儿后误杀
+    // （09-14 chroot 内 Flash-Next 即 cli.main 形式）。
+    return cmd.includes('vllm serve') || cmd.includes('vllm.entrypoints') || cmd.includes('EngineCore');
+  } catch (e) { return false; }
+}
+
+// 收集「父进程已不是 vLLM 进程」的残留进程 PID：
+//   - VLLM::EngineCore（持显存的引擎核心，父 APIServer 死后变孤儿）
+//   - multiprocessing.resource_tracker（vLLM mp 的共享内存跟踪器，同样会孤儿化）
+// 双实例模式：其他存活实例的 EngineCore/resource_tracker 其父进程仍是 vLLM，不会被误杀。
+function collectOrphanVllmPids() {
+  const { execSync } = require('child_process');
+  const orphans = [];
+  const scan = (pattern) => {
+    try {
+      const lines = execSync(pattern, { encoding: 'utf8', timeout: 5000 }).trim();
+      if (!lines) return;
+      lines.split('\n').forEach(line => {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 2) return;
+        const pid = parts[0];
+        const ppid = parts[1];
+        if (!parentIsVllmProcess(ppid)) orphans.push(parseInt(pid));
+      });
+    } catch (e) {}
+  };
+  scan("ps -eo pid,ppid,args | grep '[V]LLM::EngineCore' 2>/dev/null || true");
+  scan("ps -eo pid,ppid,args | grep '[m]ultiprocessing.resource_tracker' 2>/dev/null || true");
+  return orphans;
+}
+
+// 通用：杀掉指定 PID 列表并等待 GPU 显存释放（最多 ~30s）。
+// 判据：总显存占用相比清理前减少 >= 被清理进程的显存（1024 MiB 容差）。
+// 双卡场景：其他存活实例占用的显存不在差额里，不会被误判为"没释放"。
+async function waitGpuMemRelease(pids) {
+  if (!pids || pids.length === 0) return;
+  const { execSync } = require('child_process');
+  // 记录被清理进程当前占用的显存，用于确认显存真的释放（而非只看进程消失）
+  let freedTargetMiB = 0;
+  try {
+    const out = execSync("nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null || true", { encoding: 'utf8', timeout: 8000 }).trim();
+    if (out) out.split('\n').forEach(l => {
+      const [pid, mem] = l.split(',').map(s => s.trim());
+      if (pid && pids.includes(parseInt(pid))) freedTargetMiB += parseInt(mem) || 0;
+    });
+  } catch (e) {}
+  let usedBeforeMiB = 0;
+  try {
+    const out = execSync("nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null || true", { encoding: 'utf8', timeout: 8000 }).trim();
+    if (out) out.split('\n').forEach(l => { const v = parseInt(l.trim()); if (!isNaN(v)) usedBeforeMiB += v; });
+  } catch (e) {}
+
+  for (const pid of pids) {
+    try { execSync('kill -9 ' + pid, { encoding: 'utf8', timeout: 3000 }); } catch (e2) {}
+  }
+
+  const targetMiB = usedBeforeMiB - freedTargetMiB + 1024; // 1024 MiB 容差
+  for (let i = 0; i < 15; i++) {
+    try {
+      let usedNowMiB = 0;
+      const out = execSync("nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null || true", { encoding: 'utf8', timeout: 8000 }).trim();
+      if (out) out.split('\n').forEach(l => { const v = parseInt(l.trim()); if (!isNaN(v)) usedNowMiB += v; });
+      if (usedNowMiB <= targetMiB) return;
+    } catch (e3) {}
+    await sleep(2000);
+  }
+}
+
+async function killOrphanEngineCores() {
+  // vLLM 0.27 的 EngineCore 是独立子进程：主进程(APIServer)被杀后它不会退出，
+  // 变成孤儿继续占满 GPU 显存，导致下次启动直接显存不足失败（CUDA out of memory）。
+  // 停服务时必须一并清理并等待显存释放。
+  const orphans = collectOrphanVllmPids();
+  if (orphans.length === 0) return;
+  await waitGpuMemRelease(orphans);
+}
+
+// 读 /proc/<pid>/cmdline（空格连接），失败返回 ''
+function procCmdline(pid) {
+  try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' '); } catch (e) { return ''; }
+}
+// 读 /proc/<pid>/stat 的 ppid（field 4，comm 括号之后第一个字段），失败返回 0
+function procPpid(pid) {
+  try {
+    const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const rest = s.slice(s.lastIndexOf(')') + 2).split(' ');
+    return parseInt(rest[1]) || 0;
+  } catch (e) { return 0; }
+}
+// 沿进程树向上找实例端口：自身或任一祖先进程 cmdline 里第一个 --port N（锚定空白边界，
+// 避免误匹配 --tokenizer-port 之类的参数）。找不到返回 null。
+function instancePortOf(pid) {
+  let cur = parseInt(pid, 10);
+  for (let i = 0; i < 16 && cur > 1; i++) {
+    const m = procCmdline(cur).match(/(?:^|\s)--port (\d+)/);
+    if (m) return parseInt(m[1], 10);
+    const pp = procPpid(cur);
+    if (!pp || pp === cur) break;
+    cur = pp;
+  }
+  return null;
+}
+// 收集 sglang 实例的残留进程（主进程 + scheduler/tokenizer/detokenizer 等工作进程）。
+// 端口归属一律按进程树的 --port 判定：worker 进程 cmdline 形如 `sglang::scheduler`
+// （setproctitle，无 --port），旧逻辑按 'scheduler'/'tokenizer' 子串绕过端口过滤，
+// 导致启动/停止任一端口的实例时把所有 sglang 实例（含另一 GPU 的）的 worker 全部 kill -9，
+// 对方实例 scheduler 被杀后整体自杀 —— 即"启动一个 GPU 的 sglang，另一个 GPU 的 sglang 被结束"。
+function collectSglangPids(port) {
+  const { execSync } = require('child_process');
+  const pids = [];
+  try {
+    const raw = execSync(`pgrep -f "sglang" 2>/dev/null || true`, { encoding: 'utf8', timeout: 5000 }).trim().split('\n').filter(Boolean);
+    for (const pid of raw) {
+      try {
+        const cmd = procCmdline(pid);
+        const isSglangProc = cmd.includes('sglang.launch_server') || cmd.includes('sglang.srt') ||
+          cmd.includes('sglang/') || cmd.includes('scheduler') || cmd.includes('tokenizer') || cmd.includes('detokenizer');
+        if (!isSglangProc) continue;
+        // 不杀控制台自身与 ssh/脚本壳
+        if (cmd.includes('server.js') || cmd.includes('start_sglang')) continue;
+        // 端口归属：自身或祖先主进程的 --port 必须等于目标端口，否则跳过（保护其他实例）
+        if (port && instancePortOf(pid) !== port) continue;
+        pids.push(parseInt(pid));
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return pids;
+}
+
+// 清理目标端口上的残留实例（vllm 或 sglang：按 cmdline --port 匹配 + lsof 监听兜底），
+// 再清孤儿 EngineCore / sglang 残留，等待显存释放。启动前调用，避免 CUDA out of memory。
+async function killPortResidents(port) {
+  const { execSync } = require('child_process');
+  const toKill = [];
+  try {
+    const pids = execSync(`pgrep -f "vllm serve" 2>/dev/null; pgrep -f "sglang.launch_server" 2>/dev/null || true`, { encoding: 'utf8', timeout: 5000 }).trim().split('\n').filter(Boolean);
+    for (const pid of pids) {
+      try {
+        const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ');
+        if (cmd.includes(`--port ${port}`)) toKill.push(parseInt(pid));
+      } catch (e) {}
+    }
+    const lp = execSync(`lsof -ti:${port} -sTCP:LISTEN 2>/dev/null || true`, { encoding: 'utf8', timeout: 3000 }).trim();
+    if (lp) lp.split('\n').forEach(l => { const n = parseInt(l.trim()); if (!isNaN(n) && n !== process.pid) toKill.push(n); });
+  } catch (e) {}
+  if (toKill.length) await waitGpuMemRelease(Array.from(new Set(toKill)));
+  await killOrphanEngineCores();
+  const sg = collectSglangPids(port);
+  if (sg.length) await waitGpuMemRelease(sg);
+}
+
+async function startVllmModel(modelName, params, callback) {
+  const { execSync } = require('child_process');
+  const { spawn } = require('child_process');
+  const { port, maxModelLen, gpuId, gpuCount, parallelMode, pdMode, mtp, dflash, dspark, servedName, maxNumSeqs, gpuMemUtil, thinking, thinkingEffort, mtpTokens, temperature, topP, topK, minP, presencePenalty, repetitionPenalty, kvCacheQuant, retention,
+    maxBatchedTokens, maxScheduledTokens, schedPolicy, asyncScheduling, enforceEager, blockSize, cpuOffloadGb, prefixCaching, chunkedPrefill, seed, dtype, noLogRequests, limitMm, maxLoraRank, disableAllReduce, attentionBackend, ctxLen, languageModelOnly } = params;
+  // reasoning_effort：允许 low/medium/high/xhigh 及手动输入（字母/数字/下划线/连字符，最长 32）
+  // 例如 qwen3.8-27b 支持 xhigh；非法/空值回落 medium
+  const rawEffort = String(thinkingEffort || '').trim();
+  const effort = /^[a-zA-Z0-9_-]{1,32}$/.test(rawEffort) ? rawEffort : 'medium';
+  // MTP speculative steps: clamp to 1-8, default 3
+  const mtpN = Math.min(8, Math.max(1, parseInt(mtpTokens) || 5));
+  // 启用显卡数量：从 gpuId 起连续取 N 张卡，N>1 时启用多卡张量并行
+  const gpuN = Math.max(1, parseInt(gpuCount) || 1);
+  const gpuDevices = Array.from({ length: gpuN }, (_, i) => gpuId + i).join(',');
+
+  // 校验可用显卡数：请求卡数超过物理显卡时直接报错，避免杀掉现有服务后才发现启动失败
+  let availableGpus = 1;
+  try {
+    const gpuCountOut = execSync("nvidia-smi --query-gpu=index --format=csv,noheader | wc -l", { encoding: 'utf8', timeout: 8000 }).trim();
+    const parsed = parseInt(gpuCountOut);
+    if (parsed > 0) availableGpus = parsed;
+  } catch (e) {}
+  if (gpuId < 0 || gpuId + gpuN > availableGpus) {
+    callback({ success: false, error: `启用显卡数量(${gpuN}，起始卡 ${gpuId}) 超出当前可用显卡数(${availableGpus})，请调整后重试` });
+    return;
+  }
+
+  // 采样参数（SamplingParams）：NaN 回落默认值，越界钳制到合法范围
+  const clampNum = (v, dflt, lo, hi) => {
+    const n = parseFloat(v);
+    return isNaN(n) ? dflt : Math.min(hi, Math.max(lo, n));
+  };
+  const samplingParams = {
+    temperature: clampNum(temperature, 1.0, 0, 2),
+    top_p: clampNum(topP, 0.95, 0.01, 1),
+    top_k: Math.round(clampNum(topK, 20, -1, 100)),
+    min_p: clampNum(minP, 0.0, 0, 1),
+    presence_penalty: clampNum(presencePenalty, 0.0, -2, 2),
+    repetition_penalty: clampNum(repetitionPenalty, 1.0, 0, 2),
+  };
+  const modelPath = path.join(MODELS_DIR, modelName);
+
+  // 推测解码方式：DFlash2（block-diffusion 草稿模型，需 nightly venv）/ DSpark（DFlash 骨干 + Markov 头，
+  // vllm-env 0.27.1 原生支持）/ MTP（内置多 token 预测）
+  const isDflash = dflash === '1';
+  const isDspark = dspark === '1';
+  const dflashN = Math.min(8, Math.max(1, parseInt(mtpTokens) || 7));
+  // DSpark：投机 token 数固定为草稿 ckpt 的 dspark_block_size（UI 输入不再当 gamma）
+  const dsparkGamma = isDspark ? (readDsparkGamma(SGLANG_DSPARK_PATH) || 7) : 7;
+  if (isDspark && parseInt(mtpTokens) && parseInt(mtpTokens) !== dsparkGamma) {
+    console.log(`[vllm-start] DSpark 投机 token 数固定为草稿 ckpt 的 dspark_block_size=${dsparkGamma}，忽略 UI 输入 ${mtpTokens}`);
+  }
+  const dsparkN = dsparkGamma;
+  const VENV = '/home/ll/vllm-env'; // 2026-09-05: vllm-env 现为 syv 0.28.0 环境（符号链接），原生支持 DFlash2；nightly 环境已清理
+  if (isDflash) {
+    if (!fs.existsSync(path.join(VENV, 'bin', 'vllm'))) {
+      callback({ success: false, error: 'DFlash2 环境未就绪：未找到 /home/ll/vllm-env/bin/vllm（vllm-env 现为 0.28.0 syv 环境，原生支持 DFlash2）' });
+      return;
+    }
+    if (!fs.existsSync('/home/ll/models/qwen3.8-27b-dflash2/config.json')) {
+      callback({ success: false, error: 'DFlash2 草稿模型未下载：/home/ll/models/qwen3.8-27b-dflash2/config.json（需先下载 incoai/Qwen3.8-27B-DFlash2）' });
+      return;
+    }
+    if (!String(modelName).includes('qwen3.8-27b')) {
+      callback({ success: false, error: 'DFlash2 草稿模型目前仅支持 qwen3.8-27b 系列目标模型' });
+      return;
+    }
+  }
+  if (isDspark) {
+    if (!fs.existsSync('/home/ll/models/qwen3.8-27b-dspark/config.json')) {
+      callback({ success: false, error: 'DSpark 草稿模型未下载：/home/ll/models/qwen3.8-27b-dspark/config.json（需先下载 incoai/dspark-qwen3.8-27b）' });
+      return;
+    }
+    if (!String(modelName).includes('qwen3.8-27b')) {
+      callback({ success: false, error: 'DSpark 草稿模型目前仅支持 qwen3.8-27b 系列目标模型' });
+      return;
+    }
+  }
+
+  // 清理目标端口上的残留实例（vllm / sglang 均可）并等待 GPU 显存释放，
+  // 避免新实例 CUDA out of memory。按 cmdline --port 匹配（加载中未监听也能杀）
+  // + lsof 监听兜底，只动目标端口，不碰其他端口的实例。
+  await killPortResidents(port);
+
+  // Build command args
+  // maxModelLen 来自前端输入，只允许 'auto' 或纯数字，防止把非法内容拼进启动参数
+  const safeModelLen = /^auto$|^\d+$/.test(String(maxModelLen || '')) ? String(maxModelLen) : 'auto';
+  // 上下文长度文本框（ctxLen）：非空且为纯数字时覆盖 safeModelLen；超过 262144 时自动加 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+  const rawCtxLen = String(ctxLen || '').trim();
+  let needAllowLong = false;
+  if (/^\d+$/.test(rawCtxLen)) {
+    const ctxNum = parseInt(rawCtxLen, 10);
+    if (ctxNum > 0) {
+      safeModelLen = rawCtxLen;
+    }
+  }
+  // 2026-09-10 修复：超长上下文放行 env 不能只认 ctxLen 框。
+  // 用户在「最大上下文长度」(maxModelLen) 或快速启动预设里填 >262144 时同样要注入，
+  // 否则 vLLM 0.28.0 在 ModelConfig 校验阶段直接抛 ValueError 拒启（实测 09-10 08:35 / 08:48 两次）。
+  if (/^\d+$/.test(safeModelLen) && parseInt(safeModelLen, 10) > 262144) needAllowLong = true;
+  // 注意力后端：仅允许字母/数字/下划线（vLLM 后端名如 FLASHINFER / TRITON / FLASH_ATTN / MLA / FLASHMLA），
+  // 非法/空值回落 FLASHINFER（与旧版硬编码一致）
+  const rawAttn = String(attentionBackend || '').trim();
+  const safeAttn = /^[A-Za-z0-9_]{1,32}$/.test(rawAttn) ? rawAttn : 'FLASHINFER';
+  // 2026-09-05 w8a16+fp8 修复: vLLM 0.28.0 的 FLASH_ATTN 后端不支持 FP8 KV cache
+  // (FP8 KV 仅 FA3/SM90 或 FA4/SM100 可用); 本机 CMP170HX=SM80, fp8 KV 只能走 FlashInfer。
+  // fp8 类 KV 量化与 FLASH_ATTN 同时出现时强制改回 FLASHINFER, 防一键启动再次失败。
+  if (safeAttn === 'FLASH_ATTN' && /^fp8/.test(String(kvCacheQuant || '').toLowerCase())) safeAttn = 'FLASHINFER';
+  const args = [
+    'serve', modelPath,
+    '--port', port.toString(),
+    '--max-model-len', safeModelLen,
+    '--reasoning-parser', 'qwen3',
+    '--enable-auto-tool-choice',
+    '--tool-call-parser', 'qwen3_coder',
+    '--trust-remote-code',
+    '--served-model-name', servedName,
+    '--enable-prompt-tokens-details',
+    '--max-num-seqs', maxNumSeqs.toString(),
+    '--gpu-memory-utilization', gpuMemUtil,
+    '--attention-backend', safeAttn,
+    '--default-chat-template-kwargs', thinking === '1'
+      ? `{"enable_thinking": true, "reasoning_effort": "${effort}"}`
+      : '{"enable_thinking": false}',
+  ];
+
+  // ---- 高级参数（可选；空/未勾选则不追加，保持命令干净）----
+  // 正整数校验：非法/<=0 回落默认值（默认值与旧版硬编码一致，行为不变）
+  const intParam = (v, dflt) => { const n = parseInt(v); return (isNaN(n) || n <= 0) ? dflt : n; };
+  const pushArg = (flag, val) => { const s = String(val == null ? '' : val).trim(); if (s !== '') args.push(flag, s); };
+  const pushFlag = (flag, on) => { if (on === '1' || on === true) args.push(flag); };
+  // 批处理与调度
+  pushArg('--max-num-batched-tokens', intParam(maxBatchedTokens, 8192));
+  pushArg('--max-num-scheduled-tokens', maxScheduledTokens);
+  pushArg('--scheduling-policy', schedPolicy);
+  pushFlag('--async-scheduling', asyncScheduling);
+  pushFlag('--enforce-eager', enforceEager);
+  // 缓存与显存
+  pushArg('--block-size', intParam(blockSize, 32));
+  pushArg('--cpu-offload-gb', cpuOffloadGb);
+  // 前缀缓存 / 分块预填充：默认开启（与旧版一致），显式关闭才传 --no-enable-*
+  if (prefixCaching === '0') args.push('--no-enable-prefix-caching'); else args.push('--enable-prefix-caching');
+  if (chunkedPrefill === '0') args.push('--no-enable-chunked-prefill'); else args.push('--enable-chunked-prefill');
+  // 复现性与精度
+  pushArg('--seed', seed);
+  if (dtype && dtype !== 'auto') args.push('--dtype', dtype);
+  // 日志
+  pushFlag('--no-enable-log-requests', noLogRequests);
+  // 多模态与 LoRA
+  // 2026-09-08 修复: vLLM 0.28.0 要求 --limit-mm-per-prompt 为 dict 格式 {image:{count:N}}
+  // (裸 int 触发 pydantic ValidationError 启动即退); 留空=不传该 flag, 0=禁止图片
+  const limitMmN = parseInt(limitMm);
+  if (limitMm !== "" && limitMm !== undefined && limitMm !== null && !isNaN(limitMmN)) args.push("--limit-mm-per-prompt", JSON.stringify({image: {count: limitMmN}}));
+  pushArg('--max-lora-rank', maxLoraRank);
+  pushFlag('--disable-custom-all-reduce', disableAllReduce);
+  // 2026-09-16: twin-709 等 Qwen3_5ForConditionalGeneration（VL wrapper）模型需跳过视觉塔加载，
+  // 否则控制台弹窗启动会去解析 image processor 失败。params.languageModelOnly==='1' 时透传。
+  pushFlag('--language-model-only', languageModelOnly);
+
+  // 草稿模型选择（2026-09-05）：前端 vllmDraftModel 非空则覆盖内置草稿路径
+  // 2026-09-05 修复：短名（如 qwen3.8-27b-dflash2-w4a16）会被 vLLM 的 HF 解析器
+  // 误判为 repo 名去远程解析，导致引擎初始化卡死/失败——短名自动展开为
+  // /home/ll/models/<短名> 完整本地路径（与弹窗草稿下拉 DRAFT_OPTIONS 的 name 对应）。
+  const draftSelRaw = String(params.vllmDraftModel || '').trim();
+  const resolveDraft = (sel) => {
+    if (!sel) return '';
+    if (sel.startsWith('/') || sel.startsWith('hf://') || sel.includes('/')) return sel;
+    return path.join(MODELS_DIR, sel);
+  };
+  const draftSel = resolveDraft(draftSelRaw);
+  const pickDraft = (builtin) => (draftSel && draftSel !== '' ? draftSel : builtin);
+  if (isDflash) {
+    const _dp = pickDraft('/home/ll/models/qwen3.8-27b-dflash2-w4a16');
+    // 2026-09-08 修复: 草稿模型是 DSpark 时 method 必须用 dspark
+    // (method=dflash + Qwen3DSparkModel → EAGLEConfig 前缀成 DFlashQwen3DSparkModel → registry 不认)
+    if (/dspark/i.test(_dp)) {
+      args.push('--speculative-config', `{"method":"dspark","model":"${_dp}","num_speculative_tokens":${dsparkN}}`);
+    } else {
+      args.push('--speculative-config', `{"method":"dflash","model":"${_dp}","num_speculative_tokens":${dflashN},"draft_sample_method":"probabilistic"}`);
+    }
+    // syv 最优配置 JSON 参数硬编码（带正确引号，避开前端 shellTokenize 剥引号坑）
+    args.push('--compilation-config', JSON.stringify({max_cudagraph_capture_size: 64, custom_ops: ['+rms_norm', '+silu_and_mul']}));
+    args.push("--limit-mm-per-prompt", limitMm ? JSON.stringify({image: {count: parseInt(limitMm) || 1}}) : JSON.stringify({image: {count: 1}}));
+    args.push('--mm-processor-kwargs', JSON.stringify({size: {shortest_edge: 65536, longest_edge: 2097152}}));
+    // 2026-09-16: dflash 分支支持 FP8 在线量化（SM80 无 FP8 TC，走 Marlin W8A16）。
+    // BF16 权重(~55GB)会吃掉 gpu-mem 0.90 的大部分，KV 池仅剩 ~5GB < 17.65GB 需求 → OOM。
+    // FP8 量化后权重 ~28GB，KV 池 ~350K token，与 MTP 预设行为一致。
+    if (kvCacheQuant === 'fp8') args.push('--quantization', 'fp8');
+    // API 响应带 prompt token 明细（cached_tokens 等），零成本，利于观察缓存命中
+    args.push('--enable-prompt-tokens-details');
+  } else if (isDspark) {
+    // DSpark：DFlash 骨干 + Markov 头，vllm-env 0.27.1 原生支持（method=dspark）
+    args.push('--speculative-config', `{"method":"dspark","model":"${pickDraft('/home/ll/models/qwen3.8-27b-dspark')}","num_speculative_tokens":${dsparkN}}`);
+  } else if (mtp === '1') {
+    args.push('--speculative-config', `{"method":"qwen3_next_mtp","num_speculative_tokens":${mtpN}}`);
+  }
+
+  // 多卡启动：TP=张量并行（默认，每层切分到多卡）/ PP=流水线并行（按层分阶段）；
+  // 并行度必须等于实际启用的显卡数
+  if (gpuN > 1) {
+    if (parallelMode === 'pp') {
+      args.push('--pipeline-parallel-size', gpuN.toString());
+    } else {
+      args.push('--tensor-parallel-size', gpuN.toString());
+    }
+  }
+
+  // KV 缓存量化：fp8_kv 权重不量化仅量化 KV；fp8/int8 同时量化权重+KV。
+  // 注意：若模型自身 config.json 已声明量化（quantization_config，如 ornith 的
+  // compressed-tensors、qwen fp8），再传 --quantization 会因不匹配直接启动失败
+  // （pydantic ValidationError）。因此模型已声明量化时一律不传 --quantization，
+  // 由 vLLM 从模型配置推断；int8 的 KV 缓存量化仍可单独应用。
+  const modelConfigPath = path.join(modelPath, 'config.json');
+  let modelQuant = null;
+  try {
+    const mc = JSON.parse(fs.readFileSync(modelConfigPath, 'utf8'));
+    // 新版 transformers(5.x) 把量化配置放到 compression_config 键（如 hygon 的 W8A8 INT8），
+    // 旧版仍是 quantization_config。两者都识别，避免误判"未量化"而叠加 --quantization 导致启动失败。
+    const qc = mc.quantization_config || mc.compression_config;
+    if (qc) modelQuant = qc.quant_method || qc.quantization_method || 'yes';
+  } catch (e) {}
+  if (modelQuant) {
+    // 模型自身已量化（如 qwen3.8-27b-fp8）：不能再传 --quantization（会 pydantic 校验失败），
+    // 但用户仍可单独对 KV cache 做量化（--kv-cache-dtype），不动权重。
+    if (kvCacheQuant === 'int8') args.push('--kv-cache-dtype', 'int8');
+    else if (kvCacheQuant === 'fp8' || kvCacheQuant === 'fp8_kv') args.push('--kv-cache-dtype', 'fp8');
+    else if (kvCacheQuant === 'bfloat16' || kvCacheQuant === 'bf16') args.push('--kv-cache-dtype', 'bfloat16');
+  } else if (kvCacheQuant === 'fp8_kv') {
+    args.push('--quantization', 'fp8_kv');
+  } else if (kvCacheQuant === 'fp8') {
+    args.push('--quantization', 'fp8');
+  } else if (kvCacheQuant === 'int8') {
+    args.push('--quantization', 'awq');
+    args.push('--kv-cache-dtype', 'int8');
+  }
+
+  // 采样参数：通过 override-generation-config 合并覆盖模型的默认采样配置
+  // （此 vLLM fork 0.27.1 无 --temperature 等独立 CLI 参数，仅有 --override-generation-config JSON）
+  args.push('--override-generation-config', JSON.stringify(samplingParams));
+
+  // ====== vLLM 附加启动参数（前端「vLLM 高级参数」区块，仅 vllm 运行时传入）======
+  // 附加命令行参数：shell 风格分词（支持引号 / $((...)) 算术），整体追加在基础命令之后。
+  // 同名 flag 时附加参数胜出：先移除基础命令中的出现（flag 及其值），再追加附加参数。
+  // 放在 PD 分派之前：PD 双实例会继承同一份附加参数（各自端口/并行度仍由 PD 逻辑改写）。
+  {
+    const extraArgsRaw = String(params.vllmExtraArgs || '').trim();
+    if (extraArgsRaw) {
+      const extraTokens = shellTokenize(extraArgsRaw);
+      // 显示名称统一以弹窗「显示名称」字段为准：附加参数里的 --served-model-name（及其值）一律忽略（08-30），
+      // 否则预设/附加参数会静默覆盖字段值，导致改名"没修改成功"。
+      {
+        let si = extraTokens.indexOf('--served-model-name');
+        while (si !== -1) {
+          const removeN = (si + 1 < extraTokens.length && !String(extraTokens[si + 1]).startsWith('--')) ? 2 : 1;
+          extraTokens.splice(si, removeN);
+          si = extraTokens.indexOf('--served-model-name', si);
+        }
+      }
+      if (extraTokens.length) {
+        for (const t of extraTokens) {
+          if (!t.startsWith('--')) continue;
+          const i = args.indexOf(t);
+          if (i === -1) continue;
+          // 若下一 token 是值（不以 -- 开头）则连同 flag 一起移除，避免残留旧值
+          const removeN = (i + 1 < args.length && !String(args[i + 1]).startsWith('--')) ? 2 : 1;
+          args.splice(i, removeN);
+        }
+        args.push(...extraTokens);
+      }
+    }
+  }
+
+  const env = {
+    ...process.env,
+    VLLM_USE_MODELSCOPE: 'False',
+    VLLM_USE_FLASHINFER_SAMPLER: '0',
+    VLLM_MOE_USE_DEEP_GEMM: '0',
+    VLLM_SLEEP_WHEN_IDLE: '1',
+    // ---- Hermes 修复：GCC10(c++20) + nvrtc LD_LIBRARY_PATH + humming 兜底 ----
+    VLLM_HUMMING_USE_FALLBACK: '1',
+    HUMMING_NO_JIT: '1',
+    CC: 'gcc-10',
+    CXX: 'g++-10',
+    LD_LIBRARY_PATH: VENV + '/lib/python3.11/site-packages/nvidia/cu13/lib' + (process.env.LD_LIBRARY_PATH ? ':' + process.env.LD_LIBRARY_PATH : ''),
+    CUDA_VISIBLE_DEVICES: gpuDevices,
+    CUDA_HOME: VENV + '/lib/python3.11/site-packages/nvidia/cu13',
+    PATH: VENV + '/lib/python3.11/site-packages/nvidia/cu13/bin:' + VENV + '/bin:' + process.env.PATH,
+    FLASHINFER_EXTRA_CUDAFLAGS: '-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK',
+    FLASHINFER_DISABLE_VERSION_CHECK: '1',
+    // 2026-09-16: 本地模型路径解析失败时禁止回退 HF hub 在线查询（否则报 Repo id 错误）
+    HF_HUB_OFFLINE: '1',
+    TRANSFORMERS_OFFLINE: '1',
+  };
+
+  // 上下文长度超过模型原生上限时自动加 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+  if (needAllowLong) {
+    env.VLLM_ALLOW_LONG_MAX_MODEL_LEN = '1';
+  }
+
+  // ====== vLLM 附加环境变量（前端「vLLM 高级参数」区块，仅 vllm 运行时传入）======
+  // 每行一个 KEY=VALUE（# 开头为注释行）；KEY 必须为合法环境变量名，否则丢弃。
+  // 用户变量在基础 env 之后合并，同名时用户值胜出（如覆盖 VLLM_LOGGING_LEVEL）。
+  {
+    const extraEnvRaw = String(params.vllmExtraEnv || '').trim();
+    if (extraEnvRaw) {
+      for (const line of extraEnvRaw.split('\n')) {
+        const t = line.trim();
+        if (!t || t.startsWith('#')) continue;
+        const eq = t.indexOf('=');
+        if (eq <= 0) continue;
+        const k = t.slice(0, eq).trim();
+        const val = t.slice(eq + 1).trim();
+        if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) env[k] = val;
+      }
+    }
+  }
+
+  let callbackCalled = false;
+  function safeCallback(result) {
+    if (callbackCalled) return;
+    callbackCalled = true;
+    callback(result);
+  }
+
+  const logFile = path.join(__dirname, 'vllm.log');
+  // Must pass a real fd number to stdio: an unopened WriteStream (fd: null)
+  // is rejected by spawn with '"value" is invalid for option "stdio"'.
+  let logFd = null;
+  try { logFd = fs.openSync(logFile, 'a'); } catch (e) { /* logging disabled */ }
+
+  // PD 分离模式：拆成 prefill + decode 两个实例（见 startVllmPd）
+  if (pdMode === '1') {
+    return startVllmPd(modelName, params, { args, env, venv: VENV }, callback);
+  }
+
+  const vllm = spawn(VENV + '/bin/vllm', args, {
+    env,
+    detached: true,
+    stdio: logFd === null ? ['ignore', 'ignore', 'ignore'] : ['ignore', logFd, logFd],
+  });
+  vllm.on('exit', () => {
+    if (logFd !== null) { try { fs.closeSync(logFd); } catch (e) {} }
+  });
+
+  vllm.on('error', (err) => {
+    safeCallback({ success: false, error: err.message });
+  });
+
+  // Wait a moment and check if it's still running
+  setTimeout(() => {
+    if (callbackCalled) return; // already handled by 'error'
+    try {
+      const alive = process.kill(vllm.pid, 0);
+      if (alive) {
+        safeCallback({ success: true, pid: vllm.pid, model: modelName, runtime: 'vllm' });
+      } else {
+        safeCallback({ success: false, error: 'vLLM process exited immediately' });
+      }
+    } catch (e) {
+      safeCallback({ success: false, error: e.message });
+    }
+  }, 5000);
+}
+
+// ====== PD（prefill/decode）双实例启动 ======
+// 由 startVllmModel 在 pdMode=1 时分派：同一模型起两个 vLLM 实例——
+//   prefill（kv_producer，第 1 卡，端口 port）只算 KV 缓存
+//   decode（kv_consumer，第 2 卡，端口 port+1）拿 KV 直接生成
+// 必须的环境差异（对照 08-27 双卡实测结论）：
+//   - nixl 依赖 libssl.so.3/libcrypto.so.3 → LD_LIBRARY_PATH 前置 /home/ll/libssl3
+//   - hybrid mamba 模型 conv state 传输 → VLLM_SSM_CONV_STATE_LAYOUT=DS
+//   - 同机两个实例侧信道端口必须不同 → prefill 5600 / decode 5601
+// 启动成功后控制台代理（PD_MODEL_PORTS）自动走两步转发，客户端无感。
+async function startVllmPd(modelName, params, base, callback) {
+  const { spawn } = require('child_process');
+  const { port, servedName, gpuId } = params;
+  const decodePort = port + 1;
+  const gpuN = Math.max(1, parseInt(params.gpuCount) || 1);
+  if (gpuN < 2) {
+    callback({ success: false, error: 'PD 分离模式需要至少 2 张显卡（一卡 prefill + 一卡 decode），请把「启用显卡数量」设为 2' });
+    return;
+  }
+  if (portInUse(decodePort)) {
+    callback({ success: false, error: `PD 模式第二个端口 ${decodePort} 已被占用，请换一个空闲起始端口` });
+    return;
+  }
+  await killPortResidents(decodePort);
+
+  // args 工具函数：去掉成对参数（--tensor-parallel-size N / --speculative-config JSON）
+  const stripArgs = (args, names) => {
+    const out = [];
+    for (let i = 0; i < args.length; i++) {
+      if (names.includes(args[i])) { i++; continue; }
+      out.push(args[i]);
+    }
+    return out;
+  };
+  const replacePort = (args, p) => {
+    const idx = args.indexOf('--port');
+    if (idx >= 0 && idx + 1 < args.length) args[idx + 1] = String(p);
+    return args;
+  };
+
+  const baseArgs = base.args.slice();
+
+  // decode 端投机参数（DFlash2/MTP）单独取出；PD 下 prefill 端也配相同投机配置——
+  // 让两侧 physical_blocks_per_logical 一致（实测：仅 decode 带 MTP 时 51 vs 49，
+  // NIXL 握手拒绝 hybrid mamba 模型的前缀缓存传输；两侧同配后同为 51，握手通过，
+  // MTP 只在 decode 端实际执行，prefill 端仅布局对齐）。08-27 实测验证。
+  let specArg = null;
+  const specIdx = baseArgs.indexOf('--speculative-config');
+  if (specIdx >= 0 && specIdx + 1 < baseArgs.length) specArg = baseArgs.slice(specIdx, specIdx + 2);
+  const baseArgsNoSpec = specArg ? stripArgs(baseArgs.slice(), ['--speculative-config']) : baseArgs.slice();
+
+  const prefillArgs = replacePort(
+    stripArgs(baseArgsNoSpec, ['--tensor-parallel-size', '--pipeline-parallel-size']),
+    port);
+  prefillArgs.push('--kv-transfer-config', JSON.stringify({ kv_connector: 'NixlConnector', kv_role: 'kv_producer', kv_rank: 0, kv_parallel_size: 1 }));
+  if (specArg) prefillArgs.push(...specArg);
+  const decodeArgs = replacePort(
+    stripArgs(baseArgsNoSpec, ['--tensor-parallel-size', '--pipeline-parallel-size']),
+    decodePort);
+  decodeArgs.push('--kv-transfer-config', JSON.stringify({ kv_connector: 'NixlConnector', kv_role: 'kv_consumer', kv_rank: 1, kv_parallel_size: 1 }));
+  if (specArg) decodeArgs.push(...specArg);
+
+  const ssl3Path = '/home/ll/libssl3';
+  // flashinfer JIT 编译必需：nvcc 在 pip cu13 包里（CUDA_HOME），且 0.6.16 的 cccl
+  // 与 CUDA 13.3 的版本检查不兼容需跳过（FLASHINFER_EXTRA_CUDAFLAGS）。缺则 PD 实例
+  // 启动触发新 kernel 编译时失败（"Could not find nvcc" / cccl incompatible）。
+  const jitEnv = {
+    CUDA_HOME: base.venv + '/lib/python3.11/site-packages/nvidia/cu13',
+    FLASHINFER_EXTRA_CUDAFLAGS: '-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK',
+  };
+  const prefillEnv = {
+    ...base.env,
+    ...jitEnv,
+    CUDA_VISIBLE_DEVICES: String(gpuId),
+    LD_LIBRARY_PATH: ssl3Path + (base.env.LD_LIBRARY_PATH ? ':' + base.env.LD_LIBRARY_PATH : ''),
+    VLLM_SSM_CONV_STATE_LAYOUT: 'DS',
+    VLLM_NIXL_SIDE_CHANNEL_PORT: '5600',
+  };
+  const decodeEnv = {
+    ...base.env,
+    ...jitEnv,
+    CUDA_VISIBLE_DEVICES: String(gpuId + 1),
+    LD_LIBRARY_PATH: ssl3Path + (base.env.LD_LIBRARY_PATH ? ':' + base.env.LD_LIBRARY_PATH : ''),
+    VLLM_SSM_CONV_STATE_LAYOUT: 'DS',
+    VLLM_NIXL_SIDE_CHANNEL_PORT: '5601',
+  };
+
+  let callbackCalled = false;
+  const safeCallback = (r) => { if (callbackCalled) return; callbackCalled = true; callback(r); };
+  const openLog = (name) => {
+    try { return fs.openSync(path.join(__dirname, name), 'a'); } catch (e) { return null; }
+  };
+  const fdP = openLog('vllm-pd-prefill.log');
+  const fdD = openLog('vllm-pd-decode.log');
+
+  const proc1 = spawn(base.venv + '/bin/vllm', prefillArgs, {
+    env: prefillEnv, detached: true,
+    stdio: fdP === null ? ['ignore', 'ignore', 'ignore'] : ['ignore', fdP, fdP],
+  });
+  const proc2 = spawn(base.venv + '/bin/vllm', decodeArgs, {
+    env: decodeEnv, detached: true,
+    stdio: fdD === null ? ['ignore', 'ignore', 'ignore'] : ['ignore', fdD, fdD],
+  });
+
+  const killAll = () => {
+    try { process.kill(proc1.pid, 'SIGKILL'); } catch (e) {}
+    try { process.kill(proc2.pid, 'SIGKILL'); } catch (e) {}
+  };
+
+  setTimeout(() => {
+    let a1 = false, a2 = false;
+    try { a1 = process.kill(proc1.pid, 0); } catch (e) { a1 = false; }
+    try { a2 = process.kill(proc2.pid, 0); } catch (e) { a2 = false; }
+    if (a1 && a2) {
+      safeCallback({ success: true, pid: proc1.pid, pidDecode: proc2.pid, model: modelName, runtime: 'vllm', pd: true, prefillPort: port, decodePort });
+    } else if (!a1 && !a2) {
+      safeCallback({ success: false, error: `PD 两个实例均启动失败，详见 vllm-pd-prefill.log / vllm-pd-decode.log（端口 ${port}/${decodePort}）` });
+    } else if (!a1) {
+      killAll();
+      safeCallback({ success: false, error: `prefill 实例启动失败（端口 ${port}），已连带停止 decode；详见 vllm-pd-prefill.log` });
+    } else {
+      killAll();
+      safeCallback({ success: false, error: `decode 实例启动失败（端口 ${decodePort}），已连带停止 prefill；详见 vllm-pd-decode.log` });
+    }
+  }, 5000);
+
+  proc1.on('error', (err) => safeCallback({ success: false, error: 'prefill 启动错误: ' + err.message }));
+  proc2.on('error', (err) => safeCallback({ success: false, error: 'decode 启动错误: ' + err.message }));
+  proc1.on('exit', () => { try { if (fdP !== null) fs.closeSync(fdP); } catch (e) {} });
+  proc2.on('exit', () => { try { if (fdD !== null) fs.closeSync(fdD); } catch (e) {} });
+}
+
+// ====== SGLang 实例启动 ======
+// 参数与 vllm 分支同源（port / dflash / mtpTokens / gpuMemUtil / servedName / gpuId / gpuCount），
+// 但只使用 sglang 支持的子集。DFlash2 投机解码与本地部署验证过的参数一致：
+//   --disable-prefill-cuda-graph 必带（GDN 线性注意力 Triton 内核在 prefill CUDA 图捕获时
+//   会非法内存访问，把 GPU 打成 NV_ERR_RESET_REQUIRED，只能重启机器恢复）。
+// Shell 风格分词：处理空白 / 单引号 / 双引号 / 反斜杠转义，并求值 $((...)) 算术
+// （如 $((256*1024)) → 262144）。仅允许纯数字与四则运算符进入求值，无代码执行风险。
+function shellTokenize(input) {
+  const s = String(input);
+  const tokens = [];
+  let cur = '', has = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\' && i + 1 < s.length) { cur += s[++i]; has = true; continue; }
+    if (c === "'" || c === '"') {
+      let j = i + 1;
+      while (j < s.length && s[j] !== c) j++;
+      cur += s.slice(i + 1, j); has = true; i = j; continue;
+    }
+    if (c === '$' && s[i + 1] === '(' && s[i + 2] === '(') {
+      // $(( expr ))：两个右括号都需消费，depth 从 2 起算
+      let j = i + 3, depth = 2;
+      while (j < s.length && depth > 0) {
+        if (s[j] === '(') depth++;
+        else if (s[j] === ')') depth--;
+        j++;
+      }
+      const expr = s.slice(i + 3, Math.max(i + 3, j - 2));
+      if (/\d/.test(expr) && /^[\d+\-*/%() ]+$/.test(expr)) {
+        try { cur += String(Function('"use strict";return (' + expr + ')')()); has = true; i = j - 1; continue; } catch (e) { /* 求值失败按字面量处理 */ }
+      }
+      cur += c; has = true; continue;
+    }
+    if (/\s/.test(c)) { if (has) { tokens.push(cur); cur = ''; has = false; } continue; }
+    cur += c; has = true;
+  }
+  if (has) tokens.push(cur);
+  return tokens;
+}
+
+async function startSglangModel(modelName, params, callback) {
+  const { execSync } = require('child_process');
+  const { spawn } = require('child_process');
+  const { port, gpuId, gpuCount, parallelMode, gpuMemUtil, servedName, mtpTokens, kvCacheQuant, thinking, thinkingEffort } = params;
+  // reasoning_effort：允许 low/medium/high/xhigh 及手动输入
+  const rawEffort = String(thinkingEffort || '').trim();
+  const effort = /^[a-zA-Z0-9_-]{1,32}$/.test(rawEffort) ? rawEffort : 'medium';
+  const VENV = SGLANG_VENV;
+
+  if (!fs.existsSync(path.join(VENV, 'bin', 'python'))) {
+    callback({ success: false, error: 'sglang 环境未就绪：未找到 /home/ll/sglang-env/bin/python，请先完成 sglang 安装' });
+    return;
+  }
+  const isMtp = params.mtp === '1';
+  const isDflash = params.dflash === '1';
+  const isDspark = params.dspark === '1';
+  if (isMtp) {
+    // SGLang MTP：内置 NEXTN 算法，Qwen3.8-27B 走 Qwen3NextForCausalLMMTP
+    // 草稿模型路径 = 目标模型路径（MTP 层从目标 ckpt 提取）
+    if (!String(modelName).includes('qwen3.8-27b')) {
+      callback({ success: false, error: 'SGLang MTP 目前仅支持 qwen3.8-27b 系列目标模型（Qwen3NextForCausalLMMTP）' });
+      return;
+    }
+  }
+  if (isDflash) {
+    if (!fs.existsSync(path.join(SGLANG_DRAFT_PATH, 'config.json'))) {
+      callback({ success: false, error: 'DFlash2 草稿模型未下载：/home/ll/models/qwen3.8-27b-dflash2/config.json（需先下载 incoai/Qwen3.8-27B-DFlash2）' });
+      return;
+    }
+    if (!String(modelName).includes('qwen3.8-27b')) {
+      callback({ success: false, error: 'DFlash2 草稿模型目前仅支持 qwen3.8-27b 系列目标模型' });
+      return;
+    }
+  }
+  if (isDspark) {
+    if (!fs.existsSync(path.join(SGLANG_DSPARK_PATH, 'config.json'))) {
+      callback({ success: false, error: 'DSpark 草稿模型未下载：/home/ll/models/qwen3.8-27b-dspark/config.json（需先下载 incoai/dspark-qwen3.8-27b）' });
+      return;
+    }
+    if (!String(modelName).includes('qwen3.8-27b')) {
+      callback({ success: false, error: 'DSpark 草稿模型目前仅支持 qwen3.8-27b 系列目标模型' });
+      return;
+    }
+  }
+
+  // 清理目标端口残留（vllm/sglang 均可）并等待显存释放
+  await killPortResidents(port);
+
+  const gpuN = Math.max(1, parseInt(gpuCount) || 1);
+  const gpuDevices = Array.from({ length: gpuN }, (_, i) => (parseInt(gpuId) || 0) + i).join(',');
+
+  // 显存占用上限保护（sglang 专用）：
+  // CMP 170HX 无原生 FP8 → sglang 走 Marlin weight-only；DFLASH 的 GDN Triton 内核
+  // 是 decode 时才动态加载的（chunk_gated_delta_rule_fwd_*，约 0.5~0.6 GB）。若
+  // --mem-fraction-static 过高（如 0.95）会预占全部显存，decode 加载该内核时 OOM，
+  // 损坏 CUDA 上下文 → illegal memory access / UVM fatal error，只能重启机器恢复。
+  // 故 DFLASH 上限 0.88、普通 sglang 上限 0.92，给运行时 kernel 预留余量。
+  const memFracRaw = parseFloat(gpuMemUtil) || 0.9;
+  const memFracCap = (isMtp || isDflash || isDspark) ? 0.88 : 0.92;
+  const memFracSafe = Math.min(memFracRaw, memFracCap);
+  const memFracClamped = memFracRaw > memFracSafe;
+
+  const args = [
+    '-m', 'sglang.launch_server',
+    '--model-path', path.join(MODELS_DIR, modelName),
+    '--port', port.toString(),
+    '--served-model-name', servedName,
+    '--trust-remote-code',
+    '--mem-fraction-static', String(memFracSafe),
+    '--disable-prefill-cuda-graph',
+    '--enable-metrics',  // 开启 Prometheus /metrics 端点（默认关闭），仪表盘统计依赖它
+    '--reasoning-parser', 'qwen3',
+    // 工具调用解析（与 vLLM 分支对齐）：qwen3_coder 解析器把模型的 <tool_call> 文本解析成
+    // OpenAI 结构化的 tool_calls 数组；不带此参数时模型会输出原始工具文本、tool_calls=null，
+    // 客户端工具调用会报错。模型模板会自动检测（日志确认 qwen3_coder 可用）。
+    '--tool-call-parser', 'qwen3_coder',
+    '--default-chat-template-kwargs', thinking === '1'
+      ? '{"enable_thinking": true, "reasoning_effort": "' + effort + '"}'
+      : '{"enable_thinking": false}',
+    // 每请求实测数据导出（与 vLLM stat-logger 的 request-traces.jsonl 对应）：
+    // sglang 内置 FileRequestMetricsExporter，每个请求完成后写一行 JSONL，
+    // 前端「最近完成请求」表格据此显示 sglang 的真实请求数据。
+    '--export-metrics-to-file',
+    '--export-metrics-to-file-dir', path.join(__dirname, 'sglang-request-metrics'),
+    // ====== 09-01 用户要求：所有 SGLang 启动统一附带以下两个 flag（startSglangModel 是唯一入口，
+    // 弹窗/快速启动预设/预设启动 API 全部走此基础命令，一处生效全路径覆盖）======
+    // --dp 1：数据并行度显式钉 1（sglang 默认即 1，写死防未来默认变化误改语义，单卡/TP 拓扑不变）。
+    // --schedule-policy lpm：Longest Prefix Match 优先（sglang 默认 fcfs）。交织流量下优先调度共享
+    // 最长公共前缀的请求，最大化 radix cache 复用、提高前缀缓存命中率（生产定版）。
+    // 「SGLang 附加启动参数」里含同名 flag 时附加参数胜出（下方去重逻辑先移除基础命令中的同名项）。
+    '--dp', '1',
+    '--schedule-policy', 'lpm',
+    // 090x：SGLang 默认 enable_cache_report=False，不往 OpenAI usage 上报 cached_tokens，
+    // 导致 DSH/pi-ai 拿不到 cacheRead、前端不显示缓存命中。显式开启。
+    '--enable-cache-report',
+  ];
+  // 多卡：TP=张量并行（默认）/ PP=流水线并行；「SGLang 附加启动参数」里显式指定 --tp/--pp 时附加参数胜出
+  // （下方去重逻辑会移除基础命令中的同名 flag）
+  if (gpuN > 1) {
+    if (parallelMode === 'pp') args.push('--pp', String(gpuN));
+    else args.push('--tp', String(gpuN));
+  }
+  if (isMtp) {
+    // SGLang MTP：NEXTN（内部折叠为 EAGLE），草稿模型路径 = 目标模型路径
+    // MTP 层从目标 ckpt 提取（Qwen3NextForCausalLMMTP）。
+    // 约束：topk=1 时 SGLang 要求 num_draft_tokens = num_steps + 1，
+    // 且 num_steps 与 topk 均不可缺省（缺省会触发参数解析断言失败）。
+    // 用户「投机步数」= 每步投机 token 数 = num_draft_tokens，故 num_steps = N-1。
+    const mtpN = Math.min(8, Math.max(1, parseInt(mtpTokens) || 5));
+    const mtpSteps = Math.max(1, mtpN - 1);
+    args.push(
+      '--speculative-algorithm', 'NEXTN',
+      '--speculative-draft-model-path', path.join(MODELS_DIR, modelName),
+      '--speculative-eagle-topk', '1',
+      '--speculative-num-steps', String(mtpSteps),
+      '--speculative-num-draft-tokens', String(mtpSteps + 1)
+    );
+  } else if (isDflash) {
+    args.push(
+      '--speculative-algorithm', 'DFLASH',
+      '--speculative-draft-model-path', SGLANG_DRAFT_PATH,
+      '--speculative-num-draft-tokens', String(Math.min(8, Math.max(1, parseInt(mtpTokens) || 8)))
+    );
+  } else if (isDspark) {
+    // DSPARK：gamma 由草稿 ckpt 的 dspark_block_size 定死（训练决定，运行时改小无效），
+    // sglang 硬校验 --speculative-num-draft-tokens 必须严格等于 gamma+1（verify 窗口），
+    // 故以 ckpt config 为准；UI「投机 token 数」不再当 gamma（旧逻辑 UI 填 5 → 6 被拒启动即退）
+    const dsparkGamma = readDsparkGamma(SGLANG_DSPARK_PATH) || 7;
+    if (parseInt(mtpTokens) && parseInt(mtpTokens) !== dsparkGamma) {
+      console.log(`[sglang-start] DSPARK gamma 固定为草稿 ckpt 的 dspark_block_size=${dsparkGamma}，忽略 UI 输入 ${mtpTokens}`);
+    }
+    args.push(
+      '--speculative-algorithm', 'DSPARK',
+      '--speculative-draft-model-path', SGLANG_DSPARK_PATH,
+      '--speculative-num-draft-tokens', String(dsparkGamma + 1)
+    );
+  }
+  // KV 缓存量化（sglang 用 --kv-cache-dtype；仅 KV 生效、不动权重，故 fp8 与 fp8_kv 等价）。
+  // sglang 支持 auto / fp8_e4m3 / fp8_e5m2 / mxfp8 / bf16 / nvfp4 / fp4_mx_block16，不支持 int8，
+  // 故 int8 在 sglang 下回落 auto（不传）+ 前端已有「sglang 不支持 int8」提示。
+  {
+    const kv = String(kvCacheQuant || 'auto');
+    if (kv === 'fp8' || kv === 'fp8_kv') {
+      args.push('--kv-cache-dtype', 'fp8_e4m3');
+    }
+  }
+  // 采样参数：sglang 用 --preferred-sampling-params（JSON 格式），与 vllm 的 --override-generation-config 对应
+  {
+    const p = {};
+    if (params.temperature !== undefined && params.temperature !== '' && params.temperature !== null) p.temperature = parseFloat(params.temperature);
+    if (params.topP !== undefined && params.topP !== '' && params.topP !== null) p.top_p = parseFloat(params.topP);
+    if (params.topK !== undefined && params.topK !== '' && params.topK !== null) p.top_k = parseInt(params.topK);
+    if (params.minP !== undefined && params.minP !== '' && params.minP !== null) p.min_p = parseFloat(params.minP);
+    if (params.repetitionPenalty !== undefined && params.repetitionPenalty !== '' && params.repetitionPenalty !== null) p.repetition_penalty = parseFloat(params.repetitionPenalty);
+    if (Object.keys(p).length > 0) {
+      args.push('--preferred-sampling-params', JSON.stringify(p));
+    }
+  }
+
+  // ====== SGLang 附加启动参数（前端「SGLang 附加启动参数」框，仅 sglang 运行时传入）======
+  // 附加命令行参数：shell 风格分词（支持引号 / $((...)) 算术），整体追加在基础命令之后。
+  // 同名 flag 时附加参数胜出：先移除基础命令中的出现（flag 及其值），再追加附加参数。
+  {
+    const extraArgsRaw = String(params.sglangExtraArgs || '').trim();
+    if (extraArgsRaw) {
+      const extraTokens = shellTokenize(extraArgsRaw);
+      // 显示名称统一以弹窗「显示名称」字段为准：附加参数里的 --served-model-name（及其值）一律忽略（08-30），
+      // 否则预设/附加参数会静默覆盖字段值，导致改名"没修改成功"。
+      {
+        let si = extraTokens.indexOf('--served-model-name');
+        while (si !== -1) {
+          const removeN = (si + 1 < extraTokens.length && !String(extraTokens[si + 1]).startsWith('--')) ? 2 : 1;
+          extraTokens.splice(si, removeN);
+          si = extraTokens.indexOf('--served-model-name', si);
+        }
+      }
+      if (extraTokens.length) {
+        for (const t of extraTokens) {
+          if (!t.startsWith('--')) continue;
+          const i = args.indexOf(t);
+          if (i === -1) continue;
+          // 若下一 token 是值（不以 -- 开头）则连同 flag 一起移除，避免残留旧值
+          const removeN = (i + 1 < args.length && !String(args[i + 1]).startsWith('--')) ? 2 : 1;
+          args.splice(i, removeN);
+        }
+        args.push(...extraTokens);
+      }
+    }
+  }
+
+  const env = {
+    ...process.env,
+    SGLANG_USE_MODELSCOPE: 'false',
+    CUDA_VISIBLE_DEVICES: gpuDevices,
+    CUDA_HOME: VENV + '/lib/python3.11/site-packages/nvidia/cu13',
+    LD_LIBRARY_PATH: VENV + '/lib/python3.11/site-packages/nvidia/cu13/lib' + (process.env.LD_LIBRARY_PATH ? ':' + process.env.LD_LIBRARY_PATH : ''),
+    // gcc-10 符号链接目录（sgl-kernel JIT 需要 C++20）+ sglang venv bin（ninja 等）
+    PATH: '/home/ll/bin:' + VENV + '/bin:' + process.env.PATH,
+    CC: 'gcc-10',
+    CXX: 'g++-10',
+    // pip 混装 nvcc 13.3 / cudart 13.0 时 flashinfer 运行时 JIT 的 CCCL 兼容性校验会失败
+    FLASHINFER_EXTRA_CUDAFLAGS: '-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK',
+  };
+  // 附加环境变量（前端每行一个 KEY=VALUE），覆盖同名基础 env（如 CUDA_VISIBLE_DEVICES）
+  {
+    const extraEnvRaw = String(params.sglangExtraEnv || '').trim();
+    if (extraEnvRaw) {
+      for (const line of extraEnvRaw.split('\n')) {
+        const l = line.trim();
+        if (!l || l.startsWith('#')) continue;
+        const m = l.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+        if (m) env[m[1]] = m[2].trim().replace(/^["']|["']$/g, '');
+      }
+    }
+  }
+
+  let callbackCalled = false;
+  function safeCallback(result) {
+    if (callbackCalled) return;
+    callbackCalled = true;
+    callback(result);
+  }
+
+  const logFile = SGLANG_LOG_PATH;
+  let logFd = null;
+  try { logFd = fs.openSync(logFile, 'a'); } catch (e) { /* logging disabled */ }
+
+  // 记录最终命令行（含附加参数），便于排查启动失败
+  try { fs.appendFileSync(logFile, '# [' + new Date().toISOString() + '] cmd: ' + VENV + '/bin/python ' + args.join(' ') + '\n'); } catch (e) { /* ignore */ }
+
+  const sgl = spawn(VENV + '/bin/python', args, {
+    env,
+    detached: true,
+    stdio: logFd === null ? ['ignore', 'ignore', 'ignore'] : ['ignore', logFd, logFd],
+  });
+  sgl.on('exit', () => {
+    if (logFd !== null) { try { fs.closeSync(logFd); } catch (e) {} }
+  });
+  sgl.on('error', (err) => {
+    safeCallback({ success: false, error: err.message });
+  });
+
+  // 等 5 秒确认进程存活（sglang 启动加载需几分钟，此处只确认进程没立即退出）
+  setTimeout(() => {
+    if (callbackCalled) return;
+    try {
+      const alive = process.kill(sgl.pid, 0);
+      if (alive) {
+        const notice = memFracClamped
+          ? '显存占用已自动限制为 ' + memFracSafe + '（您设置的是 ' + memFracRaw + '）：DFLASH 运行时需预留显存给动态加载的 Triton 内核，过高会 OOM 损坏 GPU 状态。'
+          : undefined;
+        safeCallback({ success: true, pid: sgl.pid, model: modelName, runtime: 'sglang', notice: notice });
+      } else {
+        safeCallback({ success: false, error: 'sglang process exited immediately（详见 ' + SGLANG_LOG_PATH + '）' });
+      }
+    } catch (e) {
+      safeCallback({ success: false, error: e.message });
+    }
+  }, 5000);
+}
+
+async function stopVllm(callback, port) {
+  // 通用停止：vllm（vllm serve + EngineCore）与 sglang（sglang.launch_server + 工作进程）都支持。
+  port = port || config.vllmPort;
+  try {
+    const { execSync } = require('child_process');
+    // 找该端口的实例主进程（cmdline 含 vllm serve / sglang.launch_server 且 --port 匹配），
+    // 不动其他端口的实例。同样不能用 lsof：加载中的实例尚未监听端口，用 pgrep 匹配命令行更可靠。
+    let apiPid = null;
+    let runtime = null;
+    const pids = execSync(`pgrep -f "vllm serve" 2>/dev/null; pgrep -f "sglang.launch_server" 2>/dev/null || true`, { encoding: 'utf8', timeout: 5000 }).trim().split('\n').filter(Boolean);
+    for (const pid of pids) {
+      try {
+        const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ');
+        if (cmd.includes(`--port ${port}`)) {
+          apiPid = pid;
+          runtime = cmd.includes('sglang') ? 'sglang' : 'vllm';
+          break;
+        }
+      } catch (e) {}
+    }
+    // 兜底：按监听端口找（已就绪实例；-sTCP:LISTEN 排除控制台自身的客户端 socket）
+    if (!apiPid) {
+      try {
+        const lp = execSync(`lsof -ti:${port} -sTCP:LISTEN 2>/dev/null || true`, { encoding: 'utf8', timeout: 3000 }).trim().split('\n').find(l => parseInt(l.trim()) !== process.pid);
+        if (lp) {
+          apiPid = lp.trim();
+          runtime = detectRuntimeForPid(parseInt(apiPid)) || 'unknown';
+        }
+      } catch (e) {}
+    }
+    if (!apiPid) {
+      // 主进程已不在（可能上次停止失败后残留 EngineCore/sglang 工作进程）：直接清理残留并等显存释放
+      await killOrphanEngineCores();
+      const sg = collectSglangPids(port);
+      if (sg.length) await waitGpuMemRelease(sg);
+      setTimeout(() => callback({ success: true, port }), 300);
+      return;
+    }
+    // 1) 先优雅停止（SIGTERM）：让服务自行停掉子进程并释放显存
+    try { execSync('kill -TERM ' + apiPid, { encoding: 'utf8', timeout: 3000 }); } catch (e2) {}
+    let exited = false;
+    for (let i = 0; i < 10; i++) {
+      try {
+        const stat = fs.readFileSync(`/proc/${apiPid}/stat`, 'utf8');
+        const m = stat.match(/\)\s+([A-Z])/);
+        const state = m ? m[1] : '?';
+        if (state === 'Z' || state === 'X') { exited = true; break; } // 僵尸/已消失
+      } catch (e) { exited = true; break; }
+      await sleep(1000);
+    }
+    if (!exited) {
+      // 2) 优雅超时：强杀主进程，残留子进程由下方兜底清理
+      try { execSync('kill -9 ' + apiPid, { encoding: 'utf8', timeout: 3000 }); } catch (e2) {}
+      await sleep(1000);
+    }
+    // 3) 清理残留：vllm → 孤儿 EngineCore/resource_tracker；sglang → 工作进程；并等待显存真正释放
+    if (runtime === 'sglang') {
+      const sg = collectSglangPids(port);
+      if (sg.length) await waitGpuMemRelease(sg);
+    } else {
+      await killOrphanEngineCores();
+    }
+    setTimeout(() => callback({ success: true, port, runtime }), 500);
+  } catch (e) {
+    callback({ success: false, error: e.message });
+  }
+}
+
+// ====== 功耗监测（Scaphandre 式：RAPL 总功率 + CPU 时间比例归因到进程 + 能量积分） ======
+const osPower = require('os');
+const CPU_CORES = osPower.cpus().length || 1;
+let CPU_MODEL = 'CPU';
+try {
+  const _mi = fs.readFileSync('/proc/cpuinfo', 'utf8').match(/model name\s*:\s*(.+)/);
+  if (_mi && _mi[1]) CPU_MODEL = _mi[1].trim();
+} catch (e) {}
+const RAPL_PKG_PATH = '/sys/class/powercap/intel-rapl:0/energy_uj';
+let cpuPowerW = null;
+let lastEnergyUj = null;
+let lastEnergyTs = 0;
+let gpuPowerW = null;      // 最近一次 nvidia-smi power.draw
+let gpuUtil = null;        // GPU 利用率 %
+let gpuProcs = [];         // [{pid, memMiB}] 正在使用 GPU 的进程
+let lastProcSnap = null;   // { ts, pids: {pid: {t, name}} } 上一轮 /proc 快照
+let lastProcDeltas = null; // { pid: {deltaJiffies, name, memMiB} } 本轮 CPU 时间增量
+let procEnergyJ = new Map(); // pid -> 累计能量（焦耳），进程退出即清除
+let lastCpuStat = null;
+let cpuUtilPct = null;     // 整机 CPU 利用率 %
+let cpuIdleBaselineW = null; // 空闲基线功率估算（利用率 ≤2% 时的缓慢 EMA）
+let lastActiveCpuW = null;   // 本轮可归因的活跃 CPU 功率
+
+function readProcSnap() {
+  const now = Date.now();
+  const pids = {};
+  let names = [];
+  try { names = fs.readdirSync('/proc'); } catch (e) { return null; }
+  for (const n of names) {
+    if (!/^\d+$/.test(n)) continue;
+    try {
+      const stat = fs.readFileSync('/proc/' + n + '/stat', 'utf8');
+      const close = stat.lastIndexOf(')');
+      if (close < 0) continue;
+      const nm = (stat.match(/^\d+\s+\((.+)\)/) || [])[1] || '?';
+      const f = stat.slice(close + 2).trim().split(/\s+/);
+      // 括号后 f[0]=state(字段3) … utime=字段14→f[11]，stime=字段15→f[12]
+      const t = (parseInt(f[11], 10) || 0) + (parseInt(f[12], 10) || 0);
+      pids[n] = { t, name: nm };
+    } catch (e) {}
+  }
+  return { ts: now, pids };
+}
+
+function readCpuUtilPct() {
+  try {
+    const line = fs.readFileSync('/proc/stat', 'utf8').split('\n')[0];
+    const p = line.split(/\s+/).slice(1).map(x => parseInt(x, 10) || 0);
+    const idle = (p[3] || 0) + (p[4] || 0);
+    const total = p.reduce((a, b) => a + b, 0);
+    if (lastCpuStat) {
+      const dt = total - lastCpuStat.total;
+      const di = idle - lastCpuStat.idle;
+      if (dt > 0) cpuUtilPct = Math.max(0, Math.min(100, Math.round((1 - di / dt) * 100)));
+    }
+    lastCpuStat = { idle, total };
+  } catch (e) {}
+}
+
+function samplePowerCycle() {
+  // 1) CPU 封装功率（RAPL 差值）
+  let e = null;
+  try {
+    const out = require('child_process').execSync('sudo -n cat ' + RAPL_PKG_PATH, { encoding: 'utf8', timeout: 3000 }).trim();
+    const v = parseInt(out, 10);
+    if (!isNaN(v)) e = v;
+  } catch (err) {}
+  if (e !== null) {
+    const now = Date.now();
+    if (lastEnergyUj !== null && now > lastEnergyTs) {
+      const dj = e - lastEnergyUj;
+      const secs = (now - lastEnergyTs) / 1000;
+      if (dj > 0 && secs > 0) cpuPowerW = Math.round((dj / 1e6 / secs) * 10) / 10;
+    }
+    lastEnergyUj = e;
+    lastEnergyTs = now;
+  }
+  // 2) GPU 功率 + 使用 GPU 的进程（nvidia-smi）
+  try {
+    const g = require('child_process').execSync(
+      'nvidia-smi --query-gpu=power.draw,utilization.gpu --format=csv,noheader',
+      { encoding: 'utf8', timeout: 5000 }
+    ).trim().split('\n')[0] || '';
+    if (g) {
+      const p = g.split(',').map(s => s.trim());
+      gpuPowerW = parseFloat(p[0]) || null;
+      gpuUtil = parseInt(p[1]) || null;
+    }
+    const a = require('child_process').execSync(
+      'nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader',
+      { encoding: 'utf8', timeout: 5000 }
+    ).trim();
+    gpuProcs = a ? a.split('\n').map(l => {
+      const [pid, mem] = l.split(',').map(s => s.trim());
+      return { pid: parseInt(pid, 10) || 0, memMiB: parseInt(mem, 10) || 0 };
+    }).filter(x => x.pid > 0) : [];
+  } catch (err) {}
+  // 3) CPU 利用率 + 空闲基线 + 进程 CPU 时间增量
+  readCpuUtilPct();
+  if (cpuPowerW !== null && cpuUtilPct !== null && cpuUtilPct <= 2) {
+    // 近空闲：缓慢更新基线功率（EMA），用于把"空闲功耗"与"进程活跃功耗"分开
+    cpuIdleBaselineW = cpuIdleBaselineW === null ? cpuPowerW : cpuIdleBaselineW * 0.9 + cpuPowerW * 0.1;
+  }
+  lastActiveCpuW = cpuPowerW !== null && cpuIdleBaselineW !== null
+    ? Math.max(0, cpuPowerW - cpuIdleBaselineW)
+    : cpuPowerW;
+  const snap = readProcSnap();
+  if (snap) {
+    const dt = lastProcSnap ? (snap.ts - lastProcSnap.ts) / 1000 : 0;
+    if (lastProcSnap && dt > 0.5) {
+      const deltas = {};
+      let totalDelta = 0;
+      for (const pid of Object.keys(snap.pids)) {
+        const prev = lastProcSnap.pids[pid];
+        if (!prev) continue;
+        const d = snap.pids[pid].t - prev.t;
+        if (d > 0) { deltas[pid] = d; totalDelta += d; }
+      }
+      lastProcDeltas = deltas;
+      // 4) 功率归因 + 能量积分（Scaphandre 比例归因法，仅归因活跃功率）
+      if (totalDelta > 0 && lastActiveCpuW !== null) {
+        const HZ = 100; // Linux USER_HZ
+        const gpuMemSum = gpuProcs.reduce((s, g) => s + g.memMiB, 0);
+        for (const pid of Object.keys(deltas)) {
+          const cpuW = lastActiveCpuW * (deltas[pid] / totalDelta);
+          let gpuW = 0;
+          const gp = gpuProcs.find(g => g.pid === parseInt(pid, 10));
+          if (gp && gpuPowerW !== null) gpuW = gpuPowerW * (gpuMemSum > 0 ? gp.memMiB / gpuMemSum : 1);
+          const w = cpuW + gpuW;
+          if (w > 0) procEnergyJ.set(parseInt(pid, 10), (procEnergyJ.get(parseInt(pid, 10)) || 0) + w * dt);
+        }
+      }
+      for (const pid of Array.from(procEnergyJ.keys())) {
+        if (!snap.pids[pid]) procEnergyJ.delete(pid);
+      }
+    }
+    lastProcSnap = snap;
+  }
+}
+samplePowerCycle();
+setInterval(samplePowerCycle, 2000).unref();
+
+// ====== 处理器（CPU）详情（8889 存储管理页 CPU 卡）======
+// 静态规格：/proc/cpuinfo + /sys/.../topology + cache + cpufreq + dmidecode(免密可选) + vulnerabilities，5 分钟缓存；
+// 动态采样：/proc/stat 逐核增量（1s 窗口）→ global.__cpuLive；整机利用率历史 → global.__cpuHistory（保留 30 分钟）。
+function cpuRead(f) { try { return fs.readFileSync(f, 'utf8'); } catch (e) { return null; } }
+function cpuNum(f) { const t = cpuRead(f); if (t == null) return null; const n = parseInt(t.trim(), 10); return Number.isFinite(n) ? n : null; }
+function expandCpuList(s) {
+  const out = [];
+  for (const part of String(s || '').trim().split(',')) {
+    const p2 = part.trim();
+    if (!p2) continue;
+    const m = p2.match(/^(\d+)(?:-(\d+))?$/);
+    if (!m) continue;
+    const a = +m[1], b = m[2] != null ? +m[2] : a;
+    for (let i = a; i <= b && i - a < 1024; i++) out.push(i);
+  }
+  return out;
+}
+function buildCpuStatic() {
+  const out = { supported: false };
+  const txt = cpuRead('/proc/cpuinfo');
+  if (!txt) return out;
+  out.supported = true;
+  const get = (k) => { const m = txt.match(new RegExp('^' + k + '[ \\t]*:[ \\t]*(.+)$', 'm')); return m ? m[1].trim() : null; };
+  out.model = get('model name');
+  out.vendor = get('vendor_id');
+  out.family = get('cpu family');
+  out.model_id = get('model');
+  out.stepping = get('stepping');
+  out.microcode = get('microcode');
+  out.bugs = get('bugs');
+  try { out.arch = osPower.arch(); out.platform = osPower.release(); } catch (e) {}
+  // 指令集：只保留对推理/通用负载有意义的一组，按 cpuinfo flags 命中过滤
+  const flags = new Set((get('flags') || '').toUpperCase().replace(/[._]/g, '_').split(/\s+/));
+  const FEATS = ['SSE','SSE2','SSE3','SSSE3','SSE4.1','SSE4.2','AVX','AVX2','FMA','AVX512F','AVX512BW','AVX512VL','AVX512_VNNI','AES','VAES','GFNI','BMI1','BMI2','SHA_NI','AMX-BF16','AMX-TILE','AMX-INT8','RDRAND','RDSEED'];
+  out.features = FEATS.filter((f) => flags.has(f.replace(/[._]/g, '_')));
+  // 拓扑：逻辑核数 + 每核线程兄弟（>1=超线程核；混合架构下 1 线程核=E 核）
+  const sysbase = '/sys/devices/system/cpu';
+  let cpus = [];
+  try { cpus = fs.readdirSync(sysbase).filter((n) => /^cpu\d+$/.test(n)).map((n) => +n.slice(3)).sort((a, b) => a - b); } catch (e) {}
+  out.logical = cpus.length || (txt.match(/^processor[ \t]*:/gm) || []).length;
+  const coreList = [];
+  let htThreads = 0, singleThreads = 0;
+  for (const i of cpus) {
+    const tp = sysbase + '/cpu' + i + '/topology';
+    const sib = expandCpuList(cpuRead(tp + '/thread_siblings_list') || String(i));
+    coreList.push({ cpu: i, threads: sib.length, core_id: cpuNum(tp + '/core_id'), pkg: cpuNum(tp + '/physical_package_id') });
+    if (sib.length > 1) htThreads++; else singleThreads++;
+  }
+  out.coreList = coreList;
+  out.sockets = new Set(coreList.map((c) => c.pkg)).size || 1;
+  const htCores = htThreads / 2;
+  out.ht_core_count = htCores;                 // 超线程核数（Intel 混合架构 = P 核）
+  out.single_thread_core_count = singleThreads; // 单线程核数（Intel 混合架构 = E 核）
+  out.hybrid = htThreads > 0 && singleThreads > 0;
+  out.physical_cores = htCores + singleThreads;
+  // 缓存层级：cpu0 的 index*（shared_cpu_list 说明共享域）
+  const caches = [], seenCache = new Set();
+  for (let idx = 0; idx < 10; idx++) {
+    const dir = sysbase + '/cpu0/cache/index' + idx;
+    if (!fs.existsSync(dir)) continue;
+    const level = cpuNum(dir + '/level');
+    const type = (cpuRead(dir + '/type') || '').trim();
+    const size = (cpuRead(dir + '/size') || '').trim();
+    const shared = expandCpuList(cpuRead(dir + '/shared_cpu_list') || '').length || 1;
+    const line = cpuNum(dir + '/physical_line_size');
+    const key = level + ':' + type + ':' + size + ':' + shared;
+    if (seenCache.has(key)) continue; seenCache.add(key);
+    caches.push({ level, type, size, shared_cpus: shared, line });
+  }
+  out.caches = caches;
+  // 调频：驱动 / governor / EPP / 频率范围 / 睿频开关
+  const cf = sysbase + '/cpu0/cpufreq';
+  out.cpufreq_driver = (cpuRead(cf + '/scaling_driver') || '').trim() || null;
+  out.governor = (cpuRead(cf + '/scaling_governor') || '').trim() || null;
+  out.epp = (cpuRead(cf + '/energy_performance_preference') || '').trim() || null;
+  const fmin = cpuNum(cf + '/cpuinfo_min_freq'), fmax = cpuNum(cf + '/cpuinfo_max_freq'), fbase = cpuNum(cf + '/base_frequency');
+  out.freq_min_mhz = fmin != null ? Math.round(fmin / 1000) : null;
+  out.freq_max_mhz = fmax != null ? Math.round(fmax / 1000) : null;
+  out.freq_base_mhz = fbase != null ? Math.round(fbase / 1000) : null;
+  const noTurbo = cpuNum(sysbase + '/intel_pstate/no_turbo');
+  const boostGlob = cpuNum(sysbase + '/cpufreq/boost');
+  if (noTurbo != null) out.boost = noTurbo === 0;
+  else if (boostGlob != null) out.boost = boostGlob === 1;
+  else out.boost = null;
+  // 漏洞缓解状态
+  out.vulnerabilities = {};
+  try {
+    for (const f of fs.readdirSync(sysbase + '/vulnerabilities')) {
+      out.vulnerabilities[f] = (cpuRead(sysbase + '/vulnerabilities/' + f) || '').trim();
+    }
+  } catch (e) {}
+  // dmidecode 硬件规格（需免密；失败静默降级）
+  out.dmi = null;
+  try {
+    const { execSync } = require('child_process');
+    const dm = execSync('sudo -n dmidecode -t processor 2>/dev/null', { timeout: 4000, encoding: 'utf8' });
+    const pick = (k) => { const m = dm.match(new RegExp('^\\s*' + k + ':\\s*(.+)$', 'm')); return m ? m[1].trim() : null; };
+    if (/Processor Information/i.test(dm)) {
+      out.dmi = {
+        socket: pick('Socket Designation'), manufacturer: pick('Manufacturer'), version: pick('Version'),
+        current_speed: pick('Current Speed'), max_speed: pick('Max Speed'),
+        core_count: pick('Core Count'), enabled_cores: pick('Enabled Core Count'),
+        thread_count: pick('Thread Count'), l1: pick('L1 Cache'), l2: pick('L2 Cache'), l3: pick('L3 Cache'),
+        stepping: pick('Stepping'), upgrade: pick('Upgrade'),
+      };
+    }
+  } catch (e) {}
+  return out;
+}
+function getCpuStatic() {
+  const now = Date.now();
+  if (!global.__cpuStatic || now - (global.__cpuStaticAt || 0) > 300000) {
+    try { global.__cpuStatic = buildCpuStatic(); } catch (e) { global.__cpuStatic = { supported: false, error: e.message }; }
+    global.__cpuStaticAt = now;
+  }
+  return global.__cpuStatic;
+}
+// [0918] 异步逐核频率刷新（1s 一轮；fs.readFile 走 libuv 线程池，不阻塞主循环）
+function refreshCpuFreqs() {
+  if (global.__cpuFreqBusy) return;
+  global.__cpuFreqBusy = true;
+  try {
+    if (!global.__cpuIds) global.__cpuIds = fs.readdirSync('/sys/devices/system/cpu').filter((n) => /^cpu\d+$/.test(n)).map((n) => +n.slice(3));
+  } catch (e) { global.__cpuIds = []; }
+  const ids = global.__cpuIds;
+  if (!ids.length) { global.__cpuFreqBusy = false; return; }
+  const vals = new Array(ids.length).fill(null);
+  let done = 0;
+  const finish = () => {
+    if (done < ids.length) return;
+    let fSum = 0, fN = 0, fMax = null;
+    for (const f of vals) { if (f != null) { fSum += f; fN++; if (fMax == null || f > fMax) fMax = f; } }
+    global.__cpuFreq = { fSum, fN, fMax, ts: Date.now() };
+    global.__cpuFreqBusy = false;
+  };
+  ids.forEach((i, idx) => {
+    fs.readFile('/sys/devices/system/cpu/cpu' + i + '/cpufreq/scaling_cur_freq', 'utf8', (err, data) => {
+      if (!err) { const n = parseInt(String(data).trim(), 10); if (Number.isFinite(n)) vals[idx] = n; }
+      done++; finish();
+    });
+  });
+}
+if (!global.__cpuFreqTimer) {
+  global.__cpuFreqTimer = setInterval(refreshCpuFreqs, 1000);
+  if (global.__cpuFreqTimer.unref) global.__cpuFreqTimer.unref();
+  refreshCpuFreqs();
+}
+
+function sampleCpuStats() {
+  try {
+    const txt = cpuRead('/proc/stat');
+    if (!txt) return;
+    const prev = global.__cpuPrev || {};
+    const cores = [];
+    let agg = null;
+    for (const line of txt.split('\n')) {
+      const m = line.match(/^(cpu\d*)\s/);
+      if (!m) { if (cores.length || agg != null) break; else continue; }
+      const f = line.trim().split(/\s+/).slice(1).map(Number);
+      const idle = f[3] + (f[4] || 0);
+      const total = f.reduce((a, b) => a + b, 0);
+      const p = prev[m[1]];
+      let pct = null;
+      if (p && total > p.total) pct = Math.max(0, Math.min(100, (1 - (idle - p.idle) / (total - p.total)) * 100));
+      prev[m[1]] = { idle, total };
+      if (m[1] === 'cpu') agg = pct;
+      else cores.push({ cpu: +m[1].slice(3), pct: pct != null ? Math.round(pct) : null });
+    }
+    global.__cpuPrev = prev;
+    // 封装温度：优先 x86_pkg_temp/k10temp/coretemp，退化 acpitz
+    let temp = null, tempSrc = null;
+    try {
+      const prefer = ['x86_pkg_temp', 'k10temp', 'coretemp', 'soc_thermal', 'cpu_thermal', 'acpitz'];
+      let best = null;
+      for (const z of fs.readdirSync('/sys/class/thermal')) {
+        if (!/^thermal_zone\d+$/.test(z)) continue;
+        const t = (cpuRead('/sys/class/thermal/' + z + '/type') || '').trim();
+        const v = cpuNum('/sys/class/thermal/' + z + '/temp');
+        if (v == null) continue;
+        const r = prefer.indexOf(t);
+        const rank = r >= 0 ? r : 99;
+        if (!best || rank < best.rank) best = { temp: v / 1000, type: t || z, rank };
+      }
+      if (best && best.rank < 99) { temp = +best.temp.toFixed(1); tempSrc = best.type; }
+    } catch (e) {}
+    // 各逻辑核当前频率（kHz→MHz，取均值与最大值；混合架构 P/E 频率不同）
+    // 09-18 修复：同步读全部核 scaling_cur_freq 需 350~600ms（每核首次打开触发内核慢路径），
+    // 在 1s 采样器里会阻塞事件循环、饿死 GPU 卡等所有秒级数据 → 频率改由
+    // refreshCpuFreqs() 用 fs.readFile（libuv 线程池）异步刷新到 global.__cpuFreq，这里只取缓存。
+    const cf = global.__cpuFreq || { fSum: 0, fN: 0, fMax: null };
+    const fSum = cf.fSum, fN = cf.fN, fMax = cf.fMax;
+    // 负载
+    let load = null;
+    try {
+      const l = (cpuRead('/proc/loadavg') || '').trim().split(/\s+/);
+      const rp = String(l[3] || '').split('/');
+      load = { l1: +l[0], l5: +l[1], l15: +l[2], running: +rp[0], procs: +rp[1] };
+    } catch (e) {}
+    global.__cpuLive = {
+      ts: Date.now(),
+      util_pct: agg != null ? +agg.toFixed(1) : null,
+      cores,
+      temp_c: temp, temp_src: tempSrc,
+      freq_avg_mhz: fN ? Math.round(fSum / fN / 1000) : null,
+      freq_live_max_mhz: fMax != null ? Math.round(fMax / 1000) : null,
+      load,
+    };
+    const H = global.__cpuHistory || (global.__cpuHistory = []);
+    if (agg != null) {
+      H.push({ t: Math.round(Date.now() / 1000), pct: +agg.toFixed(1) });
+      if (H.length > 1800) H.splice(0, H.length - 1800); // 30 分钟
+    }
+  } catch (e) { /* 采样失败下一轮重试 */ }
+}
+if (!global.__cpuSampler) {
+  global.__cpuSampler = setInterval(sampleCpuStats, 1000);
+  if (global.__cpuSampler.unref) global.__cpuSampler.unref();
+  sampleCpuStats();
+}
+
+// ====== GPU 详情（8889 硬件监视页 GPU 卡）======
+// 数据源：nvidia-smi --query-gpu CSV（本机实测 ~33ms/次；驱动 610.43.03 支持 pcie.link.* 字段）。
+// 静态规格 5min 缓存（global.__gpuStatic）；动态（利用率/显存/温度/功耗/频率/P状态/PCIe 当前链路）1s 采样（global.__gpuLive）。
+// 需求：显示 GPU 当前工作在 PCIe x16 等链路信息，并与链路能力对比（宽度/代数降级检测）。
+function gpuSmi(fields) {
+  const { execFileSync } = require('child_process');
+  return execFileSync('nvidia-smi', ['--query-gpu=' + fields, '--format=csv,noheader,nounits'], { timeout: 4000, encoding: 'utf8' });
+}
+function gpuParseRows(out) {
+  return String(out).split('\n').filter((l) => l.trim().length).map((l) => l.split(',').map((s) => s.trim()));
+}
+function gpuNum(v) {
+  if (v == null) return null;
+  const s = String(v);
+  if (!/\d/.test(s)) return null; // "[N/A]" 等无数字输入归 null
+  const n = parseFloat(s.replace(/[^0-9.\-]/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+const GPU_STATIC_FIELDS = 'index,name,uuid,pci.bus_id,driver_version,vbios_version,compute_cap,pcie.link.gen.max,pcie.link.width.max,power.limit,power.min_limit,power.max_limit';
+const GPU_LIVE_FIELDS = 'index,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,pstate,clocks.sm,clocks.max.sm,pcie.link.gen.current,pcie.link.width.current,fan.speed';
+function buildGpuStatic() {
+  const out = { supported: false, gpus: [], driver_version: null };
+  let rows;
+  try { rows = gpuParseRows(gpuSmi(GPU_STATIC_FIELDS)); } catch (e) { out.error = 'nvidia-smi 不可用: ' + (e && e.message || e); return out; }
+  for (const r of rows) {
+    // [index,name,uuid,bus_id,driver,vbios,cc,gen_max,width_max,pl,pl_min,pl_max]
+    const g = {
+      index: gpuNum(r[0]), name: r[1] || null, uuid: r[2] || null, pci_bus_id: r[3] || null,
+      driver_version: r[4] || null, vbios: r[5] || null, compute_cap: r[6] || null,
+      gen_max: gpuNum(r[7]), width_max: gpuNum(r[8]),
+      power_limit: gpuNum(r[9]), power_min_limit: gpuNum(r[10]), power_max_limit: gpuNum(r[11]),
+    };
+    if (g.index == null) continue;
+    out.gpus.push(g);
+    if (!out.driver_version) out.driver_version = g.driver_version;
+  }
+  out.supported = out.gpus.length > 0;
+  return out;
+}
+function getGpuStatic() {
+  const now = Date.now();
+  if (!global.__gpuStatic || now - (global.__gpuStaticAt || 0) > 300000) {
+    try { global.__gpuStatic = buildGpuStatic(); } catch (e) { global.__gpuStatic = { supported: false, error: e.message }; }
+    global.__gpuStaticAt = now;
+  }
+  return global.__gpuStatic;
+}
+function sampleGpuStats() {
+  // 09-18 修复：execFileSync 同步阻塞主循环 50~300ms → 改异步 execFile + 防重入守卫
+  if (global.__gpuSampleBusy) return;
+  global.__gpuSampleBusy = true;
+  const { execFile } = require('child_process');
+  execFile('nvidia-smi', ['--query-gpu=' + GPU_LIVE_FIELDS, '--format=csv,noheader,nounits'], { timeout: 4000, encoding: 'utf8' }, (err, outStr) => {
+    global.__gpuSampleBusy = false;
+    if (err || !outStr) return; // nvidia-smi 失败保留上次采样，下一轮重试
+    try {
+      const rows = gpuParseRows(outStr);
+    const gpus = [];
+    for (const r of rows) {
+      // [index,util_gpu,util_mem,mem_used,mem_total,temp,power,pstate,sm_clk,sm_clk_max,gen_cur,width_cur,fan]
+      const g = {
+        index: gpuNum(r[0]), util_gpu: gpuNum(r[1]), util_mem: gpuNum(r[2]),
+        mem_used: gpuNum(r[3]), mem_total: gpuNum(r[4]), temp: gpuNum(r[5]),
+        power_draw: gpuNum(r[6]), pstate: r[7] || null,
+        sm_clock: gpuNum(r[8]), sm_clock_max: gpuNum(r[9]),
+        gen_current: gpuNum(r[10]), width_current: gpuNum(r[11]), fan: gpuNum(r[12]),
+      };
+      if (g.index != null) gpus.push(g);
+    }
+      global.__gpuLive = { ts: Date.now(), gpus };
+    } catch (e) { /* 解析失败保留上次采样 */ }
+  });
+}
+if (!global.__gpuSampler) {
+  global.__gpuSampler = setInterval(sampleGpuStats, 1000);
+  if (global.__gpuSampler.unref) global.__gpuSampler.unref();
+  sampleGpuStats();
+}
+
+// —— PCIe 通道带宽占用采样：nvidia-smi dmon -s t（NVML rxpci/txpci，MB/s，本机实测可用）——
+// dmon 自身阻塞 ~1s，用异步 execFile + 完成后再排下一轮（不占事件循环、不并发重入）；历史 1800 点 ≈ 36 分钟。
+function sampleGpuPcie() {
+  const { execFile } = require('child_process');
+  execFile('nvidia-smi', ['dmon', '-s', 't', '-c', '1', '-d', '1'], { timeout: 5000, encoding: 'utf8' }, (err, out) => {
+    try {
+      if (!err && out) {
+        const byIndex = {};
+        for (const line of String(out).split('\n')) {
+          const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)$/);
+          if (m) byIndex[+m[1]] = { rx_mbs: +m[2], tx_mbs: +m[3] };
+        }
+        if (Object.keys(byIndex).length) {
+          global.__gpuPcie = { ts: Date.now(), byIndex };
+          const H = global.__gpuPcieHistory || (global.__gpuPcieHistory = []);
+          H.push({ t: Math.round(Date.now() / 1000), g: byIndex });
+          if (H.length > 1800) H.splice(0, H.length - 1800); // ~1.2s/点 ≈ 36 分钟
+        }
+      }
+    } catch (e) { /* 失败保留上次数据，下轮重试 */ }
+    const t = setTimeout(sampleGpuPcie, 0); // 显卡卡 1 秒刷新：dmon 自身 ~1s + 立即续排 ≈ 1.2s/轮
+    if (t.unref) t.unref();
+  });
+}
+if (!global.__gpuPcieStarted) { global.__gpuPcieStarted = true; sampleGpuPcie(); }
+
+
+// ====== 内存带宽（8889 硬件监视页 RAM 带宽卡）======
+// 数据源：Intel uncore IMC CAS 计数器（本机 E5-2686 v4 / BDW-EP，内核 PMU uncore_imc_0/1/4/5 原生
+// 支持 cas_count_read / cas_count_write 别名，每 CAS 行 = 64 B）。perf 通配符 `uncore_imc/` 会
+// fan-out 到全部 IMC box 并合并成单行（已实测聚合正确，机器无关，兼容 6-box 的 SKX 等）。
+// 采集方式：常驻 `sudo -n perf stat -a -I 1000 -x, ...`（免密 /etc/sudoers.d/dsh-perf，同 dsh-lspci 先例），
+// CSV 走 stderr；按 interval 分组结算 bytes/s，1s 一点保留 600 点。进程秒退（sudo 无免权等）自动退避重启。
+// 金丝雀验证（2026-09-18）：空载合计 ~1.1GB/s，4 路 memcpy 加压 ~2.3GB/s，方向与量级正确。
+// 峰值口径：dmidecode 理论带宽（RAM 卡同源，前端优先使用）；回落 76.8 GB/s = 4×DDR4-2400×8B。
+const MEMBW_EVENTS = 'uncore_imc/cas_count_read/,uncore_imc/cas_count_write/';
+const MEMBW_PEAK_FALLBACK = 76.8;
+function membwUnitMul(u) {
+  switch (String(u || '').trim()) {
+    case 'KiB': return 1024;
+    case 'MiB': return 1048576;
+    case 'GiB': return 1073741824;
+    case 'B': return 1;
+    default: return 64; // 无单位 → 原始 CAS 行数 × 64B
+  }
+}
+function membwHandleLine(line) {
+  // perf stat -I 1000 -x, 行格式：elapsed秒,值,单位,事件名,运行ns,占比,,
+  const f = line.split(',');
+  if (f.length < 4) return;
+  const el = parseFloat(f[0]);
+  const val = parseFloat(f[1]);
+  if (!Number.isFinite(el) || !Number.isFinite(val)) return; // '# started on...' 等杂行
+  const ev = f[3] || '';
+  const isR = ev.indexOf('cas_count_read') >= 0;
+  const isW = ev.indexOf('cas_count_write') >= 0;
+  if (!isR && !isW) return;
+  const bytes = val * membwUnitMul(f[2]);
+  const st = global.__membwSt || (global.__membwSt = { elapsed: null, read: 0, write: 0 });
+  if (st.elapsed === null) st.elapsed = el;
+  if (el > st.elapsed + 0.05) {
+    // interval 切换：结算上一桶
+    const dt = el - st.elapsed;
+    const rb = st.read, wb = st.write;
+    st.elapsed = el; st.read = 0; st.write = 0;
+    if (dt > 0.2 && dt < 5) {
+      const now = Date.now();
+      const sample = { t: Math.round(now / 1000), r: Math.round(rb / dt), w: Math.round(wb / dt) }; // bytes/s
+      global.__membw = { ts: now, read_bps: sample.r, write_bps: sample.w };
+      const H = global.__membwHistory || (global.__membwHistory = []);
+      H.push(sample);
+      if (H.length > 600) H.splice(0, H.length - 600);
+    }
+  }
+  if (isR) st.read += bytes; else st.write += bytes;
+}
+function membwScheduleRestart() {
+  if (global.__membwRestartTimer || global.__membwProc) return;
+  const delay = (global.__membwFailQuick || 0) >= 4 ? 60000 : 5000;
+  global.__membwRestartTimer = setTimeout(() => { global.__membwRestartTimer = null; startMembwSampler(); }, delay);
+  if (global.__membwRestartTimer.unref) global.__membwRestartTimer.unref();
+}
+function startMembwSampler() {
+  if (global.__membwProc || global.__membwRestartTimer) return;
+  const { spawn } = require('child_process');
+  let child = null;
+  try {
+    child = spawn('sudo', ['-n', '/usr/bin/perf', 'stat', '-a', '-I', '1000', '-x,', '-e', MEMBW_EVENTS, '--', 'sleep', 'infinity'],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
+  } catch (e) { child = null; }
+  if (!child) { membwScheduleRestart(); return; }
+  global.__membwProc = child;
+  global.__membwSpawnAt = Date.now();
+  let buf = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => {
+    buf += chunk;
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (line) { try { membwHandleLine(line); } catch (e) { /* 单行解析失败丢弃 */ } }
+    }
+  });
+  child.on('error', () => { /* exit 事件会统一处理重启 */ });
+  child.on('exit', () => {
+    const quick = Date.now() - (global.__membwSpawnAt || 0) < 3000;
+    global.__membwFailQuick = quick ? (global.__membwFailQuick || 0) + 1 : 0;
+    global.__membwProc = null;
+    global.__membwSt = null; // 残留未结算桶作废，重启后重新起算
+    membwScheduleRestart();
+  });
+}
+if (!global.__membwStarted) { global.__membwStarted = true; startMembwSampler(); }
+
+
+// ====== PCIe 通道拓扑 / 占用（8889 硬件监视页 PCIe 卡）======
+// 数据源：sudo -n lspci -vv（/etc/sudoers.d/dsh-lspci 免密；解析失败回落普通 lspci -vv）。
+// 口径：每个 PCI 桥（根端口）的 LnkSta 当前宽度 = 该链路实际占用的 CPU/PCH 通道数；LnkCap = 板载能力。
+// 拓扑变化慢且 lspci -vv 较重，结果缓存 60s（global.__pcieTopoCache）。
+function buildPcieTopo() {
+  const out = { supported: false, groups: [], error: null };
+  const { execSync } = require('child_process');
+  let txt;
+  try {
+    txt = execSync('sudo -n lspci -vv 2>/dev/null || lspci -vv 2>/dev/null', { timeout: 6000, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  } catch (e) { out.error = 'lspci -vv 读取失败: ' + ((e && e.message) || e); return out; }
+  // 1) 切设备块（行首 BDF：兼容带/不带 domain 两种格式）
+  const blocks = [];
+  let cur = null;
+  for (const line of txt.split('\n')) {
+    const m = line.match(/^([0-9a-fA-F]{2,4}:[0-9a-fA-F]{2}\.[0-9a-fA-F]) (.+)$/);
+    if (m) { cur = { bdf: m[1], desc: m[2].replace(/\s*\(rev [0-9a-f]+\)\s*$/, ''), lines: [] }; blocks.push(cur); }
+    else if (cur) cur.lines.push(line);
+  }
+  const genOf = (spd) => ({ '2.5': 1, '5': 2, '8': 3, '16': 4, '32': 5 }[String(spd).replace('GT/s', '')] || null);
+  const busOf = (bdf) => { const p = bdf.split(':'); return p.length === 3 ? p[1] : p[0]; };
+  // 2) 逐块抽取链路信息
+  const devs = [];
+  for (const b of blocks) {
+    const body = b.lines.join('\n');
+    const sta = body.match(/LnkSta:\s+Speed ([\d.]+GT\/s|\w+)(?: \((\w+)\))?, Width x(\d+)(?: \((\w+)\))?/);
+    const cap = body.match(/LnkCap:[^\n]*Speed ([\d.]+GT\/s|\w+), Width x(\d+)/);
+    if (!sta && !cap) continue;
+    const bus = body.match(/Bus:\s*primary=([0-9a-f]+),\s*secondary=([0-9a-f]+),\s*subordinate=([0-9a-f]+)/);
+    const slot = body.match(/Physical Slot:\s*(\S+)/);
+    const port = body.match(/LnkCap:[^\n]*Port #(\d+)/);
+    devs.push({
+      bdf: b.bdf, desc: b.desc, isBridge: /PCI bridge/i.test(b.desc),
+      busSec: bus ? bus[2].toLowerCase() : null, busSub: bus ? bus[3].toLowerCase() : null,
+      slot: slot ? slot[1] : null, portNo: port ? +port[1] : null,
+      spdCur: sta ? sta[1] : null, widCur: sta ? +sta[3] : null,
+      spdCap: cap ? cap[1] : null, widCap: cap ? +cap[2] : null,
+    });
+  }
+  // 3) 端点归桥（取总线区间内 secondary 最大的桥 = 最深一级）
+  const bridges = devs.filter((d) => d.isBridge && (d.widCap != null || d.widCur != null));
+  const endpoints = devs.filter((d) => !d.isBridge && d.bdf !== '00:00.0');
+  for (const e of endpoints) {
+    const eb = busOf(e.bdf).toLowerCase();
+    let best = null;
+    for (const br of bridges) {
+      if (!br.busSec || !br.busSub) continue;
+      if (eb >= br.busSec && eb <= br.busSub && (!best || br.busSec > best.busSec)) best = br;
+    }
+    if (best) best.device = e;
+  }
+  // 4) GPU bdf → nvidia-smi 型号名 富化（统一成 lspci 短格式 '03:00.0'，小写）
+  const gpuNameByBus = {};
+  try {
+    for (const g of (getGpuStatic().gpus || [])) {
+      if (!g.pci_bus_id || !g.name) continue;
+      const parts = String(g.pci_bus_id).toLowerCase().split(':');
+      const key = parts.length >= 3 ? parts[parts.length - 2] + ':' + parts[parts.length - 1] : parts.join(':');
+      gpuNameByBus[key] = g.name;
+    }
+  } catch (err) {}
+  // 5) 分组（桥 desc 含 chipset → 芯片组；否则 CPU 直连；再兜底 other）
+  const gmap = {};
+  for (const br of bridges) {
+    const key = /chipset/i.test(br.desc) ? 'pch' : 'cpu';
+    const grp = gmap[key] || (gmap[key] = { key, label: key === 'cpu' ? 'CPU 直连' : (key === 'pch' ? '芯片组（C610/PCH）' : '其他'), ports: [], used: 0, cap_total: 0 });
+    const widUsed = br.widCur != null ? br.widCur : 0;
+    const widCap = br.widCap || 0;
+    grp.used += widUsed;
+    grp.cap_total += widCap;
+    const warns = [];
+    const gc = genOf(br.spdCur), gcap = genOf(br.spdCap);
+    const dev0 = br.device;
+    // 有效能力 = min(端口能力, 设备自身能力)——降速到设备/固件上限（如矿卡 Gen1）不算降级
+    const effWidCap = (dev0 && dev0.widCap != null && br.widCap != null) ? Math.min(br.widCap, dev0.widCap) : (br.widCap || 0);
+    const devGenCap = dev0 && dev0.spdCap ? genOf(dev0.spdCap) : null;
+    const effGenCap = Math.min(gcap == null ? 99 : gcap, devGenCap == null ? 99 : devGenCap);
+    if (br.widCur != null && br.widCur > 0) {
+      if (br.widCur < effWidCap) warns.push('宽度 x' + effWidCap + '→x' + br.widCur);
+      else if (dev0 && dev0.widCap != null && br.widCap != null && dev0.widCap > br.widCap) warns.push('设备 x' + dev0.widCap + ' 受端口接线限至 x' + br.widCur);
+      if (gc != null && effGenCap < 99 && gc < effGenCap) warns.push('速率 Gen' + effGenCap + '→Gen' + gc);
+    }
+    let devDesc = null, devBus = null, devSlot = null;
+    if (br.device) {
+      devBus = br.device.bdf;
+      devDesc = br.device.desc;
+      devSlot = br.device.slot || br.slot || null;
+      const gname = gpuNameByBus[String(devBus).toLowerCase()];
+      if (gname) devDesc += '（' + gname + '）';
+      // 端点自身能力若高于当前协商/端口接线，附注（如 GPU 卡支持 x16 而实际 x8）
+      if (br.device.widCap != null && br.device.widCap > Math.max(br.widCap || 0, widUsed)) devDesc += ' [设备能力 x' + br.device.widCap + ']';
+      const dgc = genOf(br.device.spdCap);
+      if (br.device.spdCap && dgc != null && gc != null && dgc > Math.max(gcap || 0, gc)) devDesc += ' [设备能力 Gen' + dgc + ']';
+    }
+    grp.ports.push({
+      bdf: br.bdf, port: br.portNo,
+      gen_cur: gc, gen_cap: gcap, wid_cur: widUsed, wid_cap: widCap,
+      free: Math.max(0, widCap - widUsed),
+      active: widUsed > 0,
+      warns, device: devBus ? { bdf: devBus, desc: devDesc, slot: devSlot } : null,
+    });
+  }
+  out.groups = ['cpu', 'pch', 'other'].filter((k) => gmap[k]).map((k) => {
+    const g = gmap[k];
+    g.ports.sort((a, b) => a.bdf.localeCompare(b.bdf));
+    return g;
+  });
+  out.supported = out.groups.length > 0;
+  return out;
+}
+function getPcieTopo() {
+  const now = Date.now();
+  if (!global.__pcieTopoCache || now - (global.__pcieTopoCacheAt || 0) > 60000) {
+    try { global.__pcieTopoCache = buildPcieTopo(); } catch (e) { global.__pcieTopoCache = { supported: false, groups: [], error: e.message }; }
+    global.__pcieTopoCacheAt = now;
+  }
+  return global.__pcieTopoCache;
+}
+
+
+// ====== Server ======
+
+// ====== Server ======
+// ====== 09-20 性能优化：文本响应 gzip（仅内部 API/页面/静态，绝不影响代理流式响应）======
+function installGzip(req, res) {
+  if (!/\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) return;
+  const origWriteHead = res.writeHead.bind(res);
+  const origWrite = res.write.bind(res);
+  const origEnd = res.end.bind(res);
+  let status = 200, reason = null, headers = null;
+  const chunks = [];
+  res.writeHead = function (code, hOrR, h2) {
+    status = code || 200;
+    if (typeof hOrR === 'string') { reason = hOrR; headers = h2 || null; }
+    else headers = hOrR || null;
+    return res;
+  };
+  res.write = function (c, e, cb) {
+    if (c != null && typeof c !== 'function') chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(String(c), (typeof e === 'string' ? e : 'utf8')));
+    if (typeof e === 'function') e(); else if (typeof cb === 'function') cb();
+    return true;
+  };
+  res.end = function (c, e, cb) {
+    if (typeof c === 'function') { cb = c; c = null; }
+    if (c != null) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(String(c), (typeof e === 'string' ? e : 'utf8')));
+    const body = Buffer.concat(chunks);
+    const h = Object.assign({}, headers);
+    const ct = String(h['Content-Type'] || h['content-type'] || '');
+    const textual = /^(text\/|application\/json|application\/javascript|text\/javascript|image\/svg)/.test(ct);
+    const send = (payload, extra) => {
+      const hh = Object.assign({}, h, extra || {});
+      hh['Content-Length'] = Buffer.byteLength(payload);
+      try { if (reason) origWriteHead(status, reason, hh); else origWriteHead(status, hh); }
+      catch (_) { try { origWriteHead(status); } catch (__) {} }
+      origEnd(payload);
+      if (typeof cb === 'function') cb();
+    };
+    if (textual && body.length > 1024) {
+      zlib.gzip(body, { level: 5 }, (err, out) => {
+        if (err || !out || out.length >= body.length) send(body);
+        else send(out, { 'Content-Encoding': 'gzip', 'Vary': 'Accept-Encoding' });
+      });
+    } else send(body);
+    return res;
+  };
+}
+
+// 09-20：请求入口与采样器 async 化后，任何漏网异常会变成 unhandledRejection 打崩进程；
+// 加全局兜底日志（记录但不退出），保证控制台常驻。
+process.on('unhandledRejection', (e) => { try { console.error('[unhandledRejection]', (e && e.stack) || e); } catch (_) {} });
+process.on('uncaughtException', (e) => { try { console.error('[uncaughtException]', (e && e.stack) || e); } catch (_) {} });
+
+const server = http.createServer(async (req, res) => {
+
+  let urlObj;
+  try {
+    // 恶意/畸形 Host 头（含空格、缺失等）会让 new URL 抛 Invalid URL。
+    // 若不加保护，异常会从请求回调里冒出去直接打崩整个进程（一次请求即可 DoS）。
+    urlObj = new URL(req.url, `http://${req.headers.host}`);
+  } catch (e) {
+    try { urlObj = new URL(req.url, 'http://localhost'); } catch (e2) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Bad Request' }));
+      return;
+    }
+  }
+  const pathname = urlObj.pathname;
+
+  // 09-20：内部 API/页面/静态资源启用 gzip；代理路径（chat/completions 流式）绝不压缩
+  if (pathname === '/' || pathname === '/index.html' || pathname === '/m' || pathname === '/mobile.html'
+      || pathname.startsWith('/static/') || pathname.startsWith('/v1/internal/')) {
+    installGzip(req, res);
+  }
+
+  // === Internal API: Model Running Parameters ===
+  if (pathname === '/v1/internal/model-params') {
+    // 采样参数回落：命令行未显式传采样参数时，读模型目录的 generation_config.json。
+    // 脚本化启动实例（如 Flash-Next chroot 链路）按设计不下发 --override-generation-config，
+    // 实际默认采样值由模型自带 generation_config 决定（vLLM 运行时同款来源），
+    // 否则前端「采样参数」卡会全部显示 '--'。
+    function applyGenConfigDefaults(p, cmdline) {
+      try {
+        let mp = null;
+        for (let i = 0; i < cmdline.length; i++) {
+          const a = cmdline[i];
+          if (a === '--model' || a === '--model-path') { mp = cmdline[i + 1]; break; }
+          if (a === 'serve' && cmdline[i + 1] && !String(cmdline[i + 1]).startsWith('-')) { mp = cmdline[i + 1]; break; }
+        }
+        if (!mp) return;
+        if (!global.__genCfgCache) global.__genCfgCache = new Map();
+        let hit = global.__genCfgCache.get(mp);
+        if (!hit || Date.now() - hit.t > 10000) {
+          let data = null;
+          try { data = JSON.parse(fs.readFileSync(mp + '/generation_config.json', 'utf8')); } catch (e) {}
+          hit = { t: Date.now(), data };
+          global.__genCfgCache.set(mp, hit);
+        }
+        const g = hit.data;
+        if (!g) return;
+        let filled = false;
+        if (p.temperature == null && typeof g.temperature === 'number') { p.temperature = g.temperature; filled = true; }
+        if (p.top_p == null && typeof g.top_p === 'number') { p.top_p = g.top_p; filled = true; }
+        if (p.top_k == null && typeof g.top_k === 'number') { p.top_k = g.top_k; filled = true; }
+        // min_p / repetition_penalty：generation_config 没有时按 vLLM SamplingParams 全局默认
+        if (p.min_p == null) { p.min_p = (typeof g.min_p === 'number') ? g.min_p : 0.0; filled = true; }
+        if (p.repetition_penalty == null) { p.repetition_penalty = (typeof g.repetition_penalty === 'number') ? g.repetition_penalty : 1.0; filled = true; }
+        if (filled) p.sampling_source = 'generation_config';
+      } catch (e) {}
+    }
+    try {
+      const { execSync } = require('child_process');
+      const query = require('url').parse(req.url, true).query;
+      // 不带 port = 全实例模式：一次返回所有运行实例的参数（带 GPU 标签），
+      // 前端「运行参数/采样参数」卡片按卡分块显示；带 port = 单实例（旧行为）。
+      if (!query.port) {
+        const all = [];
+        const pushInst = (inst, runtime) => {
+          try {
+            const cmdline = fs.readFileSync(`/proc/${inst.pid}/cmdline`, 'utf8').split('\0').filter(Boolean);
+            const p = parseServerParams(cmdline, runtime, inst.port);
+            if (runtime === 'sglang') p.attention_backend = null; // sglang 无此参数，避免显示 vLLM 默认值
+            applyGenConfigDefaults(p, cmdline); // 未显式传采样参数时回落模型 generation_config
+            all.push({ ...p, port: inst.port, gpu: inst.gpu,
+              gpus: inst.gpus || (inst.gpu != null ? [inst.gpu] : []),
+              runtime, model: inst.servedName || inst.modelPath || '' });
+          } catch (e) { /* 进程已退出 */ }
+        };
+        for (const inst of listVllmInstances()) pushInst(inst, 'vllm');
+        for (const inst of listSglangInstances()) pushInst(inst, 'sglang');
+        all.sort((a, b) => (((a.gpu == null) ? 999 : a.gpu) - ((b.gpu == null) ? 999 : b.gpu)) || (a.port - b.port));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ instances: all }));
+        return;
+      }
+      const wantPort = parseInt(query.port) || config.vllmPort;
+      // 找到监听指定端口的服务进程（vllm serve / sglang.launch_server）
+      let out = null;
+      let runtime = null;
+      try {
+        const lsofOut = execSync(`lsof -ti:${wantPort} -sTCP:LISTEN 2>/dev/null || true`, { encoding: 'utf8', timeout: 5000 }).trim();
+        for (const pid of lsofOut.split('\n')) {
+          try {
+            const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ');
+            if (cmd.includes('vllm serve') || cmd.includes('vllm.entrypoints') || cmd.includes('python -m vllm')) { out = pid; runtime = 'vllm'; break; }
+            if (cmd.includes('sglang.launch_server')) { out = pid; runtime = 'sglang'; break; }
+          } catch (e) {}
+        }
+      } catch (e) {}
+      if (!out) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ runtime: null }));
+        return;
+      }
+      const cmdline = fs.readFileSync(`/proc/${out}/cmdline`, 'utf8').split('\0').filter(Boolean);
+      const params = parseServerParams(cmdline, runtime, wantPort);
+      applyGenConfigDefaults(params, cmdline); // 未显式传采样参数时回落模型 generation_config
+      // 思考模式：sglang 从 cmdline --default-chat-template-kwargs 读取（同 vllm）
+      // 未传参时保持 null，前端显示「✅ 默认（开）」（模板缺省 enable_thinking=true）
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(params));
+    } catch (e) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({}));
+    }
+    return;
+  }
+
+  // === Internal API: GPU Info ===
+  if (pathname === '/v1/internal/gpu_info') {
+    getGpuInfo((info) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(info));
+    });
+    return;
+  }
+
+  // === Internal API: Model Manager ===
+  if (pathname === '/v1/internal/model-manager') {
+    if (req.method === 'GET') {
+      // List available models + all running instances (multi-backend)
+      const ports = Array.from(new Set([config.vllmPort, ...Object.values(VLLM_MODEL_PORTS)]));
+      getVllmInstances(ports, (instances) => {
+        const primary = instances.find(i => i.port === config.vllmPort) || null;
+        discoverModels((models) => {
+          // 判断模型目录是否正在运行：vLLM 实例的 model 字段是 served-model-name
+          // （通常等于目录名），而 m.path 是完整目录路径（/home/ll/models/<name>）。
+          // 旧写法 `i.model === m.path` 永远为 false → 运行中的模型卡片恒显示「未运行」。
+          const isModelRunning = (m) => {
+            const sm0 = scriptModelForName(m.name);
+            if (sm0 && (instances.some(i => i.port === sm0.port) || scriptModelAlive(sm0))) return true;
+            return !!instances.find(i =>
+              i.model === m.name || i.model === m.path || m.path === i.model ||
+              (m.path && i.model && m.path.endsWith('/' + i.model)));
+          };
+          // 脚本化模型：展示名用注册名（qwen3.8-flash-next-nvfp4），并带 port/script_model
+          // 标记，前端据此渲染「▶ 启动（脚本）」/「■ 停止」按钮。
+          const mapModel = (m) => {
+            const sm1 = scriptModelForName(m.name);
+            if (sm1) {
+              const inst = scriptModelInstance(sm1);
+              return Object.assign({}, m, {
+                name: sm1.key, dir_name: m.name, script_model: true,
+                port: inst ? inst.port : sm1.port, pid: inst ? inst.pid : null,
+                served_name: sm1.served, note: sm1.note || '',
+                running: !!inst,
+                defaults: scriptModelDefaults(sm1),
+                schemes: flashNextSchemes(),
+              });
+            }
+            return Object.assign({}, m, { running: isModelRunning(m) });
+          };
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            models: models.map(mapModel),
+            vllm: primary
+              ? { running: true, pid: primary.pid, model: primary.model, port: primary.port, gpu: primary.gpu }
+              : { running: false, pid: null, model: null },
+            instances,
+          }));
+        });
+      });
+      return;
+    }
+
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk.toString());
+      req.on('end', async () => {
+        try {
+          const data = JSON.parse(body);
+          const action = data.action;
+
+          if (action === 'start') {
+            const startPort = parseInt(data.port) || 8000;
+            // 脚本化模型（chroot 镜像内启动，如 Flash-Next-NVFP4）：弹窗参数映射为
+            // FN_* 环境变量，由宿主 wrapper 落成 env 文件、chroot 内参数化脚本构造命令行。
+            const smStart = scriptModelForName(data.modelName);
+            if (smStart) {
+              // 启动方案：默认 chroot-pp2（现有行为）；sm80-170hx 需 Docker+GDS 前置，
+              // 未就绪时明确拒绝并列出缺失项，避免用不兼容参数启动。
+              const wantScheme = String(data.scheme || 'chroot-pp2');
+              if (wantScheme !== 'chroot-pp2') {
+                const sc = flashNextSchemes().find(x => x.key === wantScheme);
+                if (!sc) {
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: false, error: '未知启动方案：' + wantScheme }));
+                  return;
+                }
+                if (!sc.ready) {
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({
+                    success: false, scheme: sc.key,
+                    error: '方案「' + sc.name + '」前置条件未就绪，缺失：' + sc.missing.join('、'),
+                    missing: sc.missing, readiness: sc.readiness,
+                  }));
+                  return;
+                }
+                // script 模式启动：走本机 wrapper（chroot + 170HX 参数集，无需 Docker/GDS）
+                if (sc.launcher && sc.launcher.mode === 'script') {
+                  const wrap = sc.launcher.wrapper;
+                  const schemeLog = '/home/ll/deploy/vllm-flash-next-170hx.log';
+                  try {
+                    const ch = require('child_process').spawn('bash', ['-c', `setsid nohup bash ${wrap} > /dev/null 2>&1 & echo $!`], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+                    let buf2 = '';
+                    ch.stdout.on('data', (d) => { buf2 += d.toString(); });
+                    ch.on('close', () => {
+                      VLLM_MODEL_PORTS['qwen3.8-flash-next'] = sc.launcher.port || 18420;
+                      console.log(`[script-model] start scheme=${sc.key} (script) pid=${parseInt(String(buf2).trim()) || null}`);
+                      if (!res.headersSent) {
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ success: true, script: true, scheme: sc.key, port: sc.launcher.port || 18420, log: schemeLog }));
+                      }
+                    });
+                    ch.on('error', (e) => { if (!res.headersSent) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ success: false, scheme: sc.key, error: String(e) })); } });
+                  } catch (e) {
+                    if (!res.headersSent) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ success: false, scheme: sc.key, error: String(e) })); }
+                  }
+                  return;
+                }
+                const repo = (sc.launcher && sc.launcher.repo) || '/home/ll/deploy/qwen-flash-sm80-170hx';
+                const schemeLog = '/home/ll/deploy/vllm-flash-next-170hx.log';
+                try {
+                  const child = require('child_process').spawn('bash', ['-c', `cd ${repo} && setsid python3 scripts/serve.py start --config config/local.json >> ${schemeLog} 2>&1 < /dev/null & echo $!`], {
+                    detached: true, stdio: ['ignore', 'pipe', 'ignore'],
+                  });
+                  let buf = '';
+                  child.stdout.on('data', (d) => { buf += d.toString(); });
+                  child.on('close', () => {
+                    VLLM_MODEL_PORTS['qwen3.8-flash-next'] = (sc.launcher && sc.launcher.port) || 18420;
+                    console.log(`[script-model] start scheme=${sc.key} pid=${parseInt(String(buf).trim()) || null}`);
+                    if (!res.headersSent) {
+                      res.writeHead(200, { 'Content-Type': 'application/json' });
+                      res.end(JSON.stringify({
+                        success: true, script: true, scheme: sc.key,
+                        notice: `已按「${sc.name}」提交启动（Docker 容器，日志 ${schemeLog}），就绪需等 /health 返回 200`,
+                      }));
+                    }
+                  });
+                } catch (e) {
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: false, error: '方案启动异常: ' + e.message }));
+                }
+                return;
+              }
+              const inst0 = scriptModelInstance(smStart);
+              if (inst0) {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: `模型 ${smStart.key} 已在运行（端口 ${inst0.port}，PID ${inst0.pid}），如需重启请先点「停止」` }));
+                return;
+              }
+              const plan = scriptModelLaunchPlan(smStart, data);
+              try {
+                const envPrefix = smStart.inner ? `INNER=${smStart.inner} ` : '';
+                const child = require('child_process').spawn('bash', ['-c', `${envPrefix}setsid bash ${smStart.script} >> ${smStart.log} 2>&1 < /dev/null & echo $!`], {
+                  detached: true,
+                  stdio: ['ignore', 'pipe', 'ignore'],
+                  env: Object.assign({}, process.env, plan.env),
+                });
+                let outBuf = '';
+                child.stdout.on('data', (d) => { outBuf += d.toString(); });
+                child.on('error', (e) => {
+                  if (!res.headersSent) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ success: false, error: '脚本启动失败: ' + e.message })); }
+                });
+                child.on('close', () => {
+                  const pid = parseInt(String(outBuf).trim()) || null;
+                  // 路由与别名跟随弹窗实际填写的 served 名与端口
+                  VLLM_MODEL_PORTS[plan.served] = plan.port;
+                  VLLM_MODEL_PORTS[smStart.key] = plan.port;
+                  MODEL_ALIASES[smStart.key] = plan.served;
+                  (smStart.dirNames || []).forEach(dn => { MODEL_ALIASES[dn] = plan.served; });
+                  if (global.__GPU_INSTANCES && typeof global.__GPU_INSTANCES.set === 'function') {
+                    global.__GPU_INSTANCES.set(plan.port, { port: plan.port, gpuId: 0, gpuCount: (smStart.base && smStart.base.pp) || 2, runtime: 'vllm', model: smStart.key, startedAt: Date.now() });
+                  }
+                  console.log(`[script-model] start ${smStart.key} port=${plan.port} served=${plan.served} pid=${pid} :: ${plan.summary}`);
+                  plan.warnings.forEach(w => console.warn(`[script-model] warn: ${w}`));
+                  if (!res.headersSent) {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({
+                      success: true, script: true, pid, port: plan.port, served: plan.served,
+                      summary: plan.summary, warnings: plan.warnings,
+                      notice: `${smStart.key} 已按弹窗参数启动（端口 ${plan.port}，${smStart.note || ''}），加载完成前请勿重复点击`,
+                    }));
+                  }
+                });
+              } catch (e) {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '脚本启动异常: ' + e.message }));
+              }
+              return;
+            }
+            // PD 分离模式：prefill 占 startPort、decode 占 startPort+1，两个端口都必须空闲
+            const isPd = data.pdMode === '1';
+            // 双实例保护：目标端口已有 vLLM 运行则拒绝启动，避免误杀现有实例
+            if (portInUse(startPort)) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: `端口 ${startPort} 已有模型在运行，请换一个空闲端口，或先停止该端口的实例` }));
+              return;
+            }
+            if (isPd && portInUse(startPort + 1)) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: `PD 模式第二个端口 ${startPort + 1} 已被占用，请换一个空闲起始端口，或先停止该端口的实例` }));
+              return;
+            }
+            // GPU 独占保护：检查请求的 GPU 是否已被其他 vLLM/SGLang 实例占用
+            const wantGpuId = parseInt(data.gpuId) || 0;
+            // PD 模式固定占 2 张卡（一卡 prefill + 一卡 decode）
+            const wantGpuCount = Math.max(1, isPd ? 2 : (parseInt(data.gpuCount) || 1));
+            const gpuConflict = checkGpuConflict(wantGpuId, wantGpuCount, startPort);
+            if (gpuConflict) {
+              const runtimeLabel = gpuConflict.runtime === 'sglang' ? 'SGLang' : 'vLLM';
+              const gpuRange = gpuConflict.gpuCount > 1
+                ? `GPU ${gpuConflict.gpuId}~${gpuConflict.gpuId + gpuConflict.gpuCount - 1}`
+                : `GPU ${gpuConflict.gpuId}`;
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: `GPU ${wantGpuId} 已被 ${runtimeLabel} 实例（${gpuConflict.model}，端口 ${gpuConflict.port}，占用 ${gpuRange}）占用。请选择其他空闲显卡，或先停止该实例` }));
+              return;
+            }
+            // 推测解码：DFlash2 优先（草稿模型 qwen3.8-27b-dflash2 + nightly 环境）；MTP 仅 35B (MoE) 默认开启。
+            // PD 分离模式两种投机均可用（08-27 实测定版）：prefill 端也配相同 speculative-config
+            // 对齐 KV 布局——MTP 时两侧 physical_blocks_per_logical 同为 51 握手通过；DFlash2 时
+            // 草稿模型两端都前向、草稿层 KV 一起传输，hash 一致（无需跳过校验），输出正常。
+            const rawDflash = data.dflash === '1' || data.mtp === 'dflash';
+            const wantDflash = rawDflash;
+            // DSpark（DFlash 骨干 + Markov 头，vllm-env 0.27.1 原生支持）：PD 分离模式未实测，暂不允许
+            const wantDspark = data.dspark === '1' || data.mtp === 'dspark';
+            if (isPd && wantDspark) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'DSpark 投机解码暂不支持 PD 分离模式（未实测），请改用 MTP 或常规模式' }));
+              return;
+            }
+            let pdNotice = null;
+            const params = {
+              port: startPort,
+              maxModelLen: data.maxModelLen || 'auto',
+              gpuId: parseInt(data.gpuId) || 0,
+              // 启用显卡数量：从 gpuId 起连续取 N 张卡，N>1 时多卡张量并行启动
+              gpuCount: Math.max(1, parseInt(data.gpuCount) || 1),
+              // 运行模式：0=常规单实例；1=PD 分离（prefill + decode 双实例，固定 2 卡）
+              pdMode: isPd ? '1' : '0',
+              mtp: (wantDflash || wantDspark) ? '0' : (data.mtp !== undefined ? (data.mtp === '1' ? '1' : '0') : (String(data.modelName).includes('35b') ? '1' : '0')),
+              dflash: wantDflash ? '1' : '0',
+              dspark: wantDspark ? '1' : '0',
+              // 投机步数 num_speculative_tokens：1~8（MTP 默认 5 / DFlash2 推荐 7）
+              mtpTokens: data.mtpTokens !== undefined ? data.mtpTokens : 5,
+              servedName: data.servedName || data.modelName,
+              maxNumSeqs: parseInt(data.maxNumSeqs) || 4,
+              gpuMemUtil: parseFloat(data.gpuMemUtil) || 0.9,
+              // 采样参数（SamplingParams），走 --override-generation-config 合并覆盖
+              temperature: data.temperature !== undefined && data.temperature !== '' ? data.temperature : 1.0,
+              topP: data.topP !== undefined && data.topP !== '' ? data.topP : 0.95,
+              topK: data.topK !== undefined && data.topK !== '' ? data.topK : 20,
+              minP: data.minP !== undefined && data.minP !== '' ? data.minP : 0.0,
+              presencePenalty: data.presencePenalty !== undefined && data.presencePenalty !== '' ? data.presencePenalty : 0.0,
+              repetitionPenalty: data.repetitionPenalty !== undefined && data.repetitionPenalty !== '' ? data.repetitionPenalty : 1.0,
+              // 思考模式：thinking=1(默认) -> enable_thinking=true + reasoning_effort=<effort>
+              // thinking=0 -> enable_thinking=false（非思考）
+              thinking: data.thinking !== undefined ? data.thinking : '1',
+              // 思考深度：low / medium(默认) / high
+              thinkingEffort: data.thinkingEffort || 'medium',
+              // KV 缓存量化：auto / fp8 / int8 / fp8_kv
+              kvCacheQuant: data.kvCacheQuant || 'auto',
+              // 高级参数（vLLM 0.27.1 实测存在的 flag；空值/未勾选不追加，行为与旧版一致）
+              maxBatchedTokens: data.maxBatchedTokens,
+              maxScheduledTokens: data.maxScheduledTokens,
+              schedPolicy: data.schedPolicy,
+              asyncScheduling: data.asyncScheduling,
+              enforceEager: data.enforceEager,
+              blockSize: data.blockSize,
+              cpuOffloadGb: data.cpuOffloadGb,
+              prefixCaching: data.prefixCaching,
+              chunkedPrefill: data.chunkedPrefill,
+              seed: data.seed,
+              dtype: data.dtype,
+              noLogRequests: data.noLogRequests,
+              limitMm: data.limitMm,
+              maxLoraRank: data.maxLoraRank,
+              disableAllReduce: data.disableAllReduce,
+              attentionBackend: data.attentionBackend,
+              // vLLM 附加环境变量 / 附加启动参数（前端弹窗「vLLM 高级参数」区块，仅 vllm 运行时生效）
+              vllmDraftModel: data.vllmDraftModel || '',
+              vllmExtraEnv: data.vllmExtraEnv || '',
+              vllmExtraArgs: data.vllmExtraArgs || '',
+              // SGLang 附加启动参数（前端弹窗「SGLang 附加启动参数」框，仅 sglang 运行时生效）
+              sglangExtraEnv: data.sglangExtraEnv || '',
+              sglangExtraArgs: data.sglangExtraArgs || '',
+            };
+            // 启动方式（运行时）：vllm（默认）或 sglang
+            const runtime = data.runtime === 'sglang' ? 'sglang' : 'vllm';
+            const starter = runtime === 'sglang' ? startSglangModel : startVllmModel;
+            starter(data.modelName, params, (result) => {
+              if (result.success && params.servedName) {
+                // 注册路由表：8889 会把该模型的请求转发到对应端口
+                VLLM_MODEL_PORTS[params.servedName] = startPort;
+                // 登记 GPU 占用，防止 vLLM/SGLang 冲突
+                global.__GPU_INSTANCES.set(startPort, {
+                  port: startPort,
+                  gpuId: wantGpuId,
+                  gpuCount: 1,
+                  runtime: runtime,
+                  model: data.modelName,
+                  startedAt: Date.now(),
+                  pdRole: isPd ? 'prefill' : undefined,
+                });
+                // PD 分离：注册两步转发路由 + 登记 decode 实例（第 2 卡）
+                if (isPd && result.pd) {
+                  PD_MODEL_PORTS[params.servedName] = { prefill: startPort, decode: startPort + 1 };
+                  global.__GPU_INSTANCES.set(startPort + 1, {
+                    port: startPort + 1,
+                    gpuId: wantGpuId + 1,
+                    gpuCount: 1,
+                    runtime: runtime,
+                    model: data.modelName,
+                    startedAt: Date.now(),
+                    pdRole: 'decode',
+                  });
+                }
+              }
+              if (pdNotice && !result.error) result.notice = pdNotice;
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(result));
+            });
+          } else if (action === 'stop') {
+            const stopPort = data.port ? parseInt(data.port) : null;
+            // 脚本化模型：chroot 内引擎属 root（ll 的 lsof 看不到监听端口），
+            // 走宿主侧停止脚本（内部按 --port 匹配后 sudo kill，不误杀其他实例）。
+            const smStop = stopPort ? scriptModelForPort(stopPort) : null;
+            if (smStop) {
+              let out = '';
+              try {
+                // 09-20：execSync(90s) 阻塞事件循环 → 异步 execFile
+                out = await execFileAsync('bash', [smStop.stopScript, String(smStop.port)], { encoding: 'utf8', timeout: 90000, maxBuffer: 4 * 1024 * 1024 });
+              } catch (e) { out = String((e && e.stdout || '') + (e && e.stderr || '') || (e && e.message) || e); }
+              Object.keys(VLLM_MODEL_PORTS).forEach(k => { if (VLLM_MODEL_PORTS[k] === smStop.port) delete VLLM_MODEL_PORTS[k]; });
+              global.__GPU_INSTANCES.delete(smStop.port);
+              const stillAlive = scriptModelInstance(smStop);
+              console.log(`[script-model] stop ${smStop.key} port ${smStop.port}${stillAlive ? ' (WARN: 仍有残留 pid=' + stillAlive.pid + ')' : ' (已彻底停止)'}`);
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: true, script: true, port: smStop.port, output: String(out).trim().slice(-400) }));
+              return;
+            }
+            // PD 配对：停止其中一个端口时，连带停止配对实例并清理 PD 两步转发路由
+            let pdPair = null;
+            if (stopPort) {
+              for (const [m, pp] of Object.entries(PD_MODEL_PORTS)) {
+                if (pp.prefill === stopPort || pp.decode === stopPort) {
+                  pdPair = { model: m, ports: [pp.prefill, pp.decode] };
+                  break;
+                }
+              }
+            }
+            Promise.resolve(stopVllm((result) => {
+              if (result.success && stopPort) {
+                // 移除路由表中指向该端口的模型
+                Object.keys(VLLM_MODEL_PORTS).forEach(k => { if (VLLM_MODEL_PORTS[k] === stopPort) delete VLLM_MODEL_PORTS[k]; });
+                // 移除 GPU 占用登记，释放该端口占用的显卡
+                global.__GPU_INSTANCES.delete(stopPort);
+                if (pdPair) {
+                  delete PD_MODEL_PORTS[pdPair.model];
+                  const other = pdPair.ports.find(p => p !== stopPort);
+                  console.log('[pd-stop] stopPort=' + stopPort + ' pair=' + JSON.stringify(pdPair) + ' other=' + other);
+                  if (other !== undefined) {
+                    global.__GPU_INSTANCES.delete(other);
+                    // 连带停止配对实例（后台执行，结果并入主响应）
+                    Promise.resolve(stopVllm((r) => console.log('[pd-stop] sibling stop result: ' + JSON.stringify(r)), other)).catch(e => console.log('[pd-stop] sibling stop error: ' + (e && e.message || e)));
+                  }
+                }
+              }
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(result));
+            }, stopPort)).catch(e => { console.log('[stop] stopVllm error: ' + (e && e.message || e)); try { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ success: false, error: String((e && e.message) || e) })); } catch (_) {} });
+          } else {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: 'Unknown action: ' + action }));
+          }
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
+      });
+      return;
+    }
+  }
+
+  // === Internal API: per-request measured stats (vLLM stat-logger plugin) ===
+  if (pathname === '/v1/internal/recent-requests') {
+    try {
+      const q = require('url').parse(req.url, true).query;
+      const limit = Math.min(200, Math.max(1, parseInt(q.limit) || 8));
+      const p = path.join(__dirname, 'request-traces.jsonl');
+      const out = [];
+      // rid → pid 映射（从 live-prefill 文件构建，2s 缓存）。vLLM 的 trace 记录
+      // 本身带 pid（插件 09-05 补丁：os.getpid=EngineCore pid），但那是**子进程** pid，
+      // 需经 resolveInstanceByPid 上溯到主进程；live-prefill 的 rid→pid 作为二级兜底。
+      const ridPid = buildRidPidMap();
+      const vllmInsts = listVllmInstances();
+      const tagGpu = (rec) => {
+        if (rec.runtime === 'sglang') {
+          // 精确 GPU 归因（优先级）：① 记录自带 port 字段（sglang exporter 补丁+实例重启
+          // 后写入，覆盖绕过 8889 的直连流量）② rid→port 代理 tee 注册（响应 id=rid，
+          // 覆盖经代理流量）③ 唯一在跑实例启发式（旧行为兜底，多实例时不生效避免误导）
+          const sgl = listSglangInstances();
+          let port = rec.port ? parseInt(rec.port, 10) : null;
+          if (!port || Number.isNaN(port)) {
+            const mp = global.__ridPortMap;
+            if (mp && rec.request_id && mp.has(rec.request_id)) port = mp.get(rec.request_id);
+          }
+          if (port && !Number.isNaN(port)) {
+            rec.port = port;
+            const hit = sgl.find(i => i.port === port);
+            rec.gpu = (hit && hit.gpu != null) ? hit.gpu : (global.__portGpuSeen.get(port) || null);
+          } else {
+            // ⑤ 模型名 → 该模型最近实例端口（两实例 served 名不同：qwen3.8-27b-0/-1；
+            //    直连流量不经代理、rid→port 无注册时靠它归因）
+            let p = null;
+            if (rec.model) {
+              const lastSeen = global.__lastSglangModelByPort = global.__lastSglangModelByPort || new Map();
+              for (const i of sgl) { if (i.model) lastSeen.set(i.model, i.port); }
+              if (lastSeen.has(rec.model)) p = lastSeen.get(rec.model);
+            }
+            // ④ rid 前缀 → 端口（36 主机 rid 实测 f=8000 / h=8001，经验性兑底）
+            if (p == null && rec.request_id) {
+              if (rec.request_id.startsWith('h')) p = 8001;
+              else if (rec.request_id.startsWith('f')) p = 8000;
+            }
+            if (p != null) {
+              const hit = sgl.find(i => i.port === p);
+              if (hit) { rec.gpu = hit.gpu; rec.port = hit.port; return; }
+              rec.port = p; rec.gpu = global.__portGpuSeen.get(p) || null;
+              return;
+            }
+            // ⑥ 唯一在跑实例（原启发式）
+            if (sgl.length === 1) { rec.gpu = sgl[0].gpu; rec.port = sgl[0].port; }
+            else { rec.gpu = null; rec.port = null; }
+          }
+          return;
+        }
+        // 优先用 trace 记录自带的 pid（插件 09-05 补丁：os.getpid=EngineCore pid），
+        // 不依赖 live-prefill 的 rid→pid 映射（live-prefill 依赖 scheduler.py 补丁，
+        // 换 vLLM 版本/venv 后补丁丢失时 live-prefill 停更→映射失效→gpu 全 null）。
+        let inst = null;
+        if (rec.pid != null) {
+          // 09-14：pid 可能是 EngineCore/Worker 子进程 → 沿 ppid 链上溯到主进程
+          inst = resolveInstanceByPid(rec.pid, vllmInsts);
+        }
+        if (!inst && ridPid.has(rec.request_id)) {
+          inst = resolveInstanceByPid(ridPid.get(rec.request_id), vllmInsts);
+        }
+        rec.gpu = inst ? (inst.gpu != null ? inst.gpu : null) : null;
+        // gpus = 该实例实际占用的卡列表（PP/TP 多卡实例：[0,1]）；前端据此把同一条
+        // 记录同时归入 GPU0 与 GPU1 分组，并打「GPU 0+1」徽标。
+        rec.gpus = (inst && Array.isArray(inst.gpus) && inst.gpus.length)
+          ? inst.gpus.slice()
+          : (rec.gpu != null ? [rec.gpu] : null);
+        rec.port = inst ? inst.port : null;
+        rec.model = (inst && (inst.servedName || inst.modelPath)) || rec.model || null;
+      };
+      try {
+        const fd = fs.openSync(p, 'r');
+        try {
+          const sz = fs.fstatSync(fd).size;
+          // 尾部窗口 256KB（≈700 行 @366B/行）：GPU0/GPU1 独立行数各可设到 200，
+          // 64KB 只够 ~179 行，高行数设置时凑不满（09-05 扩窗）
+          const LEN = Math.min(256 * 1024, sz);
+          const buf = Buffer.alloc(LEN);
+          fs.readSync(fd, buf, 0, LEN, sz - LEN);
+          const lines = buf.toString('utf8').split('\n').filter(l => l.trim());
+          // 09-18：先解析 + 剔除脏时间戳记录，再截最后 limit 条。
+          // 旧版是「先截断后过滤」：脏时钟（2161 年）记录会占满窗口，真实数据整段消失。
+          const parsed = [];
+          for (const l of lines) {
+            let rec; try { rec = JSON.parse(l); } catch (e2) { continue; } // 残行跳过
+            if (!traceTsPlausible(rec && rec.t)) continue;
+            parsed.push(rec);
+          }
+          parsed.slice(-limit).forEach(r => out.push(r));
+        } finally { fs.closeSync(fd); }
+      } catch (e) { /* file missing — no completed requests yet */ }
+
+      // sglang 每请求实测数据（--export-metrics-to-file 写入）：
+      // 记录形如 {"request_parameters":"...","prompt_tokens":N,"completion_tokens":N,
+      // "cached_tokens":N,"finish_reason":{...},"e2e_latency":X,"queue_time":Y,
+      // "spec_accept_rate":Z,"id":"rid", "request_received_ts":..., ...}
+      // 转成与 vLLM trace 同构的字段，前端「最近完成请求」表格直接复用。
+      {
+        // 09-18 修复：旧版每请求全量 readFileSync+逐行 JSON.parse 每目录最后 3 个文件
+        // （单文件实测最大 46MB、合计 ~130MB）同步阻塞主循环 ~2s/请求，饿死 GPU 卡等
+        // 所有秒级采样 → 改「每文件只读尾部 1MB + 3s 结果缓存」。out 接缓存记录浅拷贝，
+        // 后续 tagGpu 的字段改写不会污染缓存对象。
+        let sglCached = global.__sglRecentCache;
+        if (!sglCached || Date.now() - sglCached.at > 3000) {
+          const recs = [];
+          for (const { dir: sglDir, port: dirPort } of sglangMetricsDirs()) {
+          try {
+            const files = fs.readdirSync(sglDir).filter(f => /^sglang-request-metrics-.*\.log$/.test(f)).sort();
+            for (const fn of files.slice(-3)) {
+              let lines = [];
+              try {
+                const fp = path.join(sglDir, fn);
+                const st = fs.statSync(fp);
+                const TL = Math.min(1024 * 1024, st.size);
+                const fd = fs.openSync(fp, 'r');
+                try {
+                  const buf = Buffer.alloc(TL);
+                  fs.readSync(fd, buf, 0, TL, st.size - TL);
+                  lines = buf.toString('utf8').split('\n').filter(l => l.trim());
+                  if (TL < st.size && lines.length) lines.shift(); // 砍掉首行残半行
+                } finally { fs.closeSync(fd); }
+              } catch (eRead) { continue; }
+            for (const l of lines) {
+              try {
+                const rec = JSON.parse(l);
+                if (!rec || rec.prompt_tokens === undefined || rec.completion_tokens === undefined) continue;
+                // e2e：优先用 sglang 直接给的 e2e_latency（秒），否则用请求时间戳差。
+                const e2eS = (typeof rec.e2e_latency === 'number' && rec.e2e_latency > 0)
+                  ? rec.e2e_latency
+                  : (rec.request_finished_ts && rec.request_received_ts
+                    ? Math.max(0, rec.request_finished_ts - rec.request_received_ts) : 0);
+                // prefill：forward_entry_time（进入 scheduler）→ prefill_finished_time 为 epoch 秒
+                const prefillS = (rec.prefill_finished_time && rec.forward_entry_time
+                  && rec.prefill_finished_time > rec.forward_entry_time)
+                  ? rec.prefill_finished_time - rec.forward_entry_time : 0;
+                // decode：e2e 减去 prefill（剩余主要是 decode + 调度开销）
+                const decodeS = e2eS > prefillS ? e2eS - prefillS : 0;
+                const gen = parseInt(rec.completion_tokens) || 0;
+                const pp = parseInt(rec.prompt_tokens) || 0;
+                // finish_reason 可能是 {"type":"length",...} 对象或 "stop" 字符串
+                let fr = rec.finish_reason;
+                if (fr && typeof fr === 'object' && !Array.isArray(fr)) fr = fr.type || '';
+                // DFLASH 命中率：sglang 的 spec_accept_rate（接受 draft 比例，0~1）→ 前端 MTP% 列
+                let mtpHit = null;
+                if (typeof rec.spec_accept_rate === 'number' && rec.spec_accept_rate > 0) {
+                  mtpHit = parseFloat((rec.spec_accept_rate * 100).toFixed(1));
+                }
+                recs.push({
+                  t: (rec.request_finished_ts || Date.now() / 1000),
+                  request_id: rec.id || rec.request_id || '',
+                  finish_reason: String(fr || ''),
+                  prompt_tokens: pp,
+                  gen_tokens: gen,
+                  cached_tokens: parseInt(rec.cached_tokens) || 0,
+                  queued_s: typeof rec.queue_time === 'number' ? parseFloat(rec.queue_time.toFixed(3)) : 0,
+                  prefill_s: parseFloat(prefillS.toFixed(3)),
+                  decode_s: parseFloat(decodeS.toFixed(3)),
+                  e2e_s: parseFloat(e2eS.toFixed(3)),
+                  tpot_s: decodeS > 0 && gen > 1 ? parseFloat((decodeS / (gen - 1)).toFixed(5)) : 0,
+                  decode_tps: decodeS > 0 ? parseFloat((gen / decodeS).toFixed(1)) : 0,
+                  mtp_hit_rate: mtpHit,
+                  mtp_drafted: rec.spec_proposed_drafts,
+                  mtp_accepted: rec.spec_accepted_drafts,
+                  mtp_exact: true,
+                  runtime: 'sglang',
+                  port: rec.port || dirPort || null,
+                });
+              } catch (e2) { /* skip bad line */ }
+            }
+            }
+          } catch (e) { /* dir missing — no sglang metrics yet */ }
+          }
+          sglCached = global.__sglRecentCache = { at: Date.now(), recs };
+        }
+        for (const r of sglCached.recs) out.push(Object.assign({}, r));
+      }
+
+      // 关联 GPU（vLLM 记录经 rid→pid→实例；sglang 记录按「唯一在跑实例」启发式归属）
+      for (const rec of out) tagGpu(rec);
+      // 关联控制台任务号（T 号）：rid → taskId 映射由代理 tee 响应流时记录
+      const ridTask = global.__ridTaskId;
+      for (const rec of out) { if (rec.request_id && ridTask.has(rec.request_id)) rec.taskId = ridTask.get(rec.request_id); }
+      // 合并 vllm + sglang，按完成时间倒序取 limit 条
+      // 09-18：返回前统一剔除脏时间戳记录（含 sglang 侧），避免脏时钟霸占排序首位
+      const plausible = out.filter(r => traceTsPlausible(r && r.t));
+      plausible.sort((a, b) => (b.t || 0) - (a.t || 0));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ requests: plausible.slice(0, limit) })); // newest first
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // === Internal API: vLLM Logs ===
+  if (pathname === '/v1/internal/vllm-logs') {
+    // vLLM may be started externally (e.g. ~/vllm-deploy/start-*.sh) with its
+    // stdout redirected elsewhere. Resolve the file the running process actually
+    // writes to; fall back to ./vllm.log when vLLM was started from this console.
+    const logSrc = getVllmLogSource();
+    const logFile = logSrc.file;
+    const stateFile = path.join(__dirname, 'log-clear-state.json');
+    const query = require('url').parse(req.url, true).query;
+    // 09-19：docker 容器化实例 → docker logs（异步子进程，不阻塞事件循环）
+    if (logSrc.docker) {
+      const dfile = 'docker:' + logSrc.docker;
+      if (req.method === 'POST') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, file: dfile, note: '容器日志由 docker daemon 保管，清除仅对本次视图生效' }));
+        return;
+      }
+      const tailN = Math.min(1000, parseInt(query.tailLines) || 100);
+      require('child_process').execFile('docker', ['logs', '--tail', String(tailN), logSrc.docker],
+        { maxBuffer: 16 * 1024 * 1024, timeout: 5000 }, (err, stdout, stderr) => {
+          const raw = String(stdout || '') + String(stderr || '');
+          const lines = raw.split('\n').filter(l => l.trim());
+          // 增量打时间戳：只给本轮新出现的行盖观测时间（与文件路径逻辑同构）
+          if (!global.__vllmLogTracker) global.__vllmLogTracker = { file: null, offset: 0, seen: false, times: new Map() };
+          const t = global.__vllmLogTracker;
+          if (t.file !== dfile) { t.file = dfile; t.times.clear(); t.seen = false; }
+          const nowT = Date.now();
+          const obs = new Set();
+          for (let i = lines.length - 1; i >= 0; i--) {
+            if (t.times.has(lines[i])) break; // 再往前都是上轮已见
+            obs.add(i);
+          }
+          for (const i of obs) t.times.set(lines[i], nowT);
+          if (t.times.size > 30000) { const ks = [...t.times.keys()].slice(-20000); t.times = new Map(ks.map(k => [k, t.times.get(k)])); }
+          const out = lines.map((l, i) => (obs.has(i) && !/\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(l))
+            ? `[${new Date(nowT).toTimeString().slice(0, 8)}] ${l}` : l);
+          t.seen = true;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            logs: out.slice(-tailN).join('\n'), totalLines: out.length, file: dfile,
+            mtime_ms: nowT, stale_min: 0, docker: true,
+          }));
+        });
+      return;
+    }
+    if (logSrc.tty) {
+      // stdout is a terminal: nothing to read/clear here
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: req.method === 'GET' ? true : false,
+        file: logFile, tty: true,
+        error: req.method === 'GET' ? undefined : 'vLLM 从终端启动，日志输出在 ' + logFile + '，无法在此清除',
+        logs: req.method === 'GET' ? 'vLLM 从终端（' + logFile + '）启动，日志直接输出到该终端，控制台无法读取。' : null,
+        totalLines: 0
+      }));
+      return;
+    }
+    if (req.method === 'POST') {
+      // "Clear" = remember the current byte offset; never truncate a live log
+      // (the writer keeps its file offset, truncation would leave NUL holes).
+      try {
+        let size = 0;
+        try { size = fs.statSync(logFile).size; } catch (e) {}
+        fs.writeFileSync(stateFile, JSON.stringify({ byteOffset: size, filePath: logFile, time: new Date().toISOString() }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, file: logFile, byteOffset: size }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+      return;
+    }
+    const tailLines = parseInt(query.tailLines) || 100;
+    try {
+      // Defensive: only ever read regular files (a TTY/device read would block
+      // the main thread forever). For very large logs read only the last 5MB.
+      let content;
+      let windowed = false;
+      {
+        const fst = fs.statSync(logFile);
+        if (!fst.isFile()) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ file: logFile, logs: null }));
+          return;
+        }
+        const MAX_READ = 5 * 1024 * 1024;
+        const fd = fs.openSync(logFile, 'r');
+        try {
+          const sz = fs.fstatSync(fd).size;
+          if (sz <= MAX_READ) {
+            content = fs.readFileSync(fd, 'utf8');
+          } else {
+            windowed = true;
+            const buf = Buffer.alloc(MAX_READ);
+            const n = fs.readSync(fd, buf, 0, MAX_READ, sz - MAX_READ);
+            const nl = buf.indexOf(0x0a, 0, n);
+            content = buf.toString('utf8', nl >= 0 ? nl + 1 : 0, n);
+          }
+        } finally { fs.closeSync(fd); }
+      }
+      // Incremental timestamp tracking: remember the file offset seen on the
+      // previous poll and stamp newly-appearing lines with the observation time.
+      if (!global.__vllmLogTracker) global.__vllmLogTracker = { file: null, offset: 0, seen: false, times: new Map() };
+      const t = global.__vllmLogTracker;
+      const tKey = logFile + (windowed ? '#tail' : '');
+      if (t.file !== tKey || !t.seen) {
+        // First sight of this file (fresh boot or new file): do not stamp
+        // historical lines with "now" — just start tracking from the end.
+        t.file = logFile; t.offset = content.length; t.seen = true; t.times.clear();
+      }
+      if (content.length < t.offset) { t.offset = 0; t.times.clear(); } // file truncated/rotated
+      const now = Date.now();
+      if (content.length > t.offset) {
+        let idx = t.offset;
+        while (idx < content.length) {
+          const nl = content.indexOf('\n', idx);
+          const lineStart = idx;
+          idx = nl === -1 ? content.length : nl + 1;
+          if (idx > lineStart) t.times.set(lineStart, now);
+        }
+        if (t.times.size > 20000) {
+          const keys = [...t.times.keys()].sort((a, b) => a - b);
+          for (const k of keys.slice(0, keys.length - 10000)) t.times.delete(k);
+        }
+        t.offset = content.length;
+      }
+      let marker = 0;
+      try {
+        const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+        if (st && st.filePath === logFile) {
+          marker = Math.max(0, Math.min(st.byteOffset || 0, content.length));
+          // The log file may have been rotated/replaced (e.g. vLLM restarted
+          // with a fresh log): a clear offset larger than the current file
+          // means the marker points past EOF — show everything instead.
+          if (marker >= content.length && content.length > 0) marker = 0;
+        }
+      } catch (e) {}
+      const nowTs = Date.now();
+      const fsz = fs.statSync(logFile).size;
+      const fsMod = new Date(fs.statSync(logFile).mtimeMs).getTime();
+      const out = [];
+      let idx = marker;
+      while (idx < content.length) {
+        const nl = content.indexOf('\n', idx);
+        const lineStart = idx;
+        const line = content.substring(lineStart, nl === -1 ? content.length : nl);
+        idx = nl === -1 ? content.length : nl + 1;
+        if (!line.trim()) continue;
+        let time = t.times.get(lineStart);
+        // 历史行不再「按 mtime~now 均匀插值」编造时间（2026-09-16）：那会让一个几小时没写的
+        // 文件里的陈旧行显示成刚刚发生，掩盖真实情况。现在只有本轮实际观测到的行才打时间戳，
+        // 其余（含引擎自带 MM-DD HH:MM:SS 的行）原样输出，由前端解析原生时间。
+        // Lines that already carry vLLM's own "08-19 11:03:33" timestamp get no extra prefix
+        out.push(time && !/\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(line) ? `[${new Date(time).toTimeString().slice(0, 8)}] ${line}` : line);
+      }
+      const tail = out.slice(-tailLines).join('\n');
+      // 日志新鲜度：面板据此提示「日志已 N 分钟没有新内容」，避免把陈旧内容当成实时输出
+      const staleMin = Math.max(0, Math.round((nowTs - fsMod) / 60000));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        logs: tail, totalLines: out.length, file: logFile,
+        mtime_ms: fsMod, stale_min: staleMin,
+      }));
+    } catch (e) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ logs: '', totalLines: 0, error: 'No vLLM log found', file: logFile }));
+    }
+    return;
+  }
+
+  // === Internal API: Stats ===
+  // === Internal API: system memory (Linux /proc/meminfo) ===
+  if (pathname === '/v1/internal/sysmem') {
+    try {
+      const mi = {};
+      try {
+        const txt = fs.readFileSync('/proc/meminfo', 'utf8');
+        for (const line of txt.split('\n')) {
+          const mm = line.match(/^(\w+):\s+(\d+)\s*kB/);
+          if (mm) mi[mm[1]] = parseInt(mm[2], 10);
+        }
+      } catch (e) { /* non-Linux or unreadable */ }
+      if (!mi.MemTotal) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ supported: false }));
+        return;
+      }
+      const total = mi.MemTotal;
+      const avail = mi.MemAvailable !== undefined ? mi.MemAvailable : (mi.MemFree || 0);
+      const used = Math.max(0, total - avail);
+      const buffCache = (mi.Buffers || 0) + (mi.Cached || 0) + (mi.SReclaimable || 0);
+      const swapTotal = mi.SwapTotal || 0;
+      const swapUsed = swapTotal > 0 ? Math.max(0, swapTotal - (mi.SwapFree || 0)) : 0;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        supported: true,
+        total_kb: total,
+        used_kb: used,
+        available_kb: avail,
+        buff_cache_kb: buffCache,
+        used_pct: total > 0 ? parseFloat((used / total * 100).toFixed(1)) : 0,
+        swap_total_kb: swapTotal,
+        swap_used_kb: swapUsed,
+      }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (pathname === '/v1/internal/pd-series') {
+    const S = global.__pdSeries || { points: [] };
+    try {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ points: S.points }));
+    } catch (e) {}
+    return;
+  }
+
+  // ===== 0命中占比（近 1h 滚动窗口，20s 缓存）=====
+  // 口径：完成请求中 cached_tokens==0 的条数占比；>16k 大 prompt 单列 big 子集
+  //（大请求 0 命中意味着全额 prefill 重算，是拖低命中率与 TTFT 的主因）。
+  // 数据源双轨：① vLLM request-traces.jsonl（dsh_vllm_logger 插件写入，runtime=sglang 记录不计）；
+  // ② SGLang 实例日志 Prefill batch #cached-token 逐请求环（sglangTraceRecords，09-01 加——
+  //    生产全切 SGLang 后 trace 文件停更，徽标此前对 SGLang 流量失明）。
+  // 窗口内无任何记录时返回 null（前端保持 '--'），避免 0/0 显示成「0% 全命中」。
+  let __zeroHitCache = { at: 0, data: null };
+  function zeroHitStats() {
+    const now = Date.now();
+    if (__zeroHitCache.data && now - __zeroHitCache.at < 20000) return __zeroHitCache.data;
+    let total = 0, zero = 0, bigTotal = 0, bigZero = 0;
+    // ① vLLM：request-traces.jsonl
+    try {
+      const p = path.join(__dirname, 'request-traces.jsonl');
+      const fd = fs.openSync(p, 'r');
+      try {
+        const sz = fs.fstatSync(fd).size;
+        // 忙时 1h ~500 条 ≈ 200KB，tail 1MB 余量充足；末尾残行 JSON.parse 失败自动跳过
+        const LEN = Math.min(1024 * 1024, sz);
+        const buf = Buffer.alloc(LEN);
+        fs.readSync(fd, buf, 0, LEN, sz - LEN);
+        const cutoff = now / 1000 - 3600;
+        for (const l of buf.toString('utf8').split('\n')) {
+          if (!l.trim()) continue;
+          let rec; try { rec = JSON.parse(l); } catch (e2) { continue; }
+          if (!rec || rec.runtime === 'sglang' || typeof rec.t !== 'number' || rec.t < cutoff) continue;
+          if (!traceTsPlausible(rec.t)) continue; // 09-18：脏时钟记录不计入 1h 窗口
+          total++;
+          const cached = rec.cached_tokens || 0;
+          if (cached === 0) zero++;
+          if ((rec.prompt_tokens || 0) > 16384) { bigTotal++; if (cached === 0) bigZero++; }
+        }
+      } finally { fs.closeSync(fd); }
+    } catch (e) {} // 文件不存在/读失败 → 该源计 0，不拖累 SGLang 侧
+    // ② SGLang：日志逐请求环
+    let sgl; try { sgl = sglangTraceRecords(); } catch (e) { sgl = []; }
+    for (const r of sgl) {
+      total++;
+      if (r.cached === 0) zero++;
+      if (r.prompt > 16384) { bigTotal++; if (r.cached === 0) bigZero++; }
+    }
+    const data = total === 0 ? null : {
+      window_min: 60, total, zero,
+      pct: parseFloat((zero / total * 100).toFixed(1)),
+      big: { total: bigTotal, zero: bigZero },
+    };
+    __zeroHitCache = { at: now, data };
+    return data;
+  }
+
+  // ===== 快速启动（08-30 定版）：两卡一键拉起，每卡可选引擎规格 =====
+  // 预设定义在 quickstart-presets.json（热加载，改 JSON 即生效，无需重启控制台）；
+  // 脚本为实跑正典（cmdline+environ 重建）。已运行端口自动跳过（不杀生产实例）。
+  function quickStartCards() {
+    try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'quickstart-presets.json'), 'utf8')); }
+    catch (e) { return null; }
+  }
+  function qsCardStatus(cards, key) {
+    const card = cards[key];
+    if (!card) return null;
+    let live = null, engine = null;
+    try {
+      // 卡上注册的脚本化模型端口优先（如 Flash-Next 18420：实例活着就永远算运行中，
+      // 不依赖「默认预设恰好是脚本预设」）
+      const smk = card.scriptModel && SCRIPT_MODELS[card.scriptModel];
+      if (smk) {
+        const inst = scriptModelInstance(Object.assign({ key: card.scriptModel }, SCRIPT_MODELS[card.scriptModel]));
+        if (inst) { live = inst; engine = 'script'; }
+      }
+      if (!live) {
+        const v = listVllmInstances(true).find(x => x.port === card.port);
+        const s = listSglangInstances().find(x => x.port === card.port);
+        if (v) { live = v; engine = 'vllm'; } else if (s) { live = s; engine = 'sglang'; }
+      }
+      if (!live) {
+        // 兜底：该卡默认预设是脚本化模型时，按 /proc cmdline 认领 chroot 内实例
+        const def = (card.presets || []).find(p => p.standard) || (card.presets || [])[0];
+        if (def && def.engine === 'script') {
+          const sm = scriptModelForName(def.modelName) || scriptModelForPort(def.port);
+          const inst = sm ? scriptModelInstance(sm) : null;
+          if (inst) { live = inst; engine = 'script'; }
+        }
+      }
+    } catch (e) {}
+    return { key, gpu: card.gpu, port: (live && live.port) || card.port, presets: card.presets, running: !!live, pid: live ? live.pid : null, engine };
+  }
+  // 脚本预设（Flash-Next 这类 chroot 脚本化模型）的运行态：chroot 内引擎属 root，
+  // ll 的 lsof/ss 看不到监听端口，一律按 /proc/<pid>/cmdline 的 --port 匹配认领。
+  function qsScriptStatus(preset) {
+    const sm = scriptModelForName(preset.modelName) || scriptModelForPort(preset.port);
+    const inst = sm ? scriptModelInstance(sm) : null;
+    const port = (inst && inst.port) || preset.port;
+    return { key: preset.cardKey || 'script', gpu: preset.gpu, port, presets: preset.cardPresets,
+      running: !!inst, pid: inst ? inst.pid : null, engine: 'script',
+      scriptModel: sm ? sm.key : (preset.modelName || null) };
+  }
+  // 脚本化预设的停止：走注册模型的宿主停止脚本（内部按 --port 匹配后 sudo kill，
+  // SIGTERM 优先，绝不 SIGKILL 持 CUDA 上下文的进程）。等待上限须覆盖 W4A16 停止脚本
+  // 自身的 90s 优雅退出窗口（SIGTERM → 等退净 → 才兜底 SIGKILL）。
+  async function qsStopScript(smKey, port) {
+    const sm = (smKey && SCRIPT_MODELS[smKey]) ? Object.assign({ key: smKey }, SCRIPT_MODELS[smKey]) : scriptModelForPort(port);
+    if (!sm || !sm.stopScript) return '未注册停止脚本';
+    let out = '';
+    try {
+      // 09-20：execSync(180s) 会冻结事件循环（停止期间整个控制台无响应），改异步 execFile
+      out = await execFileAsync('bash', [sm.stopScript, String(port)], { encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024 });
+    } catch (e) { out = String((e && e.stdout || '') + (e && e.stderr || '') || (e && e.message) || e); }
+    Object.keys(VLLM_MODEL_PORTS).forEach(k => { if (VLLM_MODEL_PORTS[k] === port) delete VLLM_MODEL_PORTS[k]; });
+    try { global.__GPU_INSTANCES.delete(port); } catch (e) {}
+    const still = scriptModelInstance(sm);
+    console.log(`[quickstart-script] stop ${sm.key} port ${port}${still ? ' (WARN: 仍有残留 pid=' + still.pid + ')' : ' (已彻底停止)'}`);
+    return String(out).trim().slice(-400);
+  }
+  // 按指定端口判定运行态（多端口预设：跳过/健康检测跟所选预设的端口走，不跟 card.port 走）
+  function qsPortStatus(cards, key, port) {
+    const card = cards[key];
+    if (!card) return null;
+    let live = null, engine = null;
+    try {
+      const v = listVllmInstances(true).find(x => x.port === port);
+      const s = listSglangInstances().find(x => x.port === port);
+      if (v) { live = v; engine = 'vllm'; } else if (s) { live = s; engine = 'sglang'; }
+    } catch (e) {}
+    return { key, gpu: card.gpu, port, presets: card.presets, running: !!live, pid: live ? live.pid : null, engine };
+  }
+  // 参数预设启动：走「启动模型」弹窗「启动」按钮完全相同的 startVllmModel/startSglangModel，
+  // 与弹窗路径零漂移（校验/清理/命令构造/环境全部同源）
+  function qsLaunchParams(preset) {
+    return new Promise(resolve => {
+      const cb = r => resolve(r || { success: false, error: '启动无返回' });
+      try {
+        const pr = preset.params || {};
+        const _startP = preset.engine === 'sglang' ? startSglangModel(pr.modelName, pr, cb) : startVllmModel(pr.modelName, pr, cb);
+        Promise.resolve(_startP).catch(e => { console.log('[quickstart] launch error: ' + (e && e.message || e)); try { cb({ success: false, error: String((e && e.message) || e) }); } catch (_) {} });
+      } catch (e) { resolve({ success: false, error: String((e && e.message) || e) }); }
+    });
+  }
+  // 脚本化模型预设（如 Qwen3.8-Flash-Next W4A16：chroot 镜像内启动，无法走标准 vLLM 路径）：
+  // 与「模型卡片 → 启动（脚本）」按钮同一条链路——scriptModelLaunchPlan 把弹窗参数映射成
+  // FN_* 环境变量 → 宿主 wrapper 落成 env 文件（sudo 会清环境，chroot 内靠文件）→ chroot 内
+  // 参数化脚本构造 argv。端口/served 注册也与弹窗路径一致。
+  function qsLaunchScript(preset) {
+    return new Promise(resolve => {
+      const done = r => resolve(r || { success: false, error: '脚本启动无返回' });
+      try {
+        const sm = scriptModelForName(preset.modelName);
+        if (!sm) { done({ success: false, error: '未注册的脚本化模型：' + preset.modelName }); return; }
+        const inst0 = scriptModelInstance(sm);
+        if (inst0) { done({ success: false, alreadyRunning: true, error: `已在运行（端口 ${inst0.port}，PID ${inst0.pid}）` }); return; }
+        const plan = scriptModelLaunchPlan(sm, preset.params || {});
+        const envPrefix = sm.inner ? `INNER=${sm.inner} ` : '';
+        // 上次启动落盘的 FN_* 若不清掉，本次「没写到的变量」会继承旧值（sudo 会清环境，
+        // chroot 内的 inner 只能靠这个文件）。09-15 实跑就被残留的 FN_SPEC=none 影响过。
+        const envFile = preset.envFile || ((sm.script || '').match(/w4a16/) ? '/home/ll/deploy/flash-next-launch-w4a16.env' : '');
+        if (envFile) { try { fs.writeFileSync(envFile, ''); } catch (e) {} }
+        const child = require('child_process').spawn('bash', ['-c', `${envPrefix}setsid bash ${sm.script} >> ${sm.log} 2>&1 < /dev/null & echo $!`], {
+          detached: true,
+          stdio: ['ignore', 'pipe', 'ignore'],
+          env: Object.assign({}, process.env, plan.env),
+        });
+        let outBuf = '';
+        child.stdout.on('data', d => { outBuf += d.toString(); });
+        child.on('error', e => done({ success: false, error: '脚本启动失败: ' + e.message }));
+        child.on('close', () => {
+          const pid = parseInt(String(outBuf).trim()) || null;
+          VLLM_MODEL_PORTS[plan.served] = plan.port;
+          VLLM_MODEL_PORTS[sm.key] = plan.port;
+          MODEL_ALIASES[sm.key] = plan.served;
+          (sm.dirNames || []).forEach(dn => { MODEL_ALIASES[dn] = plan.served; });
+          if (global.__GPU_INSTANCES && typeof global.__GPU_INSTANCES.set === 'function') {
+            global.__GPU_INSTANCES.set(plan.port, { port: plan.port, gpuId: 0, gpuCount: (sm.base && sm.base.pp) || 2, runtime: 'vllm', model: sm.key, startedAt: Date.now() });
+          }
+          console.log(`[quickstart-script] ${sm.key} port=${plan.port} served=${plan.served} pid=${pid} :: ${plan.summary}`);
+          done({ success: true, script: true, pid, port: plan.port, served: plan.served, summary: plan.summary, warnings: plan.warnings });
+        });
+      } catch (e) { done({ success: false, error: String((e && e.message) || e) }); }
+    });
+  }
+  // ===== 快速启动预设保存（「启动模型」弹窗 →「保存到快速启动」，08-30）======
+  // 把弹窗完整参数集存为指定卡的 custom 预设（params 预设，启动时走与弹窗同源的启动函数），
+  // 替换该卡已有 custom 预设、撤销其它 standard 标记、卡端口跟随保存值。
+  if (pathname === '/v1/internal/quickstart/save' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      let data = {};
+      try { data = JSON.parse(body || '{}'); } catch (e) {}
+      const target = String(data.target || '').trim();
+      const params = (data.params && typeof data.params === 'object') ? data.params : null;
+      const cards = quickStartCards() || {};
+      if (!cards[target] || !params) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: '参数缺失（target/params）' }));
+      }
+      if (!params.modelName || !fs.existsSync(path.join(MODELS_DIR, params.modelName))) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: '模型目录不存在: ' + params.modelName }));
+      }
+      const portN = parseInt(params.port);
+      if (!portN || portN < 1024 || portN > 65535) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: '端口非法' }));
+      }
+      const eng = String(params.runtime || 'vllm') === 'sglang' ? 'sglang' : 'vllm';
+      const card = cards[target];
+      card.port = portN;
+      const tk = parseInt(params.mtpTokens);
+      const spec = (params.dflash === '1') ? 'DFlash2×' + Math.min(8, Math.max(1, tk || 7))
+        : (params.dspark === '1') ? 'DSPARK×' + (tk || 8)
+        : (eng === 'vllm' && params.mtp === '1') ? 'MTP×' + Math.min(8, Math.max(1, tk || 5))
+        : '基线';
+      const name = (eng === 'sglang' ? 'SGLang' : 'vLLM') + ' · ' + spec + '（弹窗保存）';
+      card.presets = (card.presets || []).filter(x => x.key !== 'custom');
+      (card.presets || []).forEach(x => { x.standard = false; });
+      card.presets.push({ key: 'custom', name, engine: eng, standard: true, port: portN, params });
+      try {
+        fs.writeFileSync(path.join(__dirname, 'quickstart-presets.json'), JSON.stringify(cards, null, 2));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: '写入失败: ' + e.message }));
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, target, name, port: portN }));
+    });
+    return;
+  }
+  // ===== 快速启动预设删除（08-30）：每卡至少保留一条；删默认则剩余第一条提为默认 =====
+  if (pathname === '/v1/internal/quickstart/delete' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      let data = {};
+      try { data = JSON.parse(body || '{}'); } catch (e) {}
+      const target = String(data.target || '').trim();
+      const key = String(data.key || '').trim();
+      const cards = quickStartCards() || {};
+      const card = cards[target];
+      if (!card || !key || !(card.presets || []).some(x => x.key === key)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: '预设不存在（target/key）' }));
+      }
+      card.presets = card.presets.filter(x => x.key !== key);
+      if (!card.presets.length) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: '每卡至少保留一条预设' }));
+      }
+      if (!card.presets.some(x => x.standard)) card.presets[0].standard = true;
+      const restPort = (card.presets.find(x => x.port) || {}).port;
+      if (restPort) card.port = restPort;
+      try {
+        fs.writeFileSync(path.join(__dirname, 'quickstart-presets.json'), JSON.stringify(cards, null, 2));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: '写入失败: ' + e.message }));
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, target, deleted: key, standard: (card.presets.find(x => x.standard) || {}).key || null }));
+    });
+    return;
+  }
+  if (pathname === '/v1/internal/quickstart' && req.method === 'GET') {
+    const cards = quickStartCards() || {};
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, cards: Object.keys(cards).map(k => qsCardStatus(cards, k)) }));
+    return;
+  }
+  if (pathname === '/v1/internal/quickstart' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      const cards = quickStartCards() || {};
+      let target = 'both', want = {}, restart = false;
+      let actionAllowed = false;
+      try { const b = JSON.parse(body || '{}'); target = b.target || 'both'; want = b.presets || {}; restart = !!b.restart; actionAllowed = String(b.confirm || '') === 'restart'; } catch (e) {}
+      const keys = target === 'both' ? Object.keys(cards) : [target];
+      const results = [];
+      (async () => {
+        for (const k of keys) {
+          const card = cards[k];
+          if (!card) { results.push({ key: k, status: 'unknown' }); continue; }
+          const preset = card.presets.find(p => p.key === want[k]) || card.presets.find(p => p.standard) || card.presets[0];
+          const pPort = preset.port || card.port;
+          const isScriptPreset = preset.engine === 'script';
+          // 脚本化预设（Flash-Next）与脚本模型端口：状态判定/健康检测都走 /proc cmdline 认领
+          const st = isScriptPreset ? qsScriptStatus(Object.assign({ cardKey: k, cardPresets: card.presets }, preset))
+            : (card.scriptModel && SCRIPT_MODELS[card.scriptModel] && scriptModelInstance(Object.assign({ key: card.scriptModel }, SCRIPT_MODELS[card.scriptModel]))
+                ? qsScriptStatus({ cardKey: k, cardPresets: card.presets, port: pPort, gpu: card.gpu, modelName: card.scriptModel })
+                : qsPortStatus(cards, k, pPort));
+          if (st.running) {
+            // 脚本化预设：行内「停止」可用。默认不自动停（保护生产实例），
+            // 仅当请求显式带 restart=1 时先停再起。
+            if (restart) {
+              if (!actionAllowed) {
+                results.push({ ...st, preset: preset.key, presetName: preset.name, status: 'refused', error: '需要确认口令 restart（快速启动默认不动运行中的卡）' });
+                continue;
+              }
+              if (isScriptPreset || scriptModelForPort(pPort)) {
+                const info = await qsStopScript(isScriptPreset ? preset.modelName : null, pPort);
+                results.push({ ...st, preset: preset.key, presetName: preset.name, status: 'stopped', stopOutput: info });
+                continue;
+              }
+              results.push({ ...st, preset: preset.key, presetName: preset.name, status: 'running', error: '标准实例请到「运行中」卡片点停止' });
+              continue;
+            }
+            results.push({ ...st, preset: preset.key, presetName: preset.name, status: 'running' });
+            continue;
+          }
+          const t0 = Date.now();
+          let pid = null, healthy = false;
+          try {
+            const hp = preset.port || card.port; // 参数预设可能用与卡默认不同的端口
+            let launched;
+            if (isScriptPreset) {
+              launched = await qsLaunchScript(preset);
+            } else if (preset.script) {
+              // 脚本预设：setsid 后台，独立于控制台进程
+              const { spawn } = require('child_process');
+              const child = spawn('bash', ['-c', `setsid bash ${preset.script} >> ${preset.log} 2>&1 < /dev/null & echo $!`], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+              child.stdout.on('data', d => { pid = parseInt(d.toString().trim().split(/\s+/)[0]) || null; });
+              await new Promise(r => { child.on('close', r); setTimeout(r, 3000); });
+              launched = { success: true };
+            } else {
+              // 参数预设：与「启动模型」弹窗同一条启动链路
+              launched = await qsLaunchParams(preset);
+            }
+            if (!launched || !launched.success) throw new Error((launched && launched.error) || '启动失败（进程未存活）');
+            for (let i = 0; i < (isScriptPreset ? 150 : 30) && !healthy; i++) {
+              await new Promise(r => setTimeout(r, 5000));
+              healthy = await new Promise(ok => {
+                const hreq = http.get(`http://127.0.0.1:${hp}/health`, r2 => { ok(r2.statusCode === 200); r2.resume(); });
+                hreq.on('error', () => ok(false));
+                hreq.setTimeout(2000, () => { hreq.destroy(); ok(false); });
+              });
+            }
+            results.push({ ...(isScriptPreset ? qsScriptStatus(Object.assign({ cardKey: k, cardPresets: card.presets }, preset)) : qsPortStatus(cards, k, pPort)), preset: preset.key, presetName: preset.name, status: healthy ? 'healthy' : 'starting', pid: pid || (launched.pid || null), waited_s: Math.round((Date.now() - t0) / 1000), log: preset.log || (preset.engine === 'sglang' ? SGLANG_LOG_PATH : path.join(__dirname, 'vllm.log')) });
+          } catch (e) {
+            results.push({ key: k, preset: preset.key, status: 'error', error: String((e && e.message) || e) });
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, results }));
+      })();
+    });
+    return;
+  }
+  if (pathname === '/v1/internal/stats') {
+    const startTime = Date.now();
+
+    // 09-20：/metrics 走缓存+单飞（400ms TTL）——此前每次 stats 都实时抓 64KB 上游
+    fetchMetricsCached(`${vllmBaseUrl}/metrics`, 400, 3000).then(async (data) => {
+        try {
+          const m = parseMetrics(data);
+          // SGLang 运行时：指标命名/结构不同，走独立构建器（vllm 路径保持不变）
+          if (metricsNamespace(m) === 'sglang') {
+            const sg = buildSglangStats(m, global.__tokTicker);
+            // 引擎实测总生成吞吐（3s 窗口，gen_throughput gauge 平均，与 tg TPS 同源）
+            const genSpeed1s = buildSglangGenSpeed1s(m);
+            // 引擎实测预填充吞吐（3s 窗口，prefill_effective_tokens_total{mode=input} 差值）
+            const prefillSpeed3s = buildSglangPrefillSpeed3s(m);
+            // 引擎预填充累计（mode=input），用于单请求预填充进度（首次观察差值）
+            const ppTotalNow = Math.round(counterByLabel(m, 'sglang:prefill_effective_tokens_total', 'mode', 'input'));
+            // 并发请求明细：与 vLLM 对齐，用进行中的 live 流构建每请求行（无 live 数据时回落聚合显示）
+            // 与实例 ticker 路径一致：按 model 名过滤出本实例的 live 流——主路径原先不过滤，
+            // 会把其他运行时/实例（如 vLLM 8001）的进行中请求混进 SGLang 卡片
+            {
+              let _primModel = '';
+              try {
+                const _mk = Object.keys(m).find(x => x.indexOf('sglang:num_running_reqs|') === 0);
+                if (_mk) _primModel = (JSON.parse(_mk.substring(_mk.indexOf('|') + 1)).model_name) || '';
+              } catch (e) {}
+              const _lsPrim = new Map();
+              for (const [id, e] of global.__liveStreams.map) {
+                if (e && !e.done && (_primModel === '' || e.model === _primModel)) _lsPrim.set(id, e);
+              }
+              // 08-30：每请求缓存命中真值（日志 #cached-token，vLLM 口径对齐）
+              const _primSg = listSglangInstances().find(x => x.port === sg.port) || {};
+              const _primLines = readSglangPrefillLines(sg.port, _primSg.pid);
+              sg.active_requests = buildSglangActiveRequests(sg, { map: _lsPrim }, genSpeed1s, prefillSpeed3s, ppTotalNow,
+                (e) => sglangCachedForRequest(_primLines, e, e.promptTokens));
+            }
+            // 实时 token 流（tee 捕获），前端与 active_requests 按顺序 zip 展示
+            sg.live_streams = liveStreamsSnapshot();
+            // ====== Real-time billing（与 vLLM 分支同构：持久化累加，重启不丢）======
+            // sglang 无 source 标签区分缓存命中，用 cached_tokens_total 作为缓存命中输入，
+            // prompt_tokens_total − cached_tokens_total 作为未缓存输入（与 buildSglangStats 口径一致）
+            {
+              const cachedRaw = Math.round(counterByLabel(m, 'sglang:prefill_effective_tokens_total', 'mode', 'device_hit')) + Math.round(counterByLabel(m, 'sglang:prefill_effective_tokens_total', 'mode', 'host_hit'));
+              const promptRaw = Math.round(counterTotal(m, 'sglang:prompt_tokens_total'));
+              const genRaw = Math.round(counterTotal(m, 'sglang:generation_tokens_total'));
+              const st = accumulateBilling({ cached: cachedRaw, uncached: Math.max(0, promptRaw - cachedRaw), gen: genRaw });
+              const b = computeBilling(sg, getCurrentVllmModel()); // 保留单价/币种/模型匹配等元信息
+              const totalOf = (bk) => (bk.cost.cached_input || 0) + (bk.cost.uncached_input || 0) + (bk.cost.output || 0);
+              b.current = { cost: { ...st.current.cost, total: totalOf(st.current) }, tokens: st.current.tokens };
+              b.history = { cost: { ...st.history.cost, total: totalOf(st.history) }, tokens: st.history.tokens };
+              b.days = buildBillingDays(st); // 每日费用明细（持久化，可手动删除）
+              sg.billing = b;
+              // 08-30 跨运行时聚合（与 vLLM 分支对称）：SGLang 主实例 + 所有 vLLM 实例
+              // 各自成组进并发卡片——否则 vLLM 独占的卡（如 GPU0 的 vllm 8001）整组消失
+              const _sgModelK = Object.keys(m).find(x => x.indexOf("sglang:num_running_reqs|") === 0);
+              let _sgModel = "";
+              try { if (_sgModelK) _sgModel = (JSON.parse(_sgModelK.substring(_sgModelK.indexOf("|") + 1)).model_name || ""); } catch (e) {}
+              // 09-01: 主实例 GPU 从进程列表解析（原写死 null → 主行无 GPU 徽标、无法按卡分组；缺 runtime → 徽标误显示 vllm）
+              const _sglSelf = listSglangInstances().find(x => x.port === config.vllmPort) || null;
+              const _sglPrimaryInst = {
+                port: config.vllmPort,
+                gpu: _sglSelf ? _sglSelf.gpu : null, model: _sgModel,
+                running: sg.running || 0, queued: sg.queued || 0,
+                active_requests: sg.active_requests || [], waiting_requests: [],
+                last_second: sg.last_second || null, kv: sg.kv_cache,
+                primary: true,
+                runtime: 'sglang',
+                gen_speed_1s: (genSpeed1s !== undefined && genSpeed1s >= 0) ? genSpeed1s : 0,
+              };
+              let _sglInstList = [_sglPrimaryInst];
+              try {
+                const _allVllm = listVllmInstances();
+                for (const _vi of _allVllm.filter(i => i.port !== config.vllmPort)) {
+                  const _vres = await fetchInstanceConcurrency(_vi);
+                  if (_vres) _sglInstList.push(_vres);
+                }
+                // tg TPS = 全实例（全部 GPU）生成吞吐总和
+                let _allGenSpeed = 0;
+                for (const _i of _sglInstList) _allGenSpeed += (_i.gen_speed_1s || 0);
+                if (_allGenSpeed > 0) sg.bench_tg_tps = parseFloat(_allGenSpeed.toFixed(1));
+                // 09-01 修复：SGLang 主实例下 SGLang 从实例从未聚合（如 8000/GPU0 的 DFLASH 实例）→
+                // 该卡整组（并发请求/模型信息）从仪表盘消失。与 vLLM 主分支对称补聚合。
+                for (const _sgi of listSglangInstances().filter(i => i.port !== config.vllmPort)) {
+                  const _sres = await fetchSglangInstanceConcurrency(_sgi);
+                  if (_sres) _sglInstList.push(_sres);
+                }
+                _sglInstList.sort((a, b) =>
+                  (((a.gpu == null) ? 999 : a.gpu) - ((b.gpu == null) ? 999 : b.gpu)) || (a.port - b.port));
+              } catch (e) { /* 从实例聚合失败不影响主实例 */ }
+              sg.instances = _sglInstList;
+              rememberPortGpu(_sglInstList); // 最近请求表 GPU 归因回溯
+            }
+            sg.cache_per_port = perPortCacheStats();
+            // 0命中占比（vLLM+SGLang 双源，09-01 修复：此前仅 vLLM 分支调用，SGLang 主实例下恒缺失）
+            try { const _zh = zeroHitStats(); if (_zh) sg.zero_hit = _zh; } catch (e) {}
+            try {
+              sg.sglang_theory = {};
+              for (const _ti of listSglangInstances()) { const _tt = readSglangTheory(_ti.port); if (_tt) sg.sglang_theory[_ti.port] = _tt; }
+            } catch (e) {}
+            try { if (res && !res.headersSent) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(sg)); } } catch (e) {}
+            return;
+          }
+          // Build model label dynamically from metrics
+          // Derive model labels dynamically
+          const mlGen = 'vllm:generation_tokens_total' + buildModelLabelFromMetrics(m, 'vllm:generation_tokens_total{');
+          const mlPrompt = 'vllm:prompt_tokens_total' + buildModelLabelFromMetrics(m, 'vllm:prompt_tokens_total{');
+          const mlCachePct = 'vllm:kv_cache_usage_perc' + buildModelLabelFromMetrics(m, 'vllm:kv_cache_usage_perc{');
+          const mlRunning = 'vllm:num_requests_running' + buildModelLabelFromMetrics(m, 'vllm:num_requests_running{');
+          const mlReqGen = 'vllm:request_generation_tokens_count' + buildModelLabelFromMetrics(m, 'vllm:request_generation_tokens_count{');
+          // For metrics with _count/_sum suffixes, extract label from _count key
+          // and use it for both _count and _sum lookups
+          const mlTTFT = 'vllm:time_to_first_token_seconds_count' + buildModelLabelFromMetrics(m, 'vllm:time_to_first_token_seconds_count{');
+          const mlTpot = 'vllm:request_time_per_output_token_seconds_count' + buildModelLabelFromMetrics(m, 'vllm:request_time_per_output_token_seconds_count{');
+          const mlReqDecode = 'vllm:request_decode_time_seconds_count' + buildModelLabelFromMetrics(m, 'vllm:request_decode_time_seconds_count{');
+          const mlReqPrompt = 'vllm:request_prompt_tokens' + buildModelLabelFromMetrics(m, 'vllm:request_prompt_tokens{');
+          const mlReqPrefill = 'vllm:request_prefill_time_seconds_count' + buildModelLabelFromMetrics(m, 'vllm:request_prefill_time_seconds_count{');
+
+          // For prompt_tokens_by_source_total, find each source separately
+          // parseMetrics keys are: vllm:prompt_tokens_by_source_total|{"engine":"0","model_name":"foo","source":"bar"}
+          let mlCachePrefix = '';
+          for (const k of Object.keys(m)) {
+            if (k.startsWith('vllm:prompt_tokens_by_source_total|')) {
+              mlCachePrefix = k.substring(0, k.indexOf('"source"'));
+              break;
+            }
+          }
+          const mlCacheHit = mlCachePrefix ? mlCachePrefix + '"source":"local_cache_hit"}' : '';
+          const mlCacheLocal = mlCachePrefix ? mlCachePrefix + '"source":"local_compute"}' : '';
+
+          const genTokensTotal = Math.round(m[mlGen] || 0);
+          const kvUsage = m[mlCachePct] || 0;
+
+          // ====== KV Cache 池容量（主实例，与从实例同口径 buildKvCacheInfo）======
+          const kvCache = buildKvCacheInfo(m);
+
+          const result = {
+            cache_blocks: {
+              used: Math.round(kvUsage * 100),
+              total_blocks: kvCache.num_gpu_blocks || 100,
+            },
+            kv_cache: kvCache,
+            num_running_seqs: 0,
+            num_queue_seqs: 0,
+            num_prompt_tokens: 0,
+            num_generation_tokens: 0,
+            total_completed_requests: 0,
+            total_generated_tokens_all_time: 0,
+            avg_tokens_per_request: 0,
+            avg_prefill_tokens_per_request: 0,
+            avg_decode_time_seconds: 0,
+            avg_speed_per_request: 0,
+            avg_prefill_time_seconds: 0,
+            active_requests: [],
+            total_speed: 0,
+          };
+
+          // Fetch previous snapshot for delta calculation
+          // 09-06 性能修复：原实现每次 stats 请求都 readFileSync+writeFileSync（同步 I/O 阻塞事件循环），
+          // 前端 0.5s 轮询 → 每秒 2 次同步磁盘读写。改为内存缓存 + 5s 节流落盘。
+          if (!global.__metricsSnapshot) global.__metricsSnapshot = { data: null, dirty: false, lastSave: 0 };
+          const snapStore = global.__metricsSnapshot;
+          let lastSnapshot = snapStore.data;
+          if (!lastSnapshot) {
+            lastSnapshot = { offsetTokens: 0, offsetInput: 0, offsetCached: 0, offsetUncached: 0, offsetReqCount: 0, lastRunning: 0, perReqTokens: {}, time: 0 };
+            try {
+              const snap = fs.readFileSync(path.join(__dirname, 'metrics-snapshot.json'), 'utf8');
+              lastSnapshot = JSON.parse(snap);
+            } catch (e) {}
+          } else {
+            // Validate that saved offsets match current model's metric labels
+            const needsReset =
+              (lastSnapshot.offsetInput > 0 && lastSnapshot.offsetInput > (m[mlPrompt] || 0) * 2 + 1000000) ||
+              (lastSnapshot.offsetCached > 0 && lastSnapshot.offsetCached > (m[mlPrompt] || 0) * 2) ||
+              (lastSnapshot.offsetTokens > 0 && lastSnapshot.offsetTokens > genTokensTotal * 2 + 1000);
+            if (needsReset) {
+              lastSnapshot.offsetTokens = genTokensTotal;
+              lastSnapshot.offsetInput = Math.round(m[mlPrompt] || 0);
+              lastSnapshot.offsetCached = Math.round(m[mlCacheHit] || 0);
+              lastSnapshot.offsetUncached = Math.round(m[mlCacheLocal] || 0);
+              lastSnapshot.offsetReqCount = Math.round(m[mlReqGen] || 0);
+              lastSnapshot.perReqTokens = {};
+              lastSnapshot.time = Date.now();
+              lastSnapshot.reset = null;
+            }
+          }
+
+          // Reset baseline: display shows values since last "reset stats".
+          // Re-capture when missing (first run) or when the model switched (new label)
+          const lbl = detectModelLabels(m);
+          const genKey = 'vllm:generation_tokens_total' + lbl.modelLabel;
+          if (!lastSnapshot.reset || typeof lastSnapshot.reset !== 'object' || lastSnapshot.reset[genKey] === undefined) {
+            lastSnapshot.reset = captureResetBlock(m, lbl.modelLabel, lbl.sourceLabel);
+          }
+          const mj = applyResetView(m, lastSnapshot.reset);
+
+          const elapsedMs = Date.now() - lastSnapshot.time;
+          const rawGenTokensBefore = lastSnapshot.offsetTokens || genTokensTotal;
+
+          // ====== 多卡多实例：探测全部 vllm serve 实例（port/pid/gpu/model）======
+          // 主实例 = config.vllmPort（端口自愈跟随的那个）；其余为从实例。
+          const vllmInstances = listVllmInstances();
+          const primaryInst = vllmInstances.find(i => i.port === config.vllmPort)
+            || { port: config.vllmPort, pid: null, gpu: null, modelPath: '', servedName: '' };
+
+          // vLLM 插件实时回传的每请求预填充进度（无文件/未打补丁时为 null）。
+          // 多实例共用同一 jsonl：按主实例 pid 选 sid，避免匹配被从实例抢走。
+          const livePrefill = readLivePrefill(primaryInst.pid);
+
+          const concurrency = computeConcurrencyDetails(
+            mj,
+            genTokensTotal,
+            rawGenTokensBefore,
+            elapsedMs,
+            lastSnapshot.lastRunning || 0,
+            lastSnapshot.perReqTokens || {},
+            livePrefill,
+            primaryInst.port,
+            global.__tokTicker
+          );
+          const curRunning = Math.round(m[mlRunning] || 0);
+          lastSnapshot.lastRunning = curRunning;
+          lastSnapshot.offsetTokens = genTokensTotal;
+          if (concurrency._perReqTokens) {
+            lastSnapshot.perReqTokens = concurrency._perReqTokens;
+          }
+          lastSnapshot.time = Date.now();
+          // Persist snapshot so the NEXT poll can compute a real delta
+          // (without this the file never exists → delta is always 0 → total_speed always 0)
+          // 09-06：内存缓存 + 5s 节流落盘（原实现每次请求都 writeFileSync 阻塞事件循环）
+          snapStore.data = lastSnapshot;
+          const _nowMs = Date.now();
+          if (_nowMs - snapStore.lastSave > 5000) {
+            snapStore.lastSave = _nowMs;
+            try { fs.writeFileSync(path.join(__dirname, 'metrics-snapshot.json'), JSON.stringify(lastSnapshot)); } catch (e) {}
+          }
+          Object.assign(result, concurrency);
+          delete result._perReqTokens;
+          // Remove debug
+          delete result._debug;
+          // True measured "last 1 second" numbers (server-side 1s ticker)
+          result.last_second = global.__tokTicker ? global.__tokTicker.lastSecond : { tokens: 0, speed: 0, running: 0, at: 0 };
+          result.energy = buildEnergyInfo(); // 能耗/电费（1 秒级功耗积分，持久化）
+
+          // ====== Token Counts (since last reset) ======
+          const totalInputRaw = Math.round(mj[mlPrompt] || 0);
+          const cachedRaw = Math.round(mj[mlCacheHit] || 0);
+          const uncachedRaw = Math.round(mj[mlCacheLocal] || 0);
+          result.total_input_tokens = totalInputRaw;
+          result.total_output_tokens = Math.round(mj[mlGen] || 0);
+          result.cached_input_tokens = cachedRaw;
+          result.uncached_input_tokens = uncachedRaw;
+
+          // Cache hit rate: cached / total * 100
+          const totalInput = cachedRaw + uncachedRaw;
+          result.cache_hit_rate = totalInput > 0 ? (cachedRaw / totalInput * 100).toFixed(1) : 0;
+
+          // 0命中占比：近 1h 完成请求中 cached_tokens==0 的占比（request-traces 真值，20s 缓存）
+          const zh = zeroHitStats();
+          if (zh) result.zero_hit = zh;
+
+          // 每 GPU 累计缓存命中率（各实例 ticker 累计计数器，独立于重置基线）
+          result.cache_per_port = perPortCacheStats();
+
+          // ====== Performance Benchmark Metrics (since last reset) ======
+          // pp TPS：优先用 ticker 每秒实测的「未缓存预填充吞吐」（vLLM 每迭代
+          // 递增 prompt_tokens_by_source local_compute，增量即真实发生的预填充
+          // 计算量，缓存命中不计入）—— 实时精确，随负载即时变化。
+          // 无 ticker 数据时回落累计平均：uncached_prompt_tokens / avg_prefill_time
+          const tickerPP = (global.__tokTicker && global.__tokTicker.lastSecond && global.__tokTicker.lastSecond.uncachedPPS) || 0;
+          const uncachedPP_TPS = (concurrency.avg_prefill_time_seconds > 0 && result.uncached_input_tokens > 0)
+            ? (concurrency.avg_prefill_tokens_per_request / concurrency.avg_prefill_time_seconds)
+            : 0;
+          result.bench_pp_tps = tickerPP > 0
+            ? parseFloat(Math.min(tickerPP, 50000).toFixed(1))
+            : parseFloat(Math.min(uncachedPP_TPS, 10000).toFixed(1));
+          // 诊断/透明：实时 prefill 数据源状态（sid 变化=vLLM 重启；byRid 为
+          // 引擎记录的请求数；matched 为本次匹配成功的行数）
+          result.live_prefill = {
+            sid: livePrefill && livePrefill.sid,
+            by_rid: livePrefill && livePrefill.byRid ? livePrefill.byRid.size : 0,
+            updated_at: livePrefill && livePrefill.updatedAt,
+            matched: (concurrency.active_requests || []).filter(r => r.prefill_exact).length,
+          };
+
+          // TTFT: _count and _sum share the same model label
+          const ttftCountKey = mlTTFT; // already includes _count suffix
+          const ttftSumKey = mlTTFT.replace('_count|', '_sum|');
+          const ttftCount = mj[ttftCountKey] || 0;
+          const ttftSum = mj[ttftSumKey] || 0;
+          result.avg_ttft_ms = ttftCount > 0 ? (ttftSum / ttftCount * 1000) : 0;
+
+          // TPOT
+          const tpotCountKey = mlTpot;
+          const tpotSumKey = mlTpot.replace('_count|', '_sum|');
+          const tpotCount = mj[tpotCountKey] || 0;
+          const tpotSum = mj[tpotSumKey] || 0;
+          result.avg_tpot_ms = tpotCount > 0 ? (tpotSum / tpotCount * 1000) : 0;
+
+          // Avg decode time
+          const decodeCountKey = mlReqDecode;
+          const decodeSumKey = mlReqDecode.replace('_count|', '_sum|');
+          const reqDecodeCount = mj[decodeCountKey] || 0;
+          const reqDecodeSum = mj[decodeSumKey] || 0;
+          const avgDecodeTime = reqDecodeCount > 0 ? (reqDecodeSum / reqDecodeCount) : 0;
+
+          // Avg prefill time
+          const prefillCountKey = mlReqPrefill;
+          const prefillSumKey = mlReqPrefill.replace('_count|', '_sum|');
+          const reqPrefillCount = mj[prefillCountKey] || 0;
+          const reqPrefillSum = mj[prefillSumKey] || 0;
+          const avgPrefillTime = reqPrefillCount > 0 ? (reqPrefillSum / reqPrefillCount) : 0;
+
+          // tg TPS：所有实例（全部 GPU）的 1s 生成吞吐总和（各端口 ticker 独立采样后累加，
+          // 多卡多实例 = 全局总生成速度）。主分支此处先算一个初值（仅主实例），
+          // instances 聚合完成后用全实例总和覆盖（见下方 result.bench_tg_tps = _allGenSpeed）。
+          result.bench_tg_tps = parseFloat((result.last_second && result.last_second.speed) || 0);
+
+          // E2E latency: avg_prefill_time + avg_tokens_per_request * avg_decode_time / avg_tokens_per_request = avg_prefill_time + avg_decode_time
+          // Simplified: e2e ≈ avg_prefill_time + avg_tokens_per_request * tpot
+          const avgTPOT_seconds = tpotCount > 0 ? (tpotSum / tpotCount) : 0;
+          const e2e_ms = concurrency.avg_prefill_time_seconds * 1000 + concurrency.avg_tokens_per_request * avgTPOT_seconds;
+          result.bench_e2e_ms = parseFloat(e2e_ms.toFixed(0));
+
+          // Throughput: pp_tps + tg_tps (combined)
+          result.bench_throughput = parseFloat((result.bench_pp_tps + (result.bench_tg_tps || 0)).toFixed(1));
+
+          // GPU memory: use model size estimate (~2x params for FP16 weights + KV cache + overhead)
+          // qwen3.6-35b is ~35B params, FP8 uses ~0.5 bytes/param = ~17GB weights
+          // + KV cache + activation overhead ≈ 25-30GB total
+          const modelParams = 35; // 35B
+          const memGB = parseFloat((modelParams * 0.5 + 10).toFixed(2)); // weights + KV cache overhead
+          result.bench_peak_mem_gb = memGB;
+
+          // ====== MTP Hit Rate (推测解码命中率: accepted / drafted) ======
+          // CRITICAL: must read the cumulative counters (..._total), NOT the
+          // prometheus "..._created" gauge. The _created value is the metric's
+          // creation TIMESTAMP (epoch seconds); both are created in the same
+          // millisecond, so accepted/drafted ≈ 1.0 → a constant, meaningless
+          // 100%. This matches vLLM's own draft_acceptance_rate =
+          // num_accepted_tokens / num_draft_tokens (see SpecDecodingLogging.log).
+          {
+            let specLabel = '';
+            for (const k of Object.keys(m)) {
+              if (k.startsWith('vllm:spec_decode_num_draft_tokens_total|')) {
+                specLabel = k.substring(k.indexOf('|'));
+                break;
+              }
+            }
+            if (specLabel) {
+              const drafted  = Math.round(m['vllm:spec_decode_num_draft_tokens_total' + specLabel] || 0);
+              const accepted = Math.round(m['vllm:spec_decode_num_accepted_tokens_total' + specLabel] || 0);
+              const drafts   = Math.round(m['vllm:spec_decode_num_drafts_total' + specLabel] || 0);
+              if (drafted > 0) {
+                // Per-token acceptance rate (primary "MTP 命中率"), vLLM convention
+                result.mtp_hit_rate = parseFloat((accepted / drafted * 100).toFixed(1));
+                result.mtp_draft_tokens = drafted;
+                result.mtp_accepted_tokens = accepted;
+                // Mean accepted tokens per draft step (incl. the bonus token)
+                result.mtp_accept_len = drafts > 0 ? parseFloat((1 + accepted / drafts).toFixed(2)) : 0;
+                // Per-position acceptance rates (accepted_at_pos / num_drafts)
+                const posRates = [];
+                for (let p = 0; p < 16; p++) {
+                  const pk = 'vllm:spec_decode_num_accepted_tokens_per_pos_total' + specLabel.replace(/}\s*$/, '') + ',"position":"' + p + '"}';
+                  const pv = m[pk];
+                  if (pv === undefined) break;
+                  posRates.push(drafts > 0 ? parseFloat((pv / drafts * 100).toFixed(1)) : 0);
+                }
+                if (posRates.length) result.mtp_pos_rates = posRates;
+              }
+            }
+          }
+
+
+          // ====== Concurrency simulation ======
+          const running = concurrency.running || 0;
+          const tgTPS = result.bench_tg_tps || 0;
+          const basePP_TPS = result.bench_pp_tps || 0;
+          const baseTTFT = result.avg_ttft_ms || 0;
+          const baseE2E = e2e_ms || 0;
+
+          // ====== Real-time billing (持久化累加：重启不丢、不受重置统计影响) ======
+          {
+            const st = accumulateBilling({ cached: m[mlCacheHit] || 0, uncached: m[mlCacheLocal] || 0, gen: m[mlGen] || 0 });
+            const b = computeBilling(result, getCurrentVllmModel()); // 保留单价/币种/模型匹配等元信息
+            const totalOf = (bk) => (bk.cost.cached_input || 0) + (bk.cost.uncached_input || 0) + (bk.cost.output || 0);
+            b.current = { cost: { ...st.current.cost, total: totalOf(st.current) }, tokens: st.current.tokens };
+            b.history = { cost: { ...st.history.cost, total: totalOf(st.history) }, tokens: st.history.tokens };
+            b.days = buildBillingDays(st); // 每日费用明细（持久化，可手动删除）
+            result.billing = b;
+          }
+
+          // Per-request live token streams (requests routed through this console)
+          result.live_streams = liveStreamsSnapshot();
+
+          // ====== 多卡多实例：聚合从实例并发，全部行打 GPU 标签 ======
+          // result.active_requests = 主实例行（打 port/gpu/model）；
+          // result.instances = 每实例明细 [{port, gpu, model, running, queued,
+          //   active_requests, last_second, primary}]，前端按卡分组显示。
+          try {
+            for (const r of (result.active_requests || [])) {
+              r.port = primaryInst.port;
+              r.gpu = primaryInst.gpu;
+              r.gpus = (primaryInst.gpus && primaryInst.gpus.length) ? primaryInst.gpus.slice() : (primaryInst.gpu != null ? [primaryInst.gpu] : null);
+              r.model = primaryInst.servedName || primaryInst.modelPath || '';
+            }
+            const instList = [{
+              port: primaryInst.port,
+              gpu: primaryInst.gpu,
+              gpus: primaryInst.gpus || (primaryInst.gpu != null ? [primaryInst.gpu] : []),
+              world_size: primaryInst.worldSize || 1,
+              model: primaryInst.servedName || primaryInst.modelPath || '',
+              running: result.running || 0,
+              queued: result.queued || 0,
+              active_requests: result.active_requests || [],
+              waiting_requests: result.waiting_requests || [],
+              last_second: result.last_second || null,
+              kv: kvCache,
+              primary: true,
+              gen_speed_1s: (result.last_second && result.last_second.speed) || 0,
+            }];
+            const otherInsts = vllmInstances.filter(i => i.port !== primaryInst.port);
+            if (otherInsts.length) {
+              const secResults = await Promise.all(otherInsts.map(inst => fetchInstanceConcurrency(inst)));
+              for (const s of secResults) if (s) instList.push(s);
+            }
+            // 08-30 跨运行时聚合：SGLang 实例（如 GPU1 的 sglang serve）也进并发卡片，
+            // 与 listVllmInstances 的 GPU 分组口径一致（否则 sglang 独占的卡整组消失）
+            try {
+              for (const sgi of listSglangInstances()) {
+                if (sgi.port === primaryInst.port) continue;
+                const sres = await fetchSglangInstanceConcurrency(sgi);
+                if (sres) instList.push(sres);
+              }
+            } catch (e) { /* 跨运行时聚合失败不影响主实例 */ }
+            // 按 GPU 号排序（未知排最后），再按端口，显示顺序稳定
+            instList.sort((a, b) =>
+              (((a.gpu == null) ? 999 : a.gpu) - ((b.gpu == null) ? 999 : b.gpu)) || (a.port - b.port));
+            result.instances = instList;
+            // tg TPS = 全实例（全部 GPU）1s 生成吞吐总和
+            let _allGenSpeed = 0;
+            for (const _i of instList) _allGenSpeed += (_i.gen_speed_1s || 0);
+            if (_allGenSpeed > 0) result.bench_tg_tps = parseFloat(_allGenSpeed.toFixed(1));
+            rememberPortGpu(instList); // 最近请求表 GPU 归因回溯
+          } catch (e) { /* 多实例聚合失败不影响主实例统计 */ }
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        } catch (e) {
+          console.error('Stats error:', e.message, e.stack);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({}));
+        }
+    }).catch(() => {
+      // 上游不可达/超时：返回空对象（与原行为一致；vLLM 挂起时不悬挂）
+      try { if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({})); } catch (e) {}
+    });
+    return;
+  }
+
+  // === Internal API: Billing reset (新费用/历史总费用 独立重置，与重置统计无关) ===
+  if (pathname === '/v1/internal/billing/reset' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); if (body.length > 1e4) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body || '{}');
+        const scope = data.scope === 'history' ? 'history' : 'current';
+        const st = resetBillingBucket(scope);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, scope, state: st }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // === Internal API: Power (各电子元件 + 进程级实时功耗，Scaphandre 式归因) ===
+  if (pathname === '/v1/internal/power') {
+    let gpu = { name: null, powerW: null, limitW: null, utilization: null, memUsedMiB: null, cardCount: 0 };
+    try {
+      const out = require('child_process').execSync(
+        'nvidia-smi --query-gpu=name,power.draw,power.limit,utilization.gpu,memory.used --format=csv,noheader',
+        { encoding: 'utf8', timeout: 5000 }
+      ).trim();
+      // 多卡求和：功率/上限/显存累加，利用率取最大值（单卡机行为不变）
+      const lines = out ? out.split('\n').filter(l => l.trim()) : [];
+      if (lines.length) {
+        let power = 0, limit = 0, mem = 0, utilMax = 0, name = null;
+        for (const l of lines) {
+          const p = l.split(',').map(s => s.trim());
+          name = p[0] || name;
+          power += parseFloat(p[1]) || 0;
+          limit += parseFloat(p[2]) || 0;
+          mem += parseInt(p[4], 10) || 0;
+          const u = parseInt(p[3], 10) || 0;
+          if (u > utilMax) utilMax = u;
+        }
+        gpu = {
+          name,
+          powerW: Math.round(power * 10) / 10,
+          limitW: Math.round(limit * 10) / 10,
+          utilization: utilMax,
+          memUsedMiB: mem,
+          cardCount: lines.length,
+        };
+      }
+    } catch (e) {}
+    // 进程级功耗：CPU 活跃功率按 CPU 时间增量比例归因，GPU 功率按显存占用比例归因
+    const HZ = 100;
+    const snapTs = lastProcSnap ? lastProcSnap.ts : 0;
+    const dtSec = lastProcSnap && lastProcDeltas ? Math.max(0.1, (Date.now() - snapTs) / 1000) : 2;
+    const deltas = lastProcDeltas || {};
+    const totalDelta = Object.values(deltas).reduce((s, d) => s + d, 0);
+    const activeCpuW = lastActiveCpuW;
+    // 本轮活跃的进程 ∪ 有累计能耗的进程（瞬时空闲的进程也保留显示）
+    const pidsToShow = new Set(Object.keys(deltas));
+    for (const pid of procEnergyJ.keys()) {
+      if ((procEnergyJ.get(pid) || 0) >= 50) pidsToShow.add(String(pid));
+    }
+    const procList = [];
+    for (const pid of pidsToShow) {
+      const pidN = parseInt(pid, 10);
+      const name = (lastProcSnap && lastProcSnap.pids && lastProcSnap.pids[pid] && lastProcSnap.pids[pid].name) || '?';
+      const d = deltas[pid] || 0;
+      const cpuW = (totalDelta > 0 && activeCpuW !== null) ? activeCpuW * (d / totalDelta) : 0;
+      const cpuPct = d > 0 ? Math.round(((d / HZ) / dtSec / CPU_CORES) * 1000) / 10 : 0;
+      const gp = gpuProcs.find(g => g.pid === pidN);
+      const gpuMemSum = gpuProcs.reduce((s, g) => s + g.memMiB, 0);
+      const gpuW = (gp && gpu.powerW !== null) ? gpu.powerW * (gpuMemSum > 0 ? gp.memMiB / gpuMemSum : 1) : 0;
+      const totalW = Math.round((cpuW + gpuW) * 10) / 10;
+      if (totalW < 0.1 && (procEnergyJ.get(pidN) || 0) < 50) continue;
+      procList.push({
+        pid: pidN,
+        name,
+        cpuPct,
+        cpuW: Math.round(cpuW * 10) / 10,
+        gpuW: Math.round(gpuW * 10) / 10,
+        totalW,
+        gpuMemMiB: gp ? gp.memMiB : 0,
+        energyWh: Math.round(((procEnergyJ.get(pidN) || 0) / 3600) * 1000) / 1000,
+      });
+    }
+    procList.sort((a, b) => b.totalW - a.totalW || b.energyWh - a.energyWh);
+    const procs = procList.slice(0, 10);
+    const comps = [
+      {
+        id: 'gpu',
+        name: 'GPU · ' + (gpu.name || 'NVIDIA'),
+        measured: gpu.powerW !== null,
+        powerW: gpu.powerW,
+        limitW: gpu.limitW,
+        extra: [gpu.cardCount > 1 ? gpu.cardCount + ' 卡合计' : null,
+                gpu.utilization !== null ? '利用率 ' + gpu.utilization + '%' : null,
+                gpu.memUsedMiB ? '显存 ' + gpu.memUsedMiB + ' MiB' : null].filter(Boolean).join(' · '),
+      },
+      { id: 'cpu', name: 'CPU · ' + CPU_MODEL, measured: cpuPowerW !== null, powerW: cpuPowerW,
+        extra: [cpuUtilPct !== null ? '利用率 ' + cpuUtilPct + '%' : null, CPU_CORES + ' 核',
+                cpuIdleBaselineW !== null ? '空闲基线 ~' + Math.round(cpuIdleBaselineW * 10) / 10 + ' W' : null]
+          .filter(Boolean).join(' · ') + ' · RAPL 实时采样' },
+      { id: 'nvme', name: 'NVMe SSD', measured: false, powerW: null, note: '硬件未暴露功耗传感器' },
+      { id: 'wifi', name: 'Wi-Fi 模块', measured: false, powerW: null, note: '硬件未暴露功耗传感器' },
+      { id: 'platform', name: '主板 / 电源等其它', measured: false, powerW: null, note: '本机无 IPMI，整机功耗无法直接测量' },
+    ];
+    const meas = comps.filter(c => c.measured && c.powerW !== null);
+    const totalW = Math.round(meas.reduce((s, c) => s + c.powerW, 0) * 10) / 10;
+    const offsetW = loadPowerConfig().offsetW;
+    const adjustedTotalW = Math.round((totalW + offsetW) * 10) / 10;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ time: Date.now(), totalW, offsetW, adjustedTotalW, measuredCount: meas.length, components: comps,
+      cpu: { utilization: cpuUtilPct, cores: CPU_CORES, powerW: cpuPowerW, idleBaselineW: cpuIdleBaselineW !== null ? Math.round(cpuIdleBaselineW * 10) / 10 : null, activeW: activeCpuW !== null ? Math.round(activeCpuW * 10) / 10 : null },
+      gpu: { powerW: gpu.powerW, limitW: gpu.limitW, utilization: gpu.utilization, memUsedMiB: gpu.memUsedMiB, name: gpu.name },
+      processes: procs,
+      procEnergyTotalWh: Math.round((Array.from(procEnergyJ.values()).reduce((s, v) => s + v, 0) / 3600) * 1000) / 1000,
+    }));
+    return;
+  }
+  if (pathname === '/v1/internal/power/offset' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); if (body.length > 1e4) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body || '{}');
+        const offsetW = parseFloat(data.offsetW);
+        if (isNaN(offsetW) || offsetW < 0 || offsetW > 1000) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: '补偿值需为 0-1000 之间的数字（瓦特）' }));
+          return;
+        }
+        savePowerConfig({ offsetW: Math.round(offsetW * 10) / 10 });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, offsetW: Math.round(offsetW * 10) / 10 }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // === Internal API: Energy (能耗/电费：单价设置 + 重置) ===
+  if (pathname === '/v1/internal/energy' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(buildEnergyInfo()));
+    return;
+  }
+  if (pathname === '/v1/internal/energy' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); if (body.length > 1e4) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body || '{}');
+        const price = parseFloat(data.price_per_kwh);
+        if (isNaN(price) || price < 0 || price > 100) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: '电价需为 0-100 之间的数字（元/kWh）' }));
+          return;
+        }
+        const cfg = { price_per_kwh: price, unit: data.unit ? String(data.unit) : (loadEnergyConfig().unit || '元') };
+        saveEnergyConfig(cfg);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, ...buildEnergyInfo() }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+  if (pathname === '/v1/internal/energy/reset' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); if (body.length > 1e4) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body || '{}');
+        const scope = data.scope === 'history' ? 'history' : 'current';
+        resetEnergyBucket(scope);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, scope, energy: buildEnergyInfo() }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // === Internal API: Billing days delete (手动删除每日费用明细) ===
+  if (pathname === '/v1/internal/billing/days/delete' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); if (body.length > 1e4) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body || '{}');
+        const st = loadBillingState();
+        let deleted = null;
+        if (data.all === true) {
+          st.days = {};
+          deleted = 'all';
+        } else if (/^\d{4}-\d{2}-\d{2}$/.test(data.date || '')) {
+          if (st.days[data.date]) { delete st.days[data.date]; deleted = data.date; }
+        } else {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: '参数错误：需要 {date: "YYYY-MM-DD"} 或 {all: true}' }));
+          return;
+        }
+        saveBillingState(st);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, deleted, days: buildBillingDays(st) }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // === Internal API: Billing config (手动设置计费单价) ===
+  if (pathname === '/v1/internal/billing') {
+    if (req.method === 'GET') {
+      const cfg = loadBillingConfig();
+      cfg.current_model = getCurrentVllmModel();
+      // 合并服务器上实际存在的模型目录（/home/ll/models 下带 config.json 的目录）：
+      // 保证计费弹窗能对每个模型设置单价，新加的模型目录也会自动出现。
+      // 只合并到本次响应、不落盘 —— 未定价模型不会污染 billing-config.json；
+      // 用户在弹窗里保存时，后端会按提交的模型逐个持久化。
+      discoverModels((models) => {
+        const cfgModels = cfg.models || {};
+        for (const m of models) {
+          if (cfgModels[m.name]) continue; // 已有配置（含手动保存过的）以配置为准
+          cfgModels[m.name] = { name: m.name, enabled: true, auto: true, pricing: {} };
+        }
+        cfg.models = cfgModels;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(cfg));
+      });
+      return;
+    }
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => { body += chunk.toString(); if (body.length > 1e6) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const data = JSON.parse(body || '{}');
+          const cfg = loadBillingConfig();
+          if (data.currency !== undefined) cfg.currency = String(data.currency);
+          if (data.unit !== undefined) cfg.unit = String(data.unit);
+          let models = null;
+          if (data.models && typeof data.models === 'object') {
+            models = data.models;
+          } else if (data.pricing && typeof data.pricing === 'object') {
+            models = { [data.model || 'default']: { pricing: data.pricing } };
+          }
+          if (models) {
+            cfg.models = cfg.models || {};
+            for (const name of Object.keys(models)) {
+              const m = models[name];
+              if (!m || typeof m !== 'object') continue;
+              const cur = cfg.models[name] || { name: name };
+              if (m.name !== undefined) cur.name = String(m.name);
+              if (m.enabled !== undefined) cur.enabled = !!m.enabled;
+              cur.pricing = cur.pricing || {};
+              const p = m.pricing && typeof m.pricing === 'object' ? m.pricing : m;
+              for (const f of BILLING_PRICE_FIELDS) {
+                const v = parseFloat(p[f]);
+                if (!isNaN(v) && v >= 0) cur.pricing[f] = v;
+              }
+              cfg.models[name] = cur;
+            }
+          }
+          saveBillingConfig(cfg);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, config: cfg }));
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
+      });
+      return;
+    }
+    res.writeHead(405, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: false, error: 'Method not allowed' }));
+    return;
+  }
+
+  // === Internal API: Raw metrics ===
+  if (pathname === '/v1/internal/metrics') {
+    const rawReq = http.get(`${vllmBaseUrl}/metrics`, (proxyRes) => {
+      let data = '';
+      proxyRes.on('data', chunk => data += chunk);
+      proxyRes.on('error', () => {
+        try {
+          if (!res.headersSent) res.writeHead(502);
+          res.end('Error fetching metrics');
+        } catch (e) {}
+      });
+      proxyRes.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end(data);
+      });
+    }).on('error', () => {
+      if (!res.headersSent) res.writeHead(502);
+      res.end('Error fetching metrics');
+    });
+    rawReq.setTimeout(3000, () => rawReq.destroy(new Error('metrics timeout')));
+    return;
+  }
+
+  // === Internal API: Reset stats snapshot ===
+  if (pathname === '/v1/internal/reset-stats' && req.method === 'POST') {
+    const snapshotPath = path.join(__dirname, 'metrics-snapshot.json');
+    const resetReq = http.get(`${vllmBaseUrl}/metrics`, (proxyRes) => {
+      let data = '';
+      proxyRes.on('data', chunk => data += chunk);
+      proxyRes.on('error', () => {
+        try {
+          if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'error', message: 'Cannot reach vLLM metrics' }));
+        } catch (e) {}
+      });
+      proxyRes.on('end', () => {
+        try {
+          const m = parseMetrics(data);
+          const lbl = detectModelLabels(m);
+          const reset = captureResetBlock(m, lbl.modelLabel, lbl.sourceLabel);
+          const snap = {
+            offsetTokens: Math.round(m['vllm:generation_tokens_total' + lbl.modelLabel] || 0),
+            offsetInput: Math.round(m['vllm:prompt_tokens_total' + lbl.modelLabel] || 0),
+            offsetCached: Math.round(m['vllm:prompt_tokens_by_source_total' + lbl.sourceLabel + '"source":"local_cache_hit"}'] || 0),
+            offsetUncached: Math.round(m['vllm:prompt_tokens_by_source_total' + lbl.sourceLabel + '"source":"local_compute"}'] || 0),
+            offsetReqCount: Math.round(m['vllm:request_generation_tokens_count' + lbl.modelLabel] || 0),
+            lastRunning: 0,
+            perReqTokens: {},
+            time: Date.now(),
+            reset: reset,
+          };
+          fs.writeFileSync(snapshotPath, JSON.stringify(snap));
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'ok', message: 'Stats reset', baselineKeys: Object.keys(reset).length }));
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'error', message: e.message }));
+        }
+      });
+    }).on('error', () => {
+      if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'error', message: 'Cannot reach vLLM metrics' }));
+    });
+    resetReq.setTimeout(3000, () => resetReq.destroy(new Error('reset-stats timeout')));
+    return;
+  }
+
+  // === Management API: Server status ===
+  if (pathname === '/admin/api/server-status') {
+    const statusReq = http.get(`${vllmBaseUrl}/health`, (proxyRes) => {
+      proxyRes.on('error', () => {
+        try {
+          if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'disconnected', vllm_url: vllmBaseUrl }));
+        } catch (e) {}
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: proxyRes.statusCode === 200 ? 'connected' : 'disconnected',
+        vllm_url: vllmBaseUrl,
+      }));
+    }).on('error', () => {
+      if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'disconnected', vllm_url: vllmBaseUrl }));
+    });
+    statusReq.setTimeout(3000, () => statusReq.destroy(new Error('status timeout')));
+    return;
+  }
+
+  // === Internal API: CPU 详情（静态规格 + 各核实时利用率/频率/温度/负载/近 3 分钟走势）===
+  if (pathname === '/v1/internal/cpu') {
+    let st = null;
+    try { st = getCpuStatic(); } catch (e) { st = { supported: false, error: String(e && e.message || e) }; }
+    const live = global.__cpuLive || {};
+    const hist = (global.__cpuHistory || []).slice(-180); // 近 3 分钟
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(Object.assign({}, st, { live, history: hist })));
+    return;
+  }
+
+
+  // === Internal API: GPU 详情（硬件监视页 GPU 卡：PCIe 链路 x16 等 / 带宽占用 / 显存 / 温度 / 功耗 / 频率）===
+  if (pathname === '/v1/internal/gpu') {
+    let st = null;
+    try { st = getGpuStatic(); } catch (e) { st = { supported: false, error: String(e && e.message || e) }; }
+    const liveArr = (global.__gpuLive && global.__gpuLive.gpus) || [];
+    const liveMap = {};
+    for (const g of liveArr) liveMap[g.index] = g;
+    const pcieBy = (global.__gpuPcie && global.__gpuPcie.byIndex) || {};
+    const gpus = (st.gpus || []).map((s) => {
+      const g = Object.assign({}, s, liveMap[s.index] || {});
+      const p = pcieBy[s.index];
+      if (p) {
+        g.rx_mbs = p.rx_mbs; g.tx_mbs = p.tx_mbs;
+        // 理论带宽 = 每通道有效速率（按当前代数）× 当前宽度（MB/s）：Gen1=250、Gen2=500、Gen3≈985、Gen4≈1969、Gen5≈3938
+        const perLane = { 1: 250, 2: 500, 3: 985, 4: 1969, 5: 3938 }[g.gen_current] || null;
+        g.pcie_theo_mbs = (perLane != null && g.width_current) ? perLane * g.width_current : null;
+        g.rx_pct = (g.pcie_theo_mbs && p.rx_mbs != null) ? Math.min(100, Math.round(p.rx_mbs / g.pcie_theo_mbs * 1000) / 10) : null;
+        g.tx_pct = (g.pcie_theo_mbs && p.tx_mbs != null) ? Math.min(100, Math.round(p.tx_mbs / g.pcie_theo_mbs * 1000) / 10) : null;
+      }
+      return g;
+    });
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(Object.assign({}, st, {
+      gpus,
+      live_ts: (global.__gpuLive && global.__gpuLive.ts) || null,
+      pcie_ts: (global.__gpuPcie && global.__gpuPcie.ts) || null,
+      history: (global.__gpuPcieHistory || []).slice(-180), // ~1.2s/点 ≈ 3.6 分钟窗口，前端截近 3 分钟（150 点）
+    })));
+    return;
+  }
+
+  // === Internal API: 内存带宽（硬件监视页 RAM 带宽卡；perf uncore IMC CAS 计数，1s 采样）===
+  if (pathname === '/v1/internal/membw') {
+    const live = global.__membw || null;
+    const ageMs = live ? Date.now() - live.ts : null;
+    const fresh = !!(live && ageMs != null && ageMs < 8000);
+    const gb = (x) => Math.round(x / 1073741824 * 100) / 100;
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({
+      supported: fresh,
+      stale: !!live && !fresh,
+      proc_alive: !!global.__membwProc,
+      age_ms: ageMs,
+      peak_gbs_fallback: MEMBW_PEAK_FALLBACK,
+      peak_note: '4×DDR4-2400 理论峰值（BDW-EP 四通道）；前端优先用 dmidecode 理论带宽',
+      live: live ? {
+        ts: live.ts,
+        read_gbs: gb(live.read_bps), write_gbs: gb(live.write_bps),
+        total_gbs: gb(live.read_bps + live.write_bps),
+      } : null,
+      history: (global.__membwHistory || []).slice(-180), // ~1s/点 ≈ 3 分钟窗口
+    }));
+    return;
+  }
+
+  // === Internal API: PCIe 通道拓扑/占用（硬件监视页 PCIe 卡，60s 缓存）===
+  if (pathname === '/v1/internal/pcie-topo') {
+    let d = null;
+    try { d = getPcieTopo(); } catch (e) { d = { supported: false, groups: [], error: String((e && e.message) || e) }; }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(Object.assign({ ts: Date.now() }, d)));
+    return;
+  }
+
+  // === Internal API: 网络速度（/proc/net/dev 每秒采样，窗口增量算速率）===
+  // 采样器必须在 handler 之前启动（handler 末尾会 return，放在后面永不执行）
+  if (!global.__netSampler) {
+    global.__netSampler = setInterval(sampleNetDev, 1000);
+    if (global.__netSampler.unref) global.__netSampler.unref();
+    sampleNetDev();
+  }
+  if (pathname === '/v1/internal/net') {
+    let snap = { ts: new Date().toISOString(), interfaces: [], totals: {} };
+    try {
+      const net = buildNetSnapshot();
+      snap.interfaces = net.interfaces;
+      snap.totals = net.totals;
+    } catch (e) {
+      snap.error = String((e && e.message) || e);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(snap));
+    return;
+  }
+
+  // === Internal API: Storage（容量 / SMART 健康 / 实时读写速率 / 累计读写量）===
+  // 速率采样器必须在 handler 之前启动（handler 末尾会 return，放在后面永不执行）
+  if (!global.__diskSampler) {
+    global.__diskSampler = setInterval(sampleDiskStats, 1000);
+    if (global.__diskSampler.unref) global.__diskSampler.unref();
+    sampleDiskStats();
+  }
+  if (pathname === '/v1/internal/storage') {
+    let snap;
+    try {
+      snap = buildStorageSnapshot();
+    } catch (e) {
+      snap = { ts: new Date().toISOString(), error: String(e && e.message || e), disks: [], partitions: [], ioStats: {}, totals: {} };
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(snap));
+    return;
+  }
+
+  // === Internal API: 磁盘读写速度走势（纯内存历史，不调 lsblk/smartctl，可 2 秒轮询）===
+  if (pathname === '/v1/internal/disk-trend') {
+    let win = 180;
+    try { win = parseInt(urlObj.searchParams.get('win'), 10) || 180; } catch (e) {}
+    win = Math.min(1800, Math.max(30, win));
+    let body;
+    try {
+      const s = diskTrendSeries(win);
+      const labels = global.__diskLabels || [];
+      const names = labels.map((x) => x.name);
+      const live = {};
+      for (const n of names) {
+        const r = diskRateFor(n);
+        if (r) live[n] = { read_bps: r.read_bps, write_bps: r.write_bps, window_s: r.window_s };
+      }
+      body = {
+        ts: new Date().toISOString(), win_s: win,
+        sample_s: s.sample_s, raw_points: s.raw_points,
+        points: s.points, devices: labels, live,
+      };
+    } catch (e) {
+      body = { ts: new Date().toISOString(), win_s: win, points: [], devices: [], live: {}, error: String(e && e.message || e) };
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(body));
+    return;
+  }
+
+  // ---------- 存储采集辅助函数 ----------
+  function fmtBytes(v) {
+    const n = Number(v);
+    if (!isFinite(n)) return '--';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    let i = 0, x = Math.abs(n);
+    while (x >= 1024 && i < units.length - 1) { x /= 1024; i++; }
+    const s = i === 0 ? String(Math.round(x)) : (x >= 100 ? x.toFixed(0) : (x >= 10 ? x.toFixed(1) : x.toFixed(2)));
+    return (n < 0 ? '-' : '') + s + ' ' + units[i];
+  }
+  function fmtRate(v) { return v == null ? '--' : fmtBytes(v) + '/s'; }
+
+  // 设备类型：loop/snap、软 RAID/映射、整盘、分区
+  function diskDevKind(name) {
+    if (/^(loop|ram|zram)\d+$/.test(name)) return 'loop';
+    if (/^(dm-|md)\d+$/.test(name)) return 'virtual';
+    if (/^nvme\d+n\d+$/.test(name)) return 'disk';
+    if (/^nvme\d+n\d+p\d+$/.test(name)) return 'part';
+    if (/^(sd|vd|hd)[a-z]+$/.test(name)) return 'disk';
+    if (/^(sd|vd|hd)[a-z]+\d+$/.test(name)) return 'part';
+    return 'other';
+  }
+
+  // /proc/diskstats 全字段（顺序见内核 Documentation/admin-guide/iostats.rst）
+  function readDiskStatsRaw() {
+    const out = {};
+    try {
+      for (const line of fs.readFileSync('/proc/diskstats', 'utf8').split('\n')) {
+        const p = line.trim().split(/\s+/);
+        if (p.length < 14) continue;
+        const n = (i) => parseInt(p[i], 10) || 0;
+        out[p[2]] = {
+          reads: n(3), reads_merged: n(4), read_sectors: n(5), read_ms: n(6),
+          writes: n(7), writes_merged: n(8), write_sectors: n(9), write_ms: n(10),
+          in_flight: n(11), io_ms: n(12), weighted_io_ms: n(13),
+          discards: n(14), discard_sectors: n(16),
+          flushes: n(18), flush_ms: n(19),
+        };
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  // 每秒采样一次、保留最近 32 个样本；速率取「≥4 秒前的最新样本」为基线，
+  // 与前端 5s 轮询对齐，多个页面同时打开也能得到稳定读数。
+  // ---------- 网络速度采集辅助函数 ----------
+  // /proc/net/dev 全字段（每行：iface: rx_bytes rx_packets rx_errs rx_drop rx_fifo rx_frame rx_compressed rx_multicast tx_bytes ...）
+  function readNetDevRaw() {
+    const out = {};
+    try {
+      const lines = fs.readFileSync('/proc/net/dev', 'utf8').split('\n');
+      for (const line of lines) {
+        const idx = line.indexOf(':');
+        if (idx < 0) continue;
+        const name = line.slice(0, idx).trim();
+        const p = line.slice(idx + 1).trim().split(/\s+/).map((x) => parseInt(x, 10) || 0);
+        if (p.length < 16) continue;
+        out[name] = {
+          rx_bytes: p[0], rx_packets: p[1], rx_errs: p[2], rx_drop: p[3],
+          tx_bytes: p[8], tx_packets: p[9], tx_errs: p[10], tx_drop: p[11],
+        };
+      }
+    } catch (e) {}
+    return out;
+  }
+  function sampleNetDev() {
+    if (!global.__netSamples) global.__netSamples = [];
+    const arr = global.__netSamples;
+    const now = Date.now();
+    if (arr.length && now - arr[arr.length - 1].ts < 900) return;
+    arr.push({ ts: now, dev: readNetDevRaw() });
+    while (arr.length > 32) arr.shift();
+  }
+  // 窗口增量速率：找与当前样本间隔 >=4s 的最近基线（与磁盘口径一致）
+  function netRateFor(name) {
+    const arr = global.__netSamples || [];
+    if (arr.length < 2) return null;
+    const cur = arr[arr.length - 1];
+    let base = null;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (cur.ts - arr[i].ts >= 4000) { base = arr[i]; break; }
+    }
+    if (!base) base = arr[0];
+    const a = base.dev[name], b = cur.dev[name];
+    if (!a || !b) return null;
+    const dt = (cur.ts - base.ts) / 1000;
+    if (dt <= 0.5) return null;
+    const d = (x, y) => Math.max(0, y - x);
+    return {
+      window_s: Math.round(dt * 10) / 10,
+      rx_bps: Math.round(d(a.rx_bytes, b.rx_bytes) / dt),
+      tx_bps: Math.round(d(a.tx_bytes, b.tx_bytes) / dt),
+      rx_pps: Math.round(d(a.rx_packets, b.rx_packets) / dt),
+      tx_pps: Math.round(d(a.tx_packets, b.tx_packets) / dt),
+      rx_errs: d(a.rx_errs, b.rx_errs),
+      rx_drop: d(a.rx_drop, b.rx_drop),
+      tx_errs: d(a.tx_errs, b.tx_errs),
+      tx_drop: d(a.tx_drop, b.tx_drop),
+    };
+  }
+  // 网卡速率快照（供 /v1/internal/net 与 /v1/internal/storage.network 复用）
+  function buildNetSnapshot() {
+    const arr = global.__netSamples || [];
+    const cur = arr.length ? arr[arr.length - 1] : null;
+    const dev = cur ? cur.dev : readNetDevRaw();
+    let uptimeS = null;
+    try { uptimeS = Math.round(parseFloat(fs.readFileSync('/proc/uptime', 'utf8').split(' ')[0])); } catch (e) {}
+    const interfaces = [];
+    let tRx = 0, tTx = 0, tRxCum = 0, tTxCum = 0, tRxPkt = 0, tTxPkt = 0;
+    let tRxErr = 0, tTxDrop = 0;
+    let windowS = null;
+    for (const [name, s] of Object.entries(dev)) {
+      if (name === 'lo') continue;
+      const rate = netRateFor(name);
+      if (rate) windowS = windowS == null ? rate.window_s : Math.min(windowS, rate.window_s);
+      const rx_bps = rate ? rate.rx_bps : null;
+      const tx_bps = rate ? rate.tx_bps : null;
+      interfaces.push({
+        name,
+        // 实时速率（约 5 秒窗口均值）
+        rx_bps, tx_bps,
+        rx_pps: rate ? rate.rx_pps : null,
+        tx_pps: rate ? rate.tx_pps : null,
+        rx_rate_h: rate ? fmtRate(rate.rx_bps) : '--',
+        tx_rate_h: rate ? fmtRate(rate.tx_bps) : '--',
+        window_s: rate ? rate.window_s : null,
+        // 本次开机累计（/proc/net/dev，重启归零）
+        rx_bytes: s.rx_bytes, tx_bytes: s.tx_bytes,
+        rx_packets: s.rx_packets, tx_packets: s.tx_packets,
+        rx_cum_h: fmtBytes(s.rx_bytes), tx_cum_h: fmtBytes(s.tx_bytes),
+        // 窗口内错误/丢包增量
+        rx_errs_delta: rate ? rate.rx_errs : null,
+        rx_drop_delta: rate ? rate.rx_drop : null,
+        tx_errs_delta: rate ? rate.tx_errs : null,
+        tx_drop_delta: rate ? rate.tx_drop : null,
+      });
+      tRx += rx_bps || 0;
+      tTx += tx_bps || 0;
+      tRxCum += s.rx_bytes;
+      tTxCum += s.tx_bytes;
+      tRxPkt += s.rx_packets;
+      tTxPkt += s.tx_packets;
+      if (rate) { tRxErr += rate.rx_errs + rate.rx_drop; tTxDrop += rate.tx_errs + rate.tx_drop; }
+    }
+    interfaces.sort((a, b) => (b.rx_bps || 0) + (b.tx_bps || 0) - ((a.rx_bps || 0) + (a.tx_bps || 0)));
+    return {
+      ts: new Date().toISOString(),
+      interfaces,
+      totals: {
+        rx_bps: tRx, tx_bps: tTx,
+        rx_rate_h: fmtRate(tRx), tx_rate_h: fmtRate(tTx),
+        rx_bytes: tRxCum, tx_bytes: tTxCum,
+        rx_cum_h: fmtBytes(tRxCum), tx_cum_h: fmtBytes(tTxCum),
+        rx_packets: tRxPkt, tx_packets: tTxPkt,
+        window_s: windowS,
+        uptime_s: uptimeS,
+        iface_count: interfaces.length,
+        errs_drops_window: tRxErr + tTxDrop,
+      },
+    };
+  }
+
+  function sampleDiskStats() {
+    if (!global.__diskSamples) global.__diskSamples = [];
+    const arr = global.__diskSamples;
+    const now = Date.now();
+    if (arr.length && now - arr[arr.length - 1].ts < 900) return;
+    arr.push({ ts: now, dev: readDiskStatsRaw() });
+    while (arr.length > 32) arr.shift();
+    // 逐秒速率历史（磁盘读写速度走势，接口 /v1/internal/disk-trend）
+    try { appendDiskHistory(arr[arr.length - 2], arr[arr.length - 1]); } catch (e) {}
+  }
+  function diskRateFor(name) {
+    const arr = global.__diskSamples || [];
+    if (arr.length < 2) return null;
+    const cur = arr[arr.length - 1];
+    let base = null;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (cur.ts - arr[i].ts >= 4000) { base = arr[i]; break; }
+    }
+    if (!base) base = arr[0];
+    const a = base.dev[name], b = cur.dev[name];
+    if (!a || !b) return null;
+    const dt = (cur.ts - base.ts) / 1000;
+    if (dt <= 0.5) return null;
+    const d = (x, y) => Math.max(0, y - x);
+    const dReads = d(a.reads, b.reads), dWrites = d(a.writes, b.writes);
+    const dReadBytes = d(a.read_sectors, b.read_sectors) * 512;
+    const dWriteBytes = d(a.write_sectors, b.write_sectors) * 512;
+    const dIoMs = d(a.io_ms, b.io_ms), dWIoMs = d(a.weighted_io_ms, b.weighted_io_ms);
+    const r3 = (v) => Math.round(v * 1000) / 1000;
+    return {
+      window_s: Math.round(dt * 10) / 10,
+      read_bps: Math.round(dReadBytes / dt),
+      write_bps: Math.round(dWriteBytes / dt),
+      read_iops: r3(dReads / dt),
+      write_iops: r3(dWrites / dt),
+      busy_pct: Math.min(100, Math.round((dIoMs / (dt * 1000)) * 1000) / 10),
+      read_latency_ms: dReads > 0 ? r3(d(a.read_ms, b.read_ms) / dReads) : null,
+      write_latency_ms: dWrites > 0 ? r3(d(a.write_ms, b.write_ms) / dWrites) : null,
+      avg_queue: dIoMs > 0 ? r3(dWIoMs / dIoMs) : 0,
+    };
+  }
+
+  // ---- 磁盘读写速度历史（走势曲线，接口 /v1/internal/disk-trend）----
+  // 注意：本段与 sampleDiskStats 同在 request handler 作用域内，且 setInterval 捕获的是
+  // 首个请求的那份闭包——若那个请求在下方某条路由提前 return，handler 作用域里的
+  // const/let 会永远停在 TDZ（ReferenceError）。故这里只用函数声明 + 函数内字面量，
+  // 不在 handler 作用域放 const。
+  function appendDiskHistory(prev, cur) {
+    if (!prev || !cur || !prev.dev || !cur.dev) return;
+    const devRe = /^(nvme\d+n\d+|sd[a-z]+|vd[a-z]+|hd[a-z]+)$/; // 只算物理整盘：分区/dm/loop 与整盘重复计数
+    const KEEP = 1800;                                            // 1 秒/点 → 保留 30 分钟
+    const dt = (cur.ts - prev.ts) / 1000;
+    if (!(dt > 0.2 && dt < 5)) return; // 间隔异常（事件循环卡顿、计数器重置）不出点，避免假尖峰
+    const per = {};
+    let tr = 0, tw = 0;
+    for (const name of Object.keys(cur.dev)) {
+      if (!devRe.test(name)) continue;
+      const a = prev.dev[name], b = cur.dev[name];
+      if (!a || !b) continue;
+      const r = Math.max(0, b.read_sectors - a.read_sectors) * 512 / dt;
+      const w = Math.max(0, b.write_sectors - a.write_sectors) * 512 / dt;
+      per[name] = [Math.round(r), Math.round(w)];
+      tr += r; tw += w;
+    }
+    if (!Object.keys(per).length) return;
+    const H = global.__diskHistory || (global.__diskHistory = []);
+    H.push({ t: Math.round(cur.ts / 1000), r: Math.round(tr), w: Math.round(tw), d: per });
+    if (H.length > KEEP) H.splice(0, H.length - KEEP);
+  }
+  // 取窗口内走势并按桶抽稀到 ≤300 点（桶内均值）：30 分钟窗口也只有 300 点，响应不膨胀
+  function diskTrendSeries(winS) {
+    const H = global.__diskHistory || [];
+    const from = Math.round(Date.now() / 1000) - winS;
+    let i = 0;
+    while (i < H.length && H[i].t < from) i++;
+    const pts = H.slice(i);
+    const bucket = Math.max(1, Math.ceil(pts.length / 300));
+    const out = [];
+    for (let k = 0; k < pts.length; k += bucket) {
+      const seg = pts.slice(k, k + bucket);
+      if (!seg.length) continue;
+      const acc = { t: seg[seg.length - 1].t, r: 0, w: 0, d: {} };
+      for (const p of seg) {
+        acc.r += p.r; acc.w += p.w;
+        for (const n of Object.keys(p.d)) {
+          const a = acc.d[n] || (acc.d[n] = [0, 0]);
+          a[0] += p.d[n][0]; a[1] += p.d[n][1];
+        }
+      }
+      acc.r = Math.round(acc.r / seg.length);
+      acc.w = Math.round(acc.w / seg.length);
+      for (const n of Object.keys(acc.d)) {
+        acc.d[n] = [Math.round(acc.d[n][0] / seg.length), Math.round(acc.d[n][1] / seg.length)];
+      }
+      out.push(acc);
+    }
+    return { points: out, sample_s: bucket, raw_points: pts.length };
+  }
+
+  // lsblk --json：型号/序列号/固件/容量等（比按空格切列可靠得多）
+  function readLsblkJson() {
+    try {
+      const raw = require('child_process').execSync(
+        'lsblk -J -b -o NAME,MODEL,SERIAL,SIZE,TYPE,ROTA,TRAN,REV,FSTYPE,MOUNTPOINT,PHY-SEC,LOG-SEC 2>/dev/null || true',
+        { encoding: 'utf8', timeout: 5000, maxBuffer: 8 * 1024 * 1024 }
+      );
+      const j = JSON.parse(raw);
+      return Array.isArray(j.blockdevices) ? j.blockdevices : [];
+    } catch (e) { return []; }
+  }
+
+  // SMART（smartctl -j -a）：NVMe 与 ATA 通吃；30 秒缓存避免 5 秒轮询频繁起进程
+  function readSmartInfo(devPath) {
+    if (!global.__smartCache) global.__smartCache = new Map();
+    const cached = global.__smartCache.get(devPath);
+    if (cached && Date.now() - cached.ts < 30000) return cached.data;
+    let data = null;
+    try {
+      const raw = require('child_process').execSync(
+        `sudo -n smartctl -j -a -n standby ${devPath} 2>/dev/null || true`,
+        { encoding: 'utf8', timeout: 8000, maxBuffer: 4 * 1024 * 1024 }
+      );
+      const j = JSON.parse(raw);
+      if (!j || !j.smart_status) {
+        const msgs = (j && j.smartctl && Array.isArray(j.smartctl.messages)) ? j.smartctl.messages : [];
+        const first = msgs.find((m) => m && m.string);
+        data = { available: false, reason: first ? first.string : (j && j.device && j.device.type ? 'SMART 不可用' : '无 SMART 数据') };
+      } else {
+        data = {
+          available: true,
+          health: j.smart_status.passed === true ? 'PASS' : (j.smart_status.passed === false ? 'FAIL' : 'UNKNOWN'),
+          model: j.model_name || '', serial: j.serial_number || '', firmware: j.firmware_version || '',
+          protocol: (j.device && j.device.protocol) || '',
+          capacity_bytes: (j.user_capacity && j.user_capacity.bytes) || null,
+          temperature: (j.temperature && j.temperature.current != null) ? j.temperature.current : null,
+          power_on_hours: (j.power_on_time && j.power_on_time.hours != null) ? j.power_on_time.hours : null,
+          power_cycles: j.power_cycle_count != null ? j.power_cycle_count : null,
+        };
+        const n = j.nvme_smart_health_information_log;
+        if (n) {
+          data.kind = 'nvme';
+          data.critical_warning = n.critical_warning;
+          data.available_spare = n.available_spare;
+          data.available_spare_threshold = n.available_spare_threshold;
+          data.write_life_pct = n.percentage_used != null ? n.percentage_used : null;
+          data.data_units_read = n.data_units_read != null ? n.data_units_read : null;
+          data.data_units_written = n.data_units_written != null ? n.data_units_written : null;
+          // NVMe 规范：1 data unit = 1000 × 512 B
+          data.bytes_read = n.data_units_read != null ? n.data_units_read * 512000 : null;
+          data.bytes_written = n.data_units_written != null ? n.data_units_written * 512000 : null;
+          data.host_reads = n.host_reads != null ? n.host_reads : null;
+          data.host_writes = n.host_writes != null ? n.host_writes : null;
+          data.controller_busy_min = n.controller_busy_time != null ? n.controller_busy_time : null;
+          data.unsafe_shutdowns = n.unsafe_shutdowns != null ? n.unsafe_shutdowns : null;
+          data.media_errors = n.media_errors != null ? n.media_errors : null;
+          data.error_log_entries = n.num_err_log_entries != null ? n.num_err_log_entries : null;
+          data.temp_sensors = Array.isArray(n.temperature_sensors) ? n.temperature_sensors : [];
+          if (data.power_on_hours == null && n.power_on_hours != null) data.power_on_hours = n.power_on_hours;
+          if (data.power_cycles == null && n.power_cycles != null) data.power_cycles = n.power_cycles;
+        } else if (j.ata_smart_attributes && Array.isArray(j.ata_smart_attributes.table)) {
+          data.kind = 'ata';
+          const byId = {}, byName = {};
+          for (const a of j.ata_smart_attributes.table) {
+            byId[a.id] = a;
+            if (a.name) byName[String(a.name).toLowerCase()] = a;
+          }
+          const rawOf = (id, nm) => {
+            const a = byId[id] || (nm ? byName[nm] : null);
+            return (a && a.raw && a.raw.value != null) ? a.raw.value : null;
+          };
+          const lbasWritten = rawOf(241, 'total_lbas_written');
+          const lbasRead = rawOf(242, 'total_lbas_read');
+          data.bytes_written = lbasWritten != null ? lbasWritten * 512 : null;
+          data.bytes_read = lbasRead != null ? lbasRead * 512 : null;
+          const wear = byId[177] || byName['wear_leveling_count'];
+          data.write_life_pct = wear && wear.value != null ? Math.max(0, 100 - wear.value) : null;
+          data.media_errors = rawOf(5, 'reallocated_sector_ct');
+          data.pending_sectors = rawOf(197, 'current_pending_sector');
+          data.unsafe_shutdowns = rawOf(192, 'unsafe_shutdown_count') != null ? rawOf(192, 'unsafe_shutdown_count') : rawOf(174, 'unexpected_power_loss');
+          if (data.temperature == null) {
+            const t = rawOf(194, 'temperature_celsius') != null ? rawOf(194, 'temperature_celsius') : rawOf(190, 'airflow_temperature_cel');
+            data.temperature = t;
+          }
+          if (data.power_on_hours == null) {
+            data.power_on_hours = rawOf(9, 'power_on_hours') != null ? rawOf(9, 'power_on_hours') : rawOf(240, 'head_flying_hours');
+          }
+        } else {
+          data.kind = 'other';
+        }
+      }
+    } catch (e) {
+      data = { available: false, reason: 'smartctl 调用失败：' + String(e && e.message || e) };
+    }
+    global.__smartCache.set(devPath, { ts: Date.now(), data });
+    return data;
+  }
+
+  // ---------- 内存（RAM）：实时用量 + 硬件规格（容量/频率/型号/插槽）----------
+  // dmidecode 读 SMBIOS（需 root，已配 NOPASSWD）；硬件信息静态，缓存 60 秒
+  function dmiSizeToBytes(txt) {
+    if (!txt || /No Module Installed/i.test(txt)) return 0;
+    const m = /([\d.]+)\s*(GB|MB|TB)/i.exec(txt);
+    if (!m) return 0;
+    const n = parseFloat(m[1]) || 0;
+    const unit = m[2].toUpperCase();
+    return Math.round(n * (unit === 'TB' ? 1099511627776 : unit === 'GB' ? 1073741824 : 1048576));
+  }
+
+  function readMemoryInfo() {
+    const mem = {
+      available: false, modules: [], slots_total: 0, populated: 0,
+      total_bytes: 0, total_h: '--', speed_mts: null, type: null,
+      ecc: null, max_capacity_bytes: null, max_capacity_h: null,
+      channels: null, channel_text: null, bandwidth_gbs: null,
+      form_factor: null, rank: null, live: null, dmi_error: null,
+    };
+
+    // 1) 实时用量（/proc/meminfo）
+    try {
+      const kv = {};
+      for (const line of fs.readFileSync('/proc/meminfo', 'utf8').split('\n')) {
+        const m = /^(\w+):\s+(\d+)\s*kB/.exec(line);
+        if (m) kv[m[1]] = parseInt(m[2], 10) * 1024;
+      }
+      if (kv.MemTotal) {
+        const total = kv.MemTotal;
+        const avail = kv.MemAvailable != null ? kv.MemAvailable : (kv.MemFree || 0);
+        const used = Math.max(0, total - avail);
+        const swapTotal = kv.SwapTotal || 0, swapFree = kv.SwapFree || 0;
+        mem.live = {
+          total_bytes: total,
+          used_bytes: used,
+          avail_bytes: avail,
+          free_bytes: kv.MemFree || 0,
+          buffers_bytes: kv.Buffers || 0,
+          cached_bytes: kv.Cached || 0,
+          shared_bytes: kv.Shmem || 0,
+          dirty_bytes: kv.Dirty || 0,
+          slab_bytes: kv.Slab || 0,
+          swap_total_bytes: swapTotal,
+          swap_used_bytes: Math.max(0, swapTotal - swapFree),
+          swap_use_pct: swapTotal > 0 ? Math.round((swapTotal - swapFree) / swapTotal * 100) : 0,
+          use_pct: Math.round(used / total * 100),
+          total_h: fmtBytes(total),
+          used_h: fmtBytes(used),
+          avail_h: fmtBytes(avail),
+          cached_h: fmtBytes((kv.Buffers || 0) + (kv.Cached || 0)),
+          swap_total_h: fmtBytes(swapTotal),
+          swap_used_h: fmtBytes(Math.max(0, swapTotal - swapFree)),
+        };
+      }
+    } catch (e) {}
+
+    // 2) 硬件规格（dmidecode -t memory，60 秒缓存）
+    if (!global.__memHwCache) global.__memHwCache = { ts: 0, data: null };
+    let hw = null;
+    if (global.__memHwCache.data && Date.now() - global.__memHwCache.ts < 60000) {
+      hw = global.__memHwCache.data;
+    } else {
+      let raw = '';
+      try {
+        raw = require('child_process').execSync(
+          'sudo -n dmidecode -t memory 2>/dev/null || true',
+          { encoding: 'utf8', timeout: 8000, maxBuffer: 4 * 1024 * 1024 }
+        );
+      } catch (e) { raw = ''; }
+      hw = { modules: [], slots_total: 0, ecc: null, max_capacity_bytes: null, dmi_error: null };
+      if (!raw || !/DMI type 17/.test(raw)) {
+        hw.dmi_error = '无法读取 SMBIOS（需要 sudo dmidecode 免密权限）';
+      } else {
+        let type = null, cur = null;
+        const dmi = [];
+        const flush = () => { if (cur && type === '17') dmi.push(cur); cur = null; };
+        for (const line of raw.split('\n')) {
+          const hm = /^Handle 0x[0-9A-Fa-f]+, DMI type (\d+)/.exec(line);
+          if (hm) { flush(); type = hm[1]; if (type === '17') cur = {}; continue; }
+          const fm = /^\t([^:]+):\s*(.*)$/.exec(line);
+          if (!fm) continue;
+          const k = fm[1].trim(), v = fm[2].trim();
+          if (type === '16') {
+            if (k === 'Error Correction Type') hw.ecc = /No Error|^None$/i.test(v) ? 'none' : v;
+            if (k === 'Maximum Capacity') hw.max_capacity_bytes = dmiSizeToBytes(v);
+            if (k === 'Number Of Devices') hw.slots_total = parseInt(v, 10) || 0;
+          } else if (type === '17' && cur) {
+            cur[k] = v;
+          }
+        }
+        flush();
+
+        const norm = (s) => (!s || /Not Specified|Unknown|^None$/i.test(s)) ? null : String(s).trim();
+        const speedNum = (s) => { const m = /([\d.]+)\s*(MT\/s|MHz)/i.exec(s || ''); return m ? parseFloat(m[1]) : null; };
+        hw.modules = dmi.map((m) => {
+          const sizeTxt = m['Size'] || '';
+          const installed = !/No Module Installed/i.test(sizeTxt);
+          const sz = installed ? dmiSizeToBytes(sizeTxt) : 0;
+          return {
+            locator: m['Locator'] || '',
+            bank: m['Bank Locator'] || '',
+            installed,
+            size_bytes: sz,
+            size_h: installed ? fmtBytes(sz) : '空槽',
+            type: norm(m['Type']),
+            form_factor: norm(m['Form Factor']),
+            speed_mts: speedNum(m['Speed']),
+            configured_mts: speedNum(m['Configured Memory Speed']),
+            voltage_configured: norm(m['Configured Voltage']),
+            voltage_min: norm(m['Minimum Voltage']),
+            voltage_max: norm(m['Maximum Voltage']),
+            manufacturer: norm(m['Manufacturer']),
+            part_number: norm(m['Part Number']),
+            serial: norm(m['Serial Number']),
+            rank: norm(m['Rank']),
+            total_width: norm(m['Total Width']),
+            data_width: norm(m['Data Width']),
+            technology: norm(m['Memory Technology']),
+          };
+        });
+      }
+      global.__memHwCache = { ts: Date.now(), data: hw };
+    }
+
+    mem.modules = hw.modules || [];
+    mem.slots_total = hw.slots_total || mem.modules.length;
+    mem.ecc = hw.ecc;
+    mem.dmi_error = hw.dmi_error;
+    if (hw.max_capacity_bytes) {
+      mem.max_capacity_bytes = hw.max_capacity_bytes;
+      mem.max_capacity_h = fmtBytes(hw.max_capacity_bytes);
+    }
+
+    const inst = mem.modules.filter((m) => m.installed);
+    mem.populated = inst.length;
+    mem.available = inst.length > 0;
+    mem.total_bytes = inst.reduce((a, m) => a + (m.size_bytes || 0), 0);
+    if (mem.total_bytes > 0) mem.total_h = fmtBytes(mem.total_bytes);
+
+    const speeds = inst.map((m) => m.configured_mts || m.speed_mts).filter((v) => v);
+    if (speeds.length) {
+      mem.speed_mts = Math.max.apply(null, speeds);
+      mem.speed_min_mts = Math.min.apply(null, speeds);
+      mem.mixed_speed = mem.speed_mts !== mem.speed_min_mts;
+    }
+    const types = inst.map((m) => m.type).filter(Boolean);
+    if (types.length) mem.type = types[0];
+    const ffs = inst.map((m) => m.form_factor).filter(Boolean);
+    if (ffs.length) mem.form_factor = ffs[0];
+    const ranks = inst.map((m) => m.rank).filter(Boolean);
+    if (ranks.length) mem.rank = ranks[0];
+
+    // 通道数：按 Locator 的“通道前缀”去重，两条规则：
+    // ① Locator 含 Channel 字样（常见 BIOS：Controller0-ChannelA-DIMM0）→ 直接取该前缀；
+    // ② 否则剥掉槽位尾号（DIMM_A1/DIMM_D2 → DIMM_A/DIMM_D）。
+    // 【坑】绝不能用 Bank Locator 兜底：E5 v4 这类平台 Bank=NODE 是内存控制器封装
+    //（每颗含 2 通道），两颗控制器会被误判成双通道（127 机实锤：A1/B1+C1/D1/D2
+    //  实为四通道，曾误显“双通道 33.6GB/s”，STREAM 实测 50.3GB/s）。
+    const chs = new Set(inst.map((m) => {
+      const loc = (m.locator || '').trim();
+      if (!loc) return '';
+      const mm = /^(.*?Channel[A-Za-z0-9]*)/i.exec(loc);
+      if (mm) return mm[1].toLowerCase();
+      return loc.replace(/[\s_-]*\d+\s*$/i, '').toLowerCase();
+    }).filter(Boolean));
+    let chCount = chs.size || (inst.length || null);
+    if (chCount && inst.length) chCount = Math.min(chCount, inst.length); // 前缀去重不得超过实插条数
+    mem.channels = chCount;
+    const chNames = ['单通道', '双通道', '三通道', '四通道'];
+    mem.channel_text = mem.channels ? (chNames[mem.channels - 1] || (mem.channels + ' 通道')) : null;
+
+    // 理论带宽 ≈ 每通道有效数据位(≤64) × 频率(MT/s) × 通道数 / 8
+    // 【坑】ECC RDIMM 位宽应 Data Width=64/Total Width=72，但白牌 BIOS 常把 Data Width
+    //  也虚报 72（127 机如此），ECC 校验位不占有效带宽，一律钳到 64。
+    const rawWidthBits = inst.length ? (parseFloat(inst[0].data_width) || 64) : 64;
+    const widthBits = Math.min(rawWidthBits, 64);
+    if (mem.speed_mts && mem.channels) {
+      mem.bandwidth_gbs = Math.round(mem.speed_mts * (widthBits / 8) * mem.channels / 1000 * 10) / 10;
+    }
+
+    return mem;
+  }
+
+  function buildStorageSnapshot() {
+    const result = { ts: new Date().toISOString(), disks: [], partitions: [], ioStats: {}, totals: {} };
+
+    // 1) 文件系统用量（df -B1，排除 snap 循环设备与内存文件系统）
+    const dfBySource = {};
+    try {
+      const dfOut = require('child_process').execSync(
+        'df -B1 -x squashfs -x tmpfs -x devtmpfs -x overlay --output=source,fstype,size,used,avail,pcent,target 2>/dev/null || true',
+        { encoding: 'utf8', timeout: 5000, maxBuffer: 4 * 1024 * 1024 }
+      );
+      for (const line of dfOut.trim().split('\n').slice(1)) {
+        const p = line.trim().split(/\s+/);
+        if (p.length < 7) continue;
+        const rec = {
+          source: p[0], fstype: p[1],
+          size_bytes: parseInt(p[2], 10) || 0,
+          used_bytes: parseInt(p[3], 10) || 0,
+          avail_bytes: parseInt(p[4], 10) || 0,
+          size_gb: ((parseInt(p[2], 10) || 0) / 1073741824).toFixed(1),
+          used_gb: ((parseInt(p[3], 10) || 0) / 1073741824).toFixed(1),
+          avail_gb: ((parseInt(p[4], 10) || 0) / 1073741824).toFixed(1),
+          use_pct: parseInt(p[5], 10) || 0,
+          mount: p[6],
+        };
+        result.partitions.push(rec);
+        dfBySource[rec.source] = rec;
+        dfBySource[p[0].replace('/dev/', '')] = rec;
+      }
+    } catch (e) {}
+
+    let uptimeS = null;
+    try { uptimeS = Math.round(parseFloat(fs.readFileSync('/proc/uptime', 'utf8').split(' ')[0])); } catch (e) {}
+
+    const stats = readDiskStatsRaw();
+
+    // 2) 块设备树（lsblk JSON）→ 整盘条目 + 分区明细
+    const flat = [];
+    const walkAll = (nodes) => {
+      for (const n of (nodes || [])) { flat.push(n); if (Array.isArray(n.children)) walkAll(n.children); }
+    };
+    walkAll(readLsblkJson());
+
+    const rateWindow = (() => {
+      const arr = global.__diskSamples || [];
+      if (arr.length < 2) return null;
+      const cur = arr[arr.length - 1];
+      let base = null;
+      for (let i = arr.length - 1; i >= 0; i--) {
+        if (cur.ts - arr[i].ts >= 4000) { base = arr[i]; break; }
+      }
+      if (!base) base = arr[0];
+      return Math.round((cur.ts - base.ts) / 100) / 10;
+    })();
+
+    for (const node of flat) {
+      const kind = diskDevKind(node.name);
+      if (kind !== 'disk' && kind !== 'virtual') continue;
+
+      const name = node.name;
+      const st = stats[name] || null;
+      const mounts = [];
+      const partList = [];
+      const collectParts = (nodes) => {
+        for (const c of (nodes || [])) {
+          if (c.mountpoint) mounts.push(c.mountpoint);
+          const df = dfBySource[c.name] || dfBySource['/dev/' + c.name];
+          const sz = Number(c.size) || 0;
+          partList.push({
+            name: c.name,
+            size_bytes: sz,
+            size_gb: (sz / 1073741824).toFixed(1),
+            fstype: c.fstype || '',
+            mount: c.mountpoint || '',
+            used_bytes: df ? df.used_bytes : null,
+            avail_bytes: df ? df.avail_bytes : null,
+            use_pct: df ? df.use_pct : null,
+            used_gb: df ? df.used_gb : null,
+            avail_gb: df ? df.avail_gb : null,
+          });
+          if (Array.isArray(c.children)) collectParts(c.children);
+        }
+      };
+      if (node.mountpoint) mounts.push(node.mountpoint);
+      collectParts(node.children);
+
+      const readBytes = st ? st.read_sectors * 512 : null;
+      const writeBytes = st ? st.write_sectors * 512 : null;
+      const rate = diskRateFor(name);
+      const sizeBytes = Number(node.size) || 0;
+
+      const io = {
+        // 本次开机累计（/proc/diskstats，重启归零）
+        reads: st ? st.reads : null,
+        writes: st ? st.writes : null,
+        read_bytes: readBytes,
+        write_bytes: writeBytes,
+        read_h: readBytes != null ? fmtBytes(readBytes) : '--',
+        write_h: writeBytes != null ? fmtBytes(writeBytes) : '--',
+        read_gb: readBytes != null ? Math.round(readBytes / 1073741824 * 100) / 100 : null,
+        write_gb: writeBytes != null ? Math.round(writeBytes / 1073741824 * 100) / 100 : null,
+        discard_bytes: st ? st.discard_sectors * 512 : null,
+        discards: st ? st.discards : null,
+        flushes: st ? st.flushes : null,
+        in_flight: st ? st.in_flight : null,
+        since_boot_s: uptimeS,
+        // 实时速率（约 5 秒窗口均值）
+        read_bps: rate ? rate.read_bps : null,
+        write_bps: rate ? rate.write_bps : null,
+        read_rate_h: rate ? fmtRate(rate.read_bps) : '--',
+        write_rate_h: rate ? fmtRate(rate.write_bps) : '--',
+        read_iops: rate ? rate.read_iops : null,
+        write_iops: rate ? rate.write_iops : null,
+        busy_pct: rate ? rate.busy_pct : null,
+        read_latency_ms: rate ? rate.read_latency_ms : null,
+        write_latency_ms: rate ? rate.write_latency_ms : null,
+        avg_queue: rate ? rate.avg_queue : null,
+        window_s: rate ? rate.window_s : null,
+      };
+
+      let smart = null;
+      if (kind === 'disk' && /^(nvme\d+n\d+|sd[a-z]+|vd[a-z]+|hd[a-z]+)$/.test(name)) {
+        smart = readSmartInfo('/dev/' + name);
+      }
+
+      result.disks.push({
+        name,
+        path: '/dev/' + name,
+        kind,
+        type: node.type || '',
+        tran: node.tran || '',
+        model: (node.model || '').trim() || (smart && smart.model) || '',
+        serial: (node.serial || '').trim() || (smart && smart.serial) || '',
+        firmware: (node.rev || '').trim() || (smart && smart.firmware) || '',
+        rota: node.rota === true || node.rota === '1' || node.rota === 1,
+        size_bytes: sizeBytes,
+        size_gb: (sizeBytes / 1073741824).toFixed(1),
+        size_h: fmtBytes(sizeBytes),
+        fstype: node.fstype || '',
+        mountpoints: mounts,
+        mount_display: mounts.length ? mounts.join(', ') : '未挂载',
+        partitions: partList,
+        io,
+        smart,
+      });
+    }
+
+    // 按容量倒序（系统盘/数据盘在前，虚拟设备在后）
+    result.disks.sort((a, b) => (b.size_bytes || 0) - (a.size_bytes || 0));
+
+    // 设备标签留给走势卡图例复用，省得 /v1/internal/disk-trend 再跑一次 lsblk。
+    // mount 取「图例友好」的那一个：lsblk 的 MOUNTPOINT 单列只报一个挂载点，本机数据盘
+    // 报的是 chroot bind 的 <真实路径>/rootfs/<真实路径>（如
+    // /media/ll/data/vllm-image/rootfs/media/ll/data），故先按 /rootfs/ 剥回真实路径，
+    // 再优先 /，最后取最短。表格用的 mount_display 保持原样不动。
+    try {
+      global.__diskLabels = result.disks.filter((d) => d.kind === 'disk').map((d) => {
+        const norm = (m) => { const s = String(m), k = s.indexOf('/rootfs/'); if (k < 0) return s; const rest = s.slice(k + 8); return rest ? (rest.charAt(0) === '/' ? rest : '/' + rest) : '/'; };
+        const pool = Array.from(new Set((Array.isArray(d.mountpoints) ? d.mountpoints : []).map(norm)));
+        const mount = pool.indexOf('/') >= 0 ? '/' : (pool.length ? pool.sort((a, b) => a.length - b.length)[0] : '未挂载');
+        return { name: d.name, model: d.model || '', mount, mount_display: d.mount_display || '未挂载', size_gb: d.size_gb };
+      });
+    } catch (e) {}
+
+    // 3) 累计 I/O（兼容旧前端字段名：reads/readSectors/writes/writeSectors）
+    for (const [name, s] of Object.entries(stats)) {
+      result.ioStats[name] = {
+        reads: s.reads, readSectors: s.read_sectors, read_bytes: s.read_sectors * 512,
+        writes: s.writes, writeSectors: s.write_sectors, write_bytes: s.write_sectors * 512,
+        in_flight: s.in_flight, busy_ms: s.io_ms,
+      };
+    }
+
+    // 4) 汇总
+    let tSize = 0, tUsed = 0, tAvail = 0, tRead = 0, tWrite = 0, tReadRate = 0, tWriteRate = 0;
+    for (const p of result.partitions) { tSize += p.size_bytes; tUsed += p.used_bytes; tAvail += p.avail_bytes; }
+    for (const d of result.disks) {
+      if (d.kind !== 'disk') continue;
+      tRead += d.io.read_bytes || 0;
+      tWrite += d.io.write_bytes || 0;
+      tReadRate += d.io.read_bps || 0;
+      tWriteRate += d.io.write_bps || 0;
+    }
+    result.totals = {
+      size_bytes: tSize, used_bytes: tUsed, avail_bytes: tAvail,
+      use_pct: tSize > 0 ? Math.round(tUsed / tSize * 100) : 0,
+      size_h: fmtBytes(tSize), used_h: fmtBytes(tUsed), avail_h: fmtBytes(tAvail),
+      read_bytes: tRead, write_bytes: tWrite,
+      read_h: fmtBytes(tRead), write_h: fmtBytes(tWrite),
+      read_bps: tReadRate, write_bps: tWriteRate,
+      read_rate_h: fmtRate(tReadRate), write_rate_h: fmtRate(tWriteRate),
+      window_s: rateWindow,
+      uptime_s: uptimeS,
+      disk_count: result.disks.filter((d) => d.kind === 'disk').length,
+      loop_count: flat.filter((n) => diskDevKind(n.name) === 'loop').length,
+    };
+
+    // 5) 内存（RAM）：容量 / 实时用量 / 工作频率 / 型号 / 插槽
+    try {
+      result.memory = readMemoryInfo();
+    } catch (e) {
+      result.memory = { available: false, modules: [], dmi_error: String((e && e.message) || e) };
+    }
+
+    // 6) 网络速度（硬件监视页「网络」卡片）
+    try {
+      result.network = buildNetSnapshot();
+    } catch (e) {
+      result.network = { ts: new Date().toISOString(), interfaces: [], totals: {}, error: String((e && e.message) || e) };
+    }
+
+    return result;
+  }
+
+  // === CATCH-ALL: All /v1/* paths proxy to vLLM ===
+  if (pathname.startsWith('/v1/')) {
+    if (req.method === 'GET' && pathname === '/v1/models') {
+      return handleMergedModels(res);
+    }
+    // Multi-model routing: requests carrying a "model" field go to that
+    // model's own vLLM backend (each pinned to one GPU).
+    if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let parsed = null;
+        let model = null;
+        try { parsed = JSON.parse(body); model = parsed.model; } catch (e) {}
+        // 模型名别名改写（2026-09-14）：别名（如 qwen3.8-flash-next-nvfp4）在转发前
+        // 替换成后端真实 served-model-name，否则 vLLM 按 model 字段校验直接报 404。
+        const realModel = resolveModelAlias(model);
+        if (parsed && typeof model === 'string' && realModel !== model) {
+          parsed.model = realModel;
+          body = JSON.stringify(parsed);
+        }
+        // 客户端请求关联头（2026-09-17 行级测速 v2）：生成类请求注入唯一 id，
+        // 代理 tee 捕获响应流首个 SSE data 帧里的引擎真实 rid（chatcmpl-xxx）后
+        // 登记 clientReqId→rid，REQ 行据此【精确认领】引擎每请求输出序列。
+        // 未知 header vLLM 忽略；SGLang 实例不产出该 header 也无害。
+        if (parsed && typeof parsed === 'object' && LIVE_PATH_RE.test(pathname)) {
+          const _h = parsed.headers && typeof parsed.headers === 'object' ? parsed.headers : (parsed.headers = {});
+          if (!_h['X-Client-Req-Id']) _h['X-Client-Req-Id'] = 'dsh-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+          body = JSON.stringify(parsed);
+        }
+        let forward = body;
+        if (parsed && req.method === 'POST' && pathname === '/v1/chat/completions' && chatTrimEnabled()) {
+          try {
+            const stats = trimChatBody(parsed);
+            if (stats) {
+              forward = JSON.stringify(parsed);  // 转发裁剪后的 body：live 指标/估算/count_tokens 与上游一致
+              const extra = stats.contentTruncated ? ` content=${stats.contentTruncated}` : '';
+              console.log(`[chat-trim] ${clientIp(req)} msgs ${stats.before}->${stats.after} (dropped ${stats.dropped})${extra}`);
+            }
+          } catch (e) {
+            console.error(`[chat-trim] error: ${e && e.message}`);
+          }
+        }
+        // PD 两步转发：命中 PD 模型的生成端点时，自动拆 prefill→decode 两步
+        // （prefill 只算 KV，decode 生成；客户端无感。工具调用暂不支持——PD 实例未开 tool parser）
+        const pd = pdPortsForModel(realModel);
+        if (pd && req.method === 'POST' && LIVE_PATH_RE.test(pathname)) {
+          return proxyPdToVllm(req, res, req.url, pd, forward, model);
+        }
+        proxyToVllm(req, res, req.url, vllmPortForModel(model), forward);
+      });
+      req.on('error', () => { try { if (!res.headersSent) res.destroy(); } catch (e) {} });
+      return;
+    }
+    return proxyToVllm(req, res, req.url);
+  }
+
+  // === Serve admin UI ===
+  if (pathname === '/' || pathname === '/index.html') {
+    const indexPath = path.join(__dirname, 'index.html');
+    try {
+      const content = fs.readFileSync(indexPath, 'utf8');
+      // 09-20：no-store → no-cache + ETag：内容未变时 304 空响应（省 461KB 重传），改了立即生效
+      const etag = 'W/"' + Buffer.byteLength(content) + '-' + fs.statSync(indexPath).mtimeMs.toString(36) + '"';
+      if (req.headers['if-none-match'] === etag) { res.writeHead(304); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', 'ETag': etag });
+      res.end(content);
+    } catch (e) {
+      res.writeHead(404);
+      res.end('Not found');
+    }
+    return;
+  }
+
+  // === Serve mobile UI ===
+  if (pathname === '/m' || pathname === '/mobile.html') {
+    const mobilePath = path.join(__dirname, 'mobile.html');
+    try {
+      const content = fs.readFileSync(mobilePath, 'utf8');
+      const etag = 'W/"' + Buffer.byteLength(content) + '-' + fs.statSync(mobilePath).mtimeMs.toString(36) + '"';
+      if (req.headers['if-none-match'] === etag) { res.writeHead(304); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', 'ETag': etag });
+      res.end(content);
+    } catch (e) {
+      res.writeHead(404);
+      res.end('Not found');
+    }
+    return;
+  }
+
+  // === Serve static files ===
+  if (pathname.startsWith('/static/')) {
+    const filePath = path.join(__dirname, pathname);
+    try {
+      const st = fs.statSync(filePath);
+      const content = fs.readFileSync(filePath);
+      const ext = path.extname(filePath);
+      // 09-20：静态资源加 ETag/304（tailwind.js 407KB 命中 304 即零传输）；
+      // 缓存 10 分钟平衡更新时效（改动后最多 10 分钟生效，强刷立即生效）
+      const etag = '"' + st.size.toString(36) + '-' + st.mtimeMs.toString(36) + '"';
+      if (req.headers['if-none-match'] === etag) { res.writeHead(304); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': MIME_TYPES[ext] || 'application/octet-stream', 'Cache-Control': 'public, max-age=600', 'ETag': etag });
+      res.end(content);
+    } catch (e) {
+      res.writeHead(404);
+      res.end('Not found');
+    }
+    return;
+  }
+
+  // === Fallback ===
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not Found', path: pathname }));
+});
+
+// 启动时自动探测运行中的 vLLM 实例并注册进路由表（控制台重启后不丢多模型路由）
+getVllmInstances([config.vllmPort, 8001, 8002, 8003], (insts) => {
+  insts.forEach(i => {
+    if (i.model && i.port) VLLM_MODEL_PORTS[i.model] = i.port;
+    // 重建 GPU 占用登记表（控制台重启后 GPU 独占保护仍生效）
+    if (i.port && i.gpu) {
+      const gpuParts = String(i.gpu).split(',').map(s => parseInt(s.trim()) || 0);
+      global.__GPU_INSTANCES.set(i.port, {
+        port: i.port,
+        gpuId: gpuParts[0] || 0,
+        gpuCount: Math.max(1, gpuParts.length),
+        runtime: i.runtime || 'vllm',
+        model: i.model,
+        startedAt: Date.now(),
+      });
+    }
+  });
+});
+
+server.listen(config.serverPort, '0.0.0.0', () => {
+  console.log('='.repeat(50));
+  console.log('  vLLM Management Console');
+  console.log('='.repeat(50));
+  console.log(`  Admin URL: http://localhost:${config.serverPort}/`);
+  console.log(`  vLLM backend: ${vllmBaseUrl}`);
+  console.log('='.repeat(50));
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${config.serverPort} already in use!`);
+    process.exit(1);
+  } else {
+    // 其它 listen 失败（权限不足等）：也打日志并退出，避免进程活着但不监听任何端口
+    console.error('Server error:', err.message || err);
+    process.exit(1);
+  }
+});
+
+process.on('SIGTERM', () => { server.close(); process.exit(0); });
+process.on('SIGINT', () => { server.close(); process.exit(0); });

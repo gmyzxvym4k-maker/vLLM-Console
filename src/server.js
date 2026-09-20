@@ -6815,6 +6815,23 @@ function getPcieTopo() {
 // ====== Server ======
 
 // ====== Server ======
+// ====== 09-20 控制台鉴权（可选启用）======
+// /home/ll/deploy/console-auth.json 存在且含 token 时启用：所有 /v1/internal/ 的 POST
+// （启动/停止模型、重置计费、改功耗等状态变更）必须带 X-Console-Token 头或 ?ct= 参数。
+// 删除该文件即回到免鉴权现状。GET 只读接口与 /v1 OpenAI 代理不受影响（不破坏 DSH 等客户端）。
+let __authCache = { at: 0, token: null };
+function getConsoleToken() {
+  const now = Date.now();
+  if (now - __authCache.at < 5000) return __authCache.token;
+  let tok = null;
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(__dirname, 'console-auth.json'), 'utf8'));
+    if (j && typeof j.token === 'string' && j.token.length >= 4) tok = j.token;
+  } catch (e) {}
+  __authCache = { at: now, token: tok };
+  return tok;
+}
+
 // ====== 09-20 性能优化：文本响应 gzip（仅内部 API/页面/静态，绝不影响代理流式响应）======
 function installGzip(req, res) {
   if (!/\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) return;
@@ -6884,6 +6901,19 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/' || pathname === '/index.html' || pathname === '/m' || pathname === '/mobile.html'
       || pathname.startsWith('/static/') || pathname.startsWith('/v1/internal/')) {
     installGzip(req, res);
+  }
+
+  // 09-20：管理口令启用时，拦截内部 API 的写操作（401 由前端弹窗补录口令重试）
+  if (req.method === 'POST' && pathname.startsWith('/v1/internal/')) {
+    const _tok = getConsoleToken();
+    if (_tok) {
+      const _given = String(req.headers['x-console-token'] || urlObj.searchParams.get('ct') || '');
+      if (_given !== _tok) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'unauthorized', need_token: true }));
+        return;
+      }
+    }
   }
 
   // === Internal API: Model Running Parameters ===

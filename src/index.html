@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>vLLM 管理控制台</title>
-    <script src="/static/tailwind.js"></script>
+    <!-- 09-20 性能优化：407KB 浏览器 JIT（tailwind.js）→ 9.4KB 预编译 CSS。
+         link 放在页面 <style> 之后，保持与原 Play CDN 运行时注入相同的层叠顺序（tailwind 覆盖自定义类）。 -->
     <link href="/static/fonts-local.css" rel="stylesheet">
     <style>
         /* 09-19 视觉回归 0905 原版设计（indigo/Inter/平面无阴影）；
@@ -625,6 +626,7 @@
             .dash-meta { flex-wrap: wrap; }
         }
         </style>
+    <link rel="stylesheet" href="/static/tailwind-build.css">
 </head>
 <body>
     <!-- Header -->
@@ -1670,6 +1672,26 @@
     </div>
 
 <script>
+// ====== 09-20 控制台鉴权支持：统一给 /v1/internal/ 请求附带管理口令 ======
+// 口令存 localStorage（401 时弹窗输入一次）；服务端未启用口令时本逻辑零感知。
+(function () {
+  const of = window.fetch.bind(window);
+  window.fetch = function (u, o) {
+    o = o || {};
+    const url = (typeof u === 'string') ? u : (u && u.url) || '';
+    const isInternal = url.indexOf('/v1/internal/') === 0;
+    const withTok = (hdr) => { o.headers = Object.assign({}, o.headers || (u && u.headers) || {}, { 'X-Console-Token': hdr }); return o; };
+    if (isInternal) { const t = localStorage.getItem('consoleToken'); if (t) withTok(t); }
+    return of(u, o).then(function (r) {
+      if (isInternal && r.status === 401) {
+        const t = prompt('请输入控制台管理口令（console-auth.json 的 token；留空取消）：');
+        if (t && t.trim()) { localStorage.setItem('consoleToken', t.trim()); return of(u, withTok(t.trim())); }
+      }
+      return r;
+    });
+  };
+})();
+
 // ====== 09-20 性能优化：后台标签页暂停轮询 ======
 // 页面有 15 个 setInterval 轮询器（stats 500ms×2、GPU/内存带宽 1s、日志/CPU/网络 2s…），
 // 此前标签页最小化后照打不误，持续消耗控制台与上游 vLLM /metrics。
@@ -1690,7 +1712,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20260920-r1'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r0905 = 视觉回归 0905 原版设计）
+const PAGE_VERSION = '20260920-r3'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r0905 = 视觉回归 0905 原版设计）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;

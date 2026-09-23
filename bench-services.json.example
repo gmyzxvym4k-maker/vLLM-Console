@@ -1,0 +1,10 @@
+[
+  {
+    "id": "sgl-remote",
+    "port": 8001,
+    "name": "SGLang 在另一台机器",
+    "desc": "填了 baseUrl 时 port 仅作展示",
+    "baseUrl": "http://192.168.1.50:8001",
+    "apiKey": ""
+  }
+]

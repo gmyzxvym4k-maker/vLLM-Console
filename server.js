@@ -71,7 +71,11 @@ function resolveBackendPort() {
   // 保留探测类进程过滤（ssh/bash -c 里带 "vllm serve" 字样会误匹配）。
   const found = []; // {rank: 0=vllm 1=sglang, port}
   let entries = [];
-  try { entries = fs.readdirSync('/proc'); } catch (e) { return 8000; }
+  // 09-22：探不到任何实例时返回 null（调用方沿用当前端口），不再硬回落 8000。
+  // 此前 vLLM 重启/加载窗口进程短暂消失 → resolve 返回 8000 → maybeReDetect 把
+  // 主端口横跳到 8000（无监听）→ 仪表盘主 stats 拿不到数据整页停刷（日志里大量
+  // 「端口变化 18420 -> 8000」即此）。
+  try { entries = fs.readdirSync('/proc'); } catch (e) { return null; }
   for (const name of entries) {
     if (!/^\d+$/.test(name)) continue;
     let cmd;
@@ -84,7 +88,7 @@ function resolveBackendPort() {
     if (isVllmProcCmd(cmd)) found.push({ rank: 0, port: mappedHostPort(parseInt(name), parseInt(m[1])) });
     else if (cmd.includes('sglang.launch_server')) found.push({ rank: 1, port: mappedHostPort(parseInt(name), parseInt(m[1])) });
   }
-  if (!found.length) return 8000;
+  if (!found.length) return null; // 09-22：无实例→null，不横跳到 8000
   found.sort((a, b) => a.rank - b.rank || a.port - b.port);
   return found[0].port;
 }
@@ -425,7 +429,7 @@ function parseServerParams(cmdline, runtime, port) {
 
 const config = {
   vllmHost: process.env.VLLM_HOST || '127.0.0.1',
-  vllmPort: resolveBackendPort(),
+  vllmPort: resolveBackendPort() || 8000, // 09-22：resolve 探不到返回 null，启动缺省仍 8000
   serverPort: parseInt(process.env.SERVER_PORT) || 8889,
 };
 
@@ -518,8 +522,12 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   note: '\u5bb9\u5668\u955c\u50cf PP2 \u811a\u672c\u542f\u52a8\uff08W4A16-AutoRound\uff0c\u5b98\u65b9\u624b\u518c \u00a74\uff09\uff0c\u52a0\u8f7d\u7ea6 3~9 \u5206\u949f',
   base: {
     maxModelLen: 262144, gpuMemUtil: 0.95, maxNumSeqs: 4, maxBatchedTokens: 8192,
-    blockSize: 1616, temperature: 0.3, topP: 0.95, topK: 20, minP: 0.0,
-    presencePenalty: 0.0, repetitionPenalty: 1.0, pp: 2, mtpTokens: 4,
+    blockSize: 1616, temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+    presencePenalty: 0.1, repetitionPenalty: 1.05, pp: 2, mtpTokens: 4,
+    // [kvoff-sync 09-23] 生产真值：二级缓存开 96GiB（c5a 修复后命中已通）；
+    // PLE=INT8+heap（匿名堆 49.2GB，不受 pinned 挤压页缓存影响，disk 模式与
+    // 大 pinned 层共存有缺页拖垮 decode 的结构性风险，见 09-19 事故模式）。
+    kvoff: '1', kvOffGiB: 96, pleInt8: '1', pleLoc: 'heap',
   },
   bannedArgs: ['--mamba-ssm-cache-dtype', '--mamba-cache-mode', '--language-model-only',
                '--enable-prompt-tokens-details', '--safetensors-load-strategy',
@@ -605,7 +613,11 @@ function scriptModelDefaults(sm) {
     blockSize: b.blockSize, temperature: b.temperature, topP: b.topP, topK: b.topK,
     minP: b.minP, presencePenalty: b.presencePenalty, repetitionPenalty: b.repetitionPenalty,
     thinking: '1', thinkingEffort: 'medium', kvCacheQuant: 'auto', retention: '',
-    mtp: '0', dflash: '0', dspark: '0', mtpTokens: b.mtpTokens || 6,
+    // [mtp-default 0923] 投机缺省=生产现状：W4A16 档 MTP4 实测稳定（09-19：接受长度 2.84、
+    // decode 111 tok/s、无乱码；block-size 1616 下合法档 1~4 与 9~12，5~8 启动即崩），
+    // 故弹窗默认选中「MTP」并带出生产档位 mtpTokens（base=4）。NVFP4 档保持关闭：
+    // 本镜像 PP2 下 MTP 有连续长请求 device assert 残余 bug。
+    mtp: sm.key === 'qwen3.8-flash-next-w4a16' ? '1' : '0', dflash: '0', dspark: '0', mtpTokens: b.mtpTokens || 6,
     runtime: 'vllm', dtype: 'auto',
     // 1M 长上下文开关（'0' 原生 256K / '1' YaRN×4 → 1M）；maxModelLenLong=0 表示该脚本
     // 模型没提供 1M 档（如 NVFP4 栈），前端据此隐藏开关
@@ -785,6 +797,23 @@ function scriptModelLaunchPlan(sm, d) {
   if (d.cpuOffloadGb) env.FN_CPU_OFFLOAD_GB = String(d.cpuOffloadGb);
   const kv = String(d.kvCacheQuant || 'auto');
   if (kv && kv !== 'auto' && kv !== 'bfloat16') env.FN_KV_DTYPE = kv;
+  // [kvoff-toggle 09-22] CPU KV 二级缓存：inner 脚本按 FN_KVOFF(缺省开)/FN_KVOFF_BYTES 决定。
+  // 弹窗显式传 '0'/'1'；旧快启预设无 kvoff 字段 → 落到开启（与 inner 缺省一致，行为不漂移）。
+  if (String(d.kvoff) === '0') {
+    env.FN_KVOFF = '0';
+  } else {
+    env.FN_KVOFF = '1';
+    const koG = int(d.kvoffGiB, 96);
+    if (koG > 0) env.FN_KVOFF_BYTES = String(koG * 1073741824);
+  }
+  // [ple-field 0923] PLE n-gram 表加载精度：inner 缺省=1（INT8 磁盘驻留 47.7GiB，可回收页缓存）；
+  // 弹窗显式传 '0' → BF16 原生 95.4GiB（匿名堆不可回收）。旧快启预设无本字段 → 落 '1'，
+  // 与 inner 缺省一致，行为不漂移。判据：日志 [FN-PLE-INT8] 行 / [FN-PLE-DISK] dtype=。
+  env.FN_PLE_INT8 = String(d.pleInt8) === '0' ? '0' : '1';
+  // [ple-mem 0923] PLE 表位置：只决定放内存(heap)/放硬盘(disk)，精度由 pleInt8 决定，
+  // 两者正交、四种组合都成立（INT8+内存 = 引擎侧 VLLM_PLE_INT8_MEMORY 匿名堆 48.3GiB，
+  // 由 inner 依据「精度+位置」推导后下发，不需要额外 FN_ 变量）。旧预设无本字段 → 'disk'。
+  env.FN_PLE_LOC = String(d.pleLoc) === 'heap' ? 'heap' : 'disk';
   // 采样：全部等于基准 → 不传（= 生产无 --override-generation-config）
   const gen = {
     temperature: num(d.temperature, b.temperature), top_p: num(d.topP, b.topP),
@@ -1076,6 +1105,53 @@ function perPortCacheStats() {
   return out;
 }
 
+// [kvoff-display 09-22] 从实例 cmdline 提取 CPU KV 二级缓存容量（--kv-transfer-config 的
+// cpu_bytes_to_use，单位字节）。chroot 内进程属 root，但 /proc/<pid>/cmdline 全局可读。
+// 60s 缓存（实例重启后 cmdline 变化会在下一周期反映）。
+function kvOffloadCapacityBytes(pid) {
+  try {
+    const now = Date.now();
+    if (!global.__kvOffCap) global.__kvOffCap = new Map();
+    const e = global.__kvOffCap.get(pid);
+    if (e && now - e.t < 60000) return e.b;
+    const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
+    const mm = cmd.match(/cpu_bytes_to_use["'\s:\\]+(\d+)/);
+    const b = mm ? parseInt(mm[1], 10) : 0;
+    global.__kvOffCap.set(pid, { t: now, b });
+    return b;
+  } catch (err) { return 0; }
+}
+// 汇总各 vLLM 实例的 CPU KV 二级缓存状态（数据来自 ticker 每秒 /metrics 采样）。
+// 返回 [{port, gpu, gpus, model, capacity_gb, fill_gb, fill_pct, stored_gb, loaded_gb}]。
+function kvOffloadPortsInfo() {
+  const out = [];
+  try {
+    const gib = 1073741824;
+    for (const inst of listVllmInstances()) {
+      const tk = global.__tokTickers && global.__tokTickers.get(inst.port);
+      const kv = tk && tk.kvOffload;
+      if (!kv) continue;
+      const capBytes = kvOffloadCapacityBytes(inst.pid);
+      out.push({
+        port: inst.port,
+        gpu: inst.gpu,
+        gpus: inst.gpus || (inst.gpu != null ? [inst.gpu] : []),
+        model: inst.servedName || inst.modelPath || '',
+        capacity_gb: capBytes ? +(capBytes / gib).toFixed(2) : null,
+        fill_gb: capBytes ? +(kv.fillPerc * capBytes / gib).toFixed(2) : null,
+        fill_pct: +(kv.fillPerc * 100).toFixed(1),
+        stored_gb: +(kv.storedBytes / gib).toFixed(2),
+        loaded_gb: +(kv.loadedBytes / gib).toFixed(2),
+        // [kvoff-hit 09-22] 命中真值（自实例启动累计）：回载 token / 回载与写入次数
+        ext_tokens: Math.round(kv.extTokens || 0),
+        load_count: Math.round(kv.loadCount || 0),
+        store_count: Math.round(kv.storeCount || 0),
+      });
+    }
+  } catch (e) {}
+  return out;
+}
+
 // 09-01 SGLang「理论可命中率」（LCP×8192 网格折算，sglang-theory.service 每 60s 写 json）
 function readSglangTheory(port) {
   try {
@@ -1130,6 +1206,26 @@ function samplePortMetrics(port) {
           : uncachedTotal;
         tk.lastCacheCached = cacheCached;
         tk.lastCacheUncached = cacheUncached;
+        // [kvoff-display 09-22] CPU KV 二级缓存（vLLM OffloadingConnector 才有这些指标；
+        // fill_perc 由本地 kvfill 补丁暴露=内存档已用比例，usage_perc 是钉住传输比例，不用）。
+        tk.kvOffload = null;
+        if (ns !== 'sglang') {
+          try {
+            const fillKey = Object.keys(m).find(k => k.startsWith('vllm:kv_offload_cpu_cache_fill_perc|'));
+            if (fillKey) {
+              tk.kvOffload = {
+                fillPerc: m[fillKey] || 0,
+                storedBytes: counterByLabel(m, 'vllm:kv_offload_total_bytes_total', 'transfer_type', 'GPU_to_CPU'),
+                loadedBytes: counterByLabel(m, 'vllm:kv_offload_total_bytes_total', 'transfer_type', 'CPU_to_GPU'),
+                // [kvoff-hit 09-22] 命中真值：connector 回载的 prompt token（免重算部分，
+                // source=external_kv_transfer）+ 回载/写入次数（histogram _count 序列）
+                extTokens: counterBySource(m, 'vllm:prompt_tokens_by_source_total', 'external_kv_transfer'),
+                loadCount: counterByLabel(m, 'vllm:kv_offload_size_count', 'transfer_type', 'CPU_to_GPU'),
+                storeCount: counterByLabel(m, 'vllm:kv_offload_size_count', 'transfer_type', 'GPU_to_CPU'),
+              };
+            }
+          } catch (e) {}
+        }
         const running = Math.round(
           ns === 'sglang' ? gaugeValue(m, runningBase)
                           : (m['vllm:num_requests_running' + buildModelLabelFromMetrics(m, 'vllm:num_requests_running{')] || 0)
@@ -3224,6 +3320,33 @@ function logFileMentions(file, needle, maxBytes) {
 // ① 内容命中实例模型路径 +10（决定性）② 新鲜度（≤5min +4 / ≤60min +2 / ≤24h +1）
 // ③ 等于注册名 sm.log +1（同分时优先，端口推导语径最易撞遗留文件）。
 // 结果按 5s TTL 记忆，避免前端 2s 轮询反复读大文件。
+// [ple-display 0923] 端口对应的全部脚本模型条目，按进程 cmdline 的模型路径命中优先排序。
+// 同端口多栈（18420=NVFP4+W4A16 先后注册）时 scriptModelForPort 的「取第一个」会拿错。
+function scriptModelsForPort(port, cmdlineArr) {
+  const p = parseInt(port);
+  if (!p) return [];
+  const out = [];
+  for (const k of Object.keys(SCRIPT_MODELS)) {
+    const v = SCRIPT_MODELS[k];
+    const inst0 = scriptModelInstance(v);
+    if (v.port === p || (inst0 && inst0.port === p)) out.push(Object.assign({ key: k }, v));
+  }
+  if (out.length > 1 && cmdlineArr && cmdlineArr.length) {
+    const cmd = cmdlineArr.join(' ');
+    const score = (v) => {
+      const paths = [v.modelPath, v.longCtxModelPath, v.longCtx512ModelPath].concat(v.altModelPaths || []);
+      let sc = 0;
+      for (const mp of paths) {
+        if (!mp) continue;
+        // cmdline 模型路径与条目路径互为前缀即命中（1M/512K 副本目录不同父同级）
+        if (cmd.includes(mp) || (mp.includes('/media/ll/data/models') && cmd.includes('/media/ll/data/models'))) sc = Math.max(sc, cmd.includes(mp) ? 2 : 1);
+      }
+      return sc;
+    };
+    out.sort((a, b) => score(b) - score(a));
+  }
+  return out;
+}
 function pickScriptModelLogFile(inst, sm) {
   if (!inst) return null;
   const memo = (global.__scriptLogPick = global.__scriptLogPick || new Map());
@@ -5274,7 +5397,7 @@ async function killPortResidents(port) {
 async function startVllmModel(modelName, params, callback) {
   const { execSync } = require('child_process');
   const { spawn } = require('child_process');
-  const { port, maxModelLen, gpuId, gpuCount, parallelMode, pdMode, mtp, dflash, dspark, servedName, maxNumSeqs, gpuMemUtil, thinking, thinkingEffort, mtpTokens, temperature, topP, topK, minP, presencePenalty, repetitionPenalty, kvCacheQuant, retention,
+  const { port, maxModelLen, gpuId, gpuCount, parallelMode, pdMode, mtp, dflash, dspark, servedName, maxNumSeqs, gpuMemUtil, thinking, thinkingEffort, mtpTokens, temperature, topP, topK, minP, presencePenalty, repetitionPenalty, kvCacheQuant, kvoff, kvoffGiB, retention,
     maxBatchedTokens, maxScheduledTokens, schedPolicy, asyncScheduling, enforceEager, blockSize, cpuOffloadGb, prefixCaching, chunkedPrefill, seed, dtype, noLogRequests, limitMm, maxLoraRank, disableAllReduce, attentionBackend, ctxLen, languageModelOnly } = params;
   // reasoning_effort：允许 low/medium/high/xhigh 及手动输入（字母/数字/下划线/连字符，最长 32）
   // 例如 qwen3.8-27b 支持 xhigh；非法/空值回落 medium
@@ -5505,6 +5628,19 @@ async function startVllmModel(modelName, params, callback) {
   } else if (kvCacheQuant === 'int8') {
     args.push('--quantization', 'awq');
     args.push('--kv-cache-dtype', 'int8');
+  }
+
+  // [kvoff-toggle 09-22] CPU KV 二级缓存（vLLM 原生 OffloadingConnector，纯内存档、不落盘）。
+  // 弹窗缺省关闭 → 不传任何 flag，与旧行为逐字一致；PD 模式跳过（其自带 NixlConnector 配置）。
+  // 注意：mamba 混合模型（qwen3.8-27b 系列）在本机 vLLM 0.29 上未验证过 connector，
+  // 若开启后启动失败，把弹窗「二级缓存」切回关闭即可。
+  if (String(kvoff) === '1' && String(pdMode) !== '1') {
+    const koGiB = Math.max(8, Math.min(256, parseInt(kvoffGiB, 10) || 64));
+    args.push('--kv-transfer-config', JSON.stringify({
+      kv_connector: 'OffloadingConnector',
+      kv_role: 'kv_both',
+      kv_connector_extra_config: { cpu_bytes_to_use: koGiB * 1073741824 },
+    }));
   }
 
   // 采样参数：通过 override-generation-config 合并覆盖模型的默认采样配置
@@ -6815,6 +6951,681 @@ function getPcieTopo() {
 // ====== Server ======
 
 // ====== Server ======
+// ====== 09-23 Bench Console（移植自 github.com/polyuij42-del/bench-console v2.2.1，MIT 协议）======
+// LLM 推理基准测试台：三种独立模式（单流解码·13类 / 并发档位 / 预填充 TTFT）+ 测试期间每 1s
+// 采样 /metrics 的实时监控 + 轮次独立（等排空/冲前缀缓存/salt 加盐）+ 结果落盘 JSON 与 A/B 对比。
+// API 挂 /v1/internal/bench/*（POST 自动落入控制台口令拦截口径）；UI 页面 /bench.html，
+// 以「基准测试」标签内嵌管理台。被测服务 = 受管实例（动态跟随 config.vllmPort 端口自愈）
+// + 可选 bench-services.json（远端引擎 baseUrl / apiKey，schema 同上游 config.services）。
+// 铁律合规：本模块零 execSync；所有上游调用均为 fetch + AbortController 带超时。
+// 整块包 IIFE：外部已有 sleep/parseMetrics 等同名符号，闭包内自带一份互不冲突。
+const BENCH = (function () {
+  'use strict';
+  const VERSION = '2.2.1';
+  const MODES = ['single', 'conc', 'prefill'];
+  const PROMPT_FILES = {
+    '13': path.join(__dirname, 'prompts', 'prompts13.json'),
+    '6': path.join(__dirname, 'prompts', 'prompts6.json'),
+  };
+  const RESULT_DIR = path.join(__dirname, 'bench-results');
+  try { fs.mkdirSync(RESULT_DIR, { recursive: true }); } catch (e) {}
+
+  // ---------- 被测服务：受管实例（动态）+ bench-services.json（可选扩展，热读） ----------
+  function localSvc() {
+    const port = config.vllmPort;
+    return { id: 'local', port, name: '受管实例 · :' + port, desc: '控制台当前 vLLM 后端（跟随端口自愈）', baseUrl: 'http://127.0.0.1:' + port };
+  }
+  function services() {
+    let extra = [];
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(__dirname, 'bench-services.json'), 'utf8'));
+      if (Array.isArray(j)) extra = j;
+    } catch (e) {}
+    extra = extra
+      .map((s) => ({ ...s, id: String(s.id != null ? s.id : s.port), port: Number(s.port), name: s.name || (s.port + ' · Engine') }))
+      .filter((s) => Number.isFinite(s.port));
+    const out = [localSvc()];
+    for (const s of extra) if (!out.some((x) => x.id === s.id)) out.push(s);
+    return out;
+  }
+  function svc(k) {
+    const key = String(k);
+    const list = services();
+    return list.find((x) => x.id === key) || list.find((x) => String(x.port) === key);
+  }
+  function svcOf(s) { return (typeof s === 'string' || typeof s === 'number') ? svc(s) : s; }
+  // 带鉴权服务统一由此产出 Authorization 头；apiKey 只在服务端使用，绝不下发浏览器
+  function svcKey(s) { const x = svcOf(s); return (x && x.apiKey) ? { 'Authorization': 'Bearer ' + x.apiKey } : {}; }
+  function baseUrl(s) { const x = svcOf(s); const b = (x && x.baseUrl) || ('http://127.0.0.1:' + (x ? x.port : '')); return String(b).replace(/\/+$/, ''); }
+
+  // ---------- utils ----------
+  function json(res, code, obj) {
+    const body = JSON.stringify(obj);
+    res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(body);
+  }
+  async function readBody(req) {
+    let d = '';
+    for await (const c of req) d += c;
+    try { return JSON.parse(d || '{}'); } catch (e) { return {}; }
+  }
+  async function fetchWithTimeout(url, ms, extraHeaders) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), ms);
+    try { return await fetch(url, { signal: ac.signal, headers: extraHeaders || undefined }); } finally { clearTimeout(t); }
+  }
+  function parseMetrics(text) {
+    const out = {};
+    for (const m of text.matchAll(/^((?:vllm|sglang):[a-z_0-9]+)\{[^}]*\}\s+([0-9.eE++-]+)$/gm)) {
+      const k = m[1], v = parseFloat(m[2]);
+      if (!Number.isNaN(v)) out[k] = (out[k] || 0) + v;
+    }
+    return out;
+  }
+  async function getMetrics(s) {
+    try {
+      const r = await fetchWithTimeout(baseUrl(s) + '/metrics', 4000, svcKey(s));
+      if (!r.ok) return {};
+      return parseMetrics(await r.text());
+    } catch (e) { return {}; }
+  }
+  function metricsDelta(a, b) {
+    const d = {};
+    for (const k of new Set([...Object.keys(a || {}), ...Object.keys(b || {})])) d[k] = (b[k] || 0) - (a[k] || 0);
+    return d;
+  }
+  function mean(a) { return a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0; }
+  function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+  // ---------- 轮次隔离（v2.2）----------
+  // 引擎完全排空判定（无在跑、无排队请求；指标缺失时视为空闲）。vLLM 新旧指标名 + SGLang 名都兼容。
+  function engineIdle(m) {
+    const running = m['vllm:num_requests_running'] ?? m['vllm:num_running_requests'] ?? m['sglang:num_running_requests'];
+    const waiting = m['vllm:num_requests_waiting'] ?? m['vllm:num_waiting_requests'] ?? m['sglang:num_queue_reqs'];
+    if (running == null && waiting == null) return true;
+    return !running && !waiting;
+  }
+  // 探测缓存冲刷端点：vLLM /reset_prefix_cache、SGLang /flush_cache（带鉴权头）。每个 run 对每个服务只探一次。
+  async function probeFlush(s, cap) {
+    for (const p of ['/reset_prefix_cache', '/flush_cache']) {
+      try {
+        const r = await fetchWithTimeout(baseUrl(s) + p, 3000, svcKey(s));
+        if (r.ok) { cap.svc = s; cap.path = p; return; } // 探测成功本身就完成了一次冲刷
+      } catch (e) {}
+    }
+    cap.svc = s; cap.path = null;
+  }
+  // 每轮结束后的隔离动作：冲刷前缀缓存（若支持）→ 等引擎完全排空（最多 20s）→ 轮间静置
+  async function roundIsolate(s, state, label) {
+    if (!state.flushCap) state.flushCap = { svc: null, path: null };
+    const cap = state.flushCap;
+    if (cap.svc !== s) {
+      await probeFlush(s, cap);
+    } else if (cap.path) {
+      try { await fetchWithTimeout(baseUrl(s) + cap.path, 3000, svcKey(s)); } catch (e) {}
+    }
+    state.iso = label + ' · 等引擎排空…';
+    const t0 = Date.now();
+    while (Date.now() - t0 < 20000) {
+      if (state.abort) throw new Error('aborted');
+      if (engineIdle(await getMetrics(s))) break;
+      await sleep(500);
+    }
+    const n = (state.repSettle || 0) | 0;
+    if (n > 0) {
+      state.iso = label + ` · 轮间静置 ${n}s`;
+      for (let i = 0; i < n; i++) {
+        if (state.abort) throw new Error('aborted');
+        await sleep(1000);
+      }
+    }
+    state.iso = null;
+  }
+
+  // ---------- streaming chat ----------
+  // cb(tokens, elapsedMs)：每 20 个 token 回调一次，供实时监控显示本轮进度
+  async function streamChat(s, model, prompt, maxTokens, signal, cb) {
+    const t0 = Date.now();
+    let ttft = null, tokens = 0;
+    const body = JSON.stringify({
+      model, messages: [{ role: 'user', content: prompt }],
+      max_tokens: maxTokens, temperature: 0, stream: true,
+      stream_options: { include_usage: true },
+    });
+    const res = await fetch(baseUrl(s) + '/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...svcKey(s) }, body, signal,
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    let usage = null;
+    const dec = new TextDecoder();
+    let buf = '';
+    for await (const chunk of res.body) {
+      buf += dec.decode(chunk, { stream: true });
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t.startsWith('data:')) continue;
+        const data = t.slice(5).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const jj = JSON.parse(data);
+          if (jj.usage) { usage = jj.usage; tokens = usage.completion_tokens || tokens; }
+          const dl = jj.choices && jj.choices[0] && jj.choices[0].delta;
+          // 思考模型走 delta.reasoning/reasoning_content，正文走 delta.content，都算生成 token（TTFT=首个 token 时间）
+          const d = dl && (dl.content || dl.reasoning || dl.reasoning_content);
+          if (d) {
+            if (ttft === null) ttft = Date.now() - t0;
+            tokens++;
+            if (cb && tokens % 20 === 0) cb(tokens, Date.now() - t0);
+          }
+        } catch (e) {}
+      }
+    }
+    const wall = (Date.now() - t0) / 1000;
+    return { ttft, tokens, wall, tps: tokens / wall, promptTokens: (usage && usage.prompt_tokens) || 0 };
+  }
+
+  // ---------- prefill：走 /v1/completions（无 chat 模板/思考干扰），TTFT ≈ prefill 完成时间 ----------
+  async function streamPrefill(s, model, prompt, signal) {
+    const t0 = Date.now();
+    let ttft = null;
+    const body = JSON.stringify({
+      model, prompt, max_tokens: 1, temperature: 0, stream: true,
+      stream_options: { include_usage: true },
+    });
+    const res = await fetch(baseUrl(s) + '/v1/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...svcKey(s) }, body, signal,
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    let usage = null;
+    const dec = new TextDecoder();
+    let buf = '';
+    for await (const chunk of res.body) {
+      buf += dec.decode(chunk, { stream: true });
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t.startsWith('data:')) continue;
+        const data = t.slice(5).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const jj = JSON.parse(data);
+          if (jj.usage) usage = jj.usage;
+          if (jj.choices && jj.choices.length && ttft === null) ttft = Date.now() - t0;
+        } catch (e) {}
+      }
+    }
+    return { ttft, promptTokens: (usage && usage.prompt_tokens) || 0 };
+  }
+
+  // ---------- prefill filler（多段不同文本轮换，避免前缀缓存命中干扰） ----------
+  const FILLERS = [
+    '数据中心机房内，成排的服务器指示灯规律地闪烁，冷却风扇发出低沉而持续的嗡鸣声，运维工程师正在巡检每一台机柜的运行状态并记录温度读数。',
+    'The distributed tracing system collected spans from every microservice, revealing latency outliers in the payment pipeline during peak traffic hours.',
+    '秋日的阳光穿过办公楼的落地窗，洒在键盘和显示器的边缘，工程师们一边讨论着架构图的细节，一边在白板上画出新的服务边界与调用关系。',
+    'Benchmark methodology requires isolating variables: identical prompt sets, fixed token budgets, repeated rounds, and metric deltas sampled before and after each request.',
+    '数据库慢查询日志显示，联合索引缺失导致的全表扫描在夜间批处理窗口反复出现，DBA 建议对订单表的时间列增加复合索引并重建统计信息。',
+    'Kubernetes 集群的节点压力在流量高峰时段逼近阈值，水平扩缩容策略基于自定义指标触发，新的 Pod 在三十秒内完成调度并接入服务网格。',
+    'Long-context inference shifts the bottleneck from decode bandwidth to prefill compute: attention over tens of thousands of tokens dominates time-to-first-token.',
+    '缓存命中率的变化往往比吞吐量更早暴露问题：当热数据集超出容量时，逐出率上升，尾延迟随之抬升，告警应在命中率跌破阈值时触发。',
+  ];
+  function buildPrefillPrompt(targetTokens, variant, ratio) {
+    const chars = Math.max(Math.round(targetTokens * (ratio || 2.7)), 300);
+    const header = `请阅读以下材料，读完后输出 OK 即可。\n材料编号 V${variant}：\n`;
+    let out = header, i = 0;
+    while (out.length < chars) { out += FILLERS[(i + variant) % FILLERS.length]; i++; }
+    return out.slice(0, chars) + '\n（材料结束）';
+  }
+
+  // ---------- runner ----------
+  let RUN = null; // current/last run
+  let RUN_SEQ = 0;
+
+  function addEvent(state, kind, title, text) {
+    state.events.push({ ts: new Date().toTimeString().slice(0, 8), kind, title, text });
+    if (state.events.length > 300) state.events.shift();
+  }
+
+  // 实时采样器（每 1s 采 /metrics，环形缓冲 300 点）
+  const LIVE_CAP = 300;
+  function liveInit(state) {
+    state.live = { t: [], tg: [], pg: [], run: [], wait: [], kv: [], prevTs: 0, prevGen: 0, prevProm: 0, t0: Date.now() };
+  }
+  async function liveTick(state, s) {
+    const L = state.live;
+    if (!L) return;
+    const now = Date.now();
+    const m = await getMetrics(s);
+    const gen = m['vllm:generation_tokens_total'] ?? m['sglang:generation_tokens_total'] ?? 0;
+    const prom = m['vllm:prompt_tokens_total'] ?? m['sglang:prompt_tokens_total'] ?? 0;
+    const kvRaw = m['vllm:kv_cache_usage_perc'] ?? m['sglang:token_usage'];
+    const kv = (kvRaw == null ? (m['vllm:gpu_cache_usage_perc'] || 0) : kvRaw) * 100;
+    if (!L.prevTs) { L.prevTs = now; L.prevGen = gen; L.prevProm = prom; }
+    const dt = (now - L.prevTs) / 1000;
+    if (dt >= 0.5) {
+      let tg = 0, pg = 0;
+      if (gen >= L.prevGen) tg = (gen - L.prevGen) / dt;
+      if (prom >= L.prevProm) pg = (prom - L.prevProm) / dt;
+      L.t.push(Math.round((now - L.t0) / 1000));
+      L.tg.push(+tg.toFixed(1));
+      L.pg.push(+pg.toFixed(1));
+      L.run.push(m['vllm:num_requests_running'] ?? m['vllm:num_running_requests'] ?? m['sglang:num_running_requests'] ?? 0);
+      L.wait.push(m['vllm:num_requests_waiting'] ?? m['vllm:num_waiting_requests'] ?? m['sglang:num_queue_reqs'] ?? 0);
+      L.kv.push(+kv.toFixed(1));
+      if (L.t.length > LIVE_CAP) { L.t.shift(); L.tg.shift(); L.pg.shift(); L.run.shift(); L.wait.shift(); L.kv.shift(); }
+      L.prevTs = now; L.prevGen = gen; L.prevProm = prom;
+    }
+  }
+
+  function buildFinal(mode, state, repsUsed) {
+    if (mode === 'single') {
+      const ids = state.order || Object.keys(state.single);
+      const rows = ids.map((id) => state.single[id]).filter(Boolean)
+        .map((r) => ({ name: r.name, tps: r.meanTps, ttft: r.meanTtft, accept: r.accept }));
+      if (!rows.length) return null;
+      const tpss = rows.map((r) => r.tps).filter(Boolean);
+      if (!tpss.length) return null;
+      const sorted = [...rows].sort((a, b) => b.tps - a.tps);
+      const st = [...tpss].sort((a, b) => a - b);
+      const median = st.length % 2 ? st[(st.length - 1) / 2] : (st[st.length / 2 - 1] + st[st.length / 2]) / 2;
+      const accRows = rows.filter((r) => r.accept != null);
+      return {
+        mode, count: rows.length,
+        avg: +mean(tpss).toFixed(1), median: +median.toFixed(1),
+        best: sorted[0], worst: sorted[sorted.length - 1],
+        spreadPct: +(100 * (sorted[0].tps - sorted[sorted.length - 1].tps) / mean(tpss)).toFixed(1),
+        meanTtft: Math.round(mean(rows.map((r) => r.ttft).filter(Boolean))),
+        meanAccept: accRows.length ? +mean(accRows.map((r) => r.accept)).toFixed(1) : null,
+        repsUsed: repsUsed || null,
+        top3: sorted.slice(0, 3), bottom3: sorted.slice(-3).reverse(),
+        rows: sorted,
+      };
+    }
+    if (mode === 'conc') {
+      const cs = Object.keys(state.conc).map(Number).sort((a, b) => a - b);
+      if (!cs.length) return null;
+      const rows = cs.map((c) => ({ c, agg: state.conc[c].meanAgg, accept: state.conc[c].meanAccept, wall: +(mean(state.conc[c].reps.map((x) => x.wall))).toFixed(2) }));
+      const peak = rows.reduce((a, b) => (b.agg > a.agg ? b : a));
+      const base = rows.find((r) => r.c === 1) || rows[0];
+      return {
+        mode, rows, peak,
+        baseC: base.c, baseAgg: base.agg,
+        scale: base.agg ? +(peak.agg / base.agg).toFixed(2) : null,
+        meanAccept: rows.some((r) => r.accept != null) ? +mean(rows.filter((r) => r.accept != null).map((r) => r.accept)).toFixed(1) : null,
+      };
+    }
+    if (mode === 'prefill') {
+      const ks = Object.keys(state.prefill).map(Number).sort((a, b) => a - b);
+      if (!ks.length) return null;
+      const rows = ks.map((k) => ({ len: k, ptps: state.prefill[k].meanPtps, ttft: state.prefill[k].meanTtft, tokens: state.prefill[k].meanPromptTokens }));
+      const best = rows.filter((r) => r.ptps).reduce((a, b) => (b.ptps > (a.ptps || 0) ? b : a), rows[0]);
+      return { mode, rows, best };
+    }
+    return null;
+  }
+
+  async function runBench(params) {
+    const { model, suite, reps, concLevels, maxTokens, settle, repSettle, tag, prefill } = params;
+    const mode = MODES.includes(params.mode) ? params.mode : 'single';
+    // 内部一律用服务 id 作身份标识（缺 sid 时回退到 port）
+    const _target = svc(params.sid != null ? params.sid : params.port);
+    const s = _target ? _target.id : params.port;
+    const state = RUN;
+    const runAc = new AbortController(); // /api/stop 时立刻中止所有在途请求
+    state.runAc = runAc;
+    // 轮次独立：默认开启；repSettle=轮间静置秒数（缺省 3）；salt 保证每轮提示词首部唯一
+    const roundIso = params.roundIso !== false;
+    const isoSettle = Number.isFinite(+repSettle) ? +repSettle : 3;
+    state.repSettle = isoSettle;
+    state.salt = 'bench ' + Math.random().toString(36).slice(2, 8) + ' ';
+    state.flushCap = { svc: null, path: null };
+    state.mode = mode;
+    state.status = 'running';
+    let liveTimer = null;
+    try {
+      // 1. health（最多等 3 分钟，避免引擎启动中误判就绪）
+      state.stage = 'health';
+      let healthy = false;
+      for (let i = 0; i < 90; i++) {
+        try {
+          const r = await fetchWithTimeout(baseUrl(s) + '/health', 3000, svcKey(s));
+          if (r.ok) { healthy = true; break; }
+        } catch (e) {}
+        if (state.abort) throw new Error('aborted');
+        await sleep(2000);
+      }
+      if (!healthy) throw new Error('服务未就绪（health 检查未通过）');
+      // 2. load prompts（单流/并发需要；预填充不需要）
+      let prompts = [];
+      if (mode !== 'prefill') {
+        try { prompts = JSON.parse(fs.readFileSync(PROMPT_FILES[suite] || PROMPT_FILES['13'], 'utf8')); } catch (e) {}
+        if (!prompts.length) throw new Error(`prompt 文件加载失败或为空：${PROMPT_FILES[suite] || PROMPT_FILES['13']}`);
+        state.order = prompts.map((p) => p.id);
+      }
+      // 3. settle
+      state.stage = 'settle';
+      state.stageNote = `静置 ${settle}s`;
+      for (let i = 0; i < settle; i++) {
+        if (state.abort) throw new Error('aborted');
+        await sleep(1000);
+      }
+      // 4. warmup（失败自动重试 3 次，引擎刚就绪时可能瞬时拒绝连接）
+      state.stage = 'warmup';
+      state.stageNote = '预热请求';
+      for (let w = 0; w < 3; w++) {
+        try { await streamChat(s, model, '你好', 20, runAc.signal); break; } catch (e) {
+          if (state.abort) throw new Error('aborted');
+          if (w === 2) throw e;
+          state.stageNote = `预热失败，重试 ${w + 2}/3…`;
+          await sleep(5000);
+        }
+      }
+      // 5. 启动实时采样
+      liveInit(state);
+      liveTick(state, s).catch(() => {});
+      liveTimer = setInterval(() => { liveTick(state, s).catch(() => {}); }, 1000);
+
+      const m0 = await getMetrics(s);
+
+      if (roundIso) addEvent(state, 'type', '🧹 轮次独立模式',
+        '每轮之间：等引擎完全排空 + 冲刷前缀缓存（若服务支持）+ 轮间静置 ' + isoSettle + 's；'
+        + '每轮提示词加 salt 前缀，前缀/radix 缓存永不命中，各轮互不干扰');
+
+      // 6a. 单流逐类型（仅此模式执行）
+      if (mode === 'single') {
+        state.single = {};
+        for (let ti = 0; ti < prompts.length; ti++) {
+          if (state.abort) throw new Error('aborted');
+          const p = prompts[ti];
+          state.stage = 'single';
+          state.stageNote = p.name;
+          state.progress = { phase: '单流', cur: ti + 1, total: prompts.length, rep: 0, reps };
+          const rec = { name: p.name, reps: [], ttfts: [], running: true };
+          state.single[p.id] = rec; // 先挂上，前端实时可见
+          for (let r = 0; r < reps; r++) {
+            if (state.abort) throw new Error('aborted');
+            state.progress.rep = r + 1;
+            state.cur = { phase: '单流', name: p.name, rep: r + 1, reps, tokens: 0, t0: Date.now() };
+            const before = await getMetrics(s);
+            const pmt = roundIso ? state.salt + 'r' + (r + 1) + '\n' + p.prompt : p.prompt;
+            const out = await streamChat(s, model, pmt, maxTokens, runAc.signal,
+              (tk) => { if (state.cur) state.cur.tokens = tk; });
+            const after = await getMetrics(s);
+            const d = metricsDelta(before, after);
+            const acc = d['vllm:spec_decode_num_accepted_tokens_total'] || 0;
+            const dft = d['vllm:spec_decode_num_draft_tokens_total'] || 0;
+            rec.reps.push({ tps: +out.tps.toFixed(1), ttft: out.ttft, tokens: out.tokens, wall: +out.wall.toFixed(2), accept: dft ? +(100 * acc / dft).toFixed(1) : null });
+            rec.ttfts.push(out.ttft);
+            rec.meanTps = +mean(rec.reps.map((x) => x.tps)).toFixed(1);
+            rec.meanTtft = Math.round(mean(rec.ttfts));
+            if (roundIso) await roundIsolate(s, state, p.name + ' 第' + (r + 1) + '轮后');
+          }
+          rec.running = false;
+          rec.accept = rec.reps.map((x) => x.accept).filter((x) => x !== null).length
+            ? +mean(rec.reps.map((x) => x.accept).filter((x) => x !== null)).toFixed(1) : null;
+          addEvent(state, 'type', '✔ ' + p.name,
+            rec.meanTps + ' tok/s · TTFT ' + rec.meanTtft + 'ms' + (rec.accept != null ? ' · 接受率 ' + rec.accept + '%' : '')
+            + ' · ' + reps + '轮 [' + rec.reps.map((x) => x.tps).join(' / ') + ']');
+        }
+        state.cur = null;
+      }
+
+      // 6b. 并发档位（仅此模式执行）
+      if (mode === 'conc') {
+        state.conc = {};
+        const levels = concLevels.filter((c) => c >= 1 && c <= 32);
+        for (let li = 0; li < levels.length; li++) {
+          const c = levels[li];
+          state.stage = 'conc';
+          state.stageNote = `并发 c=${c}`;
+          state.progress = { phase: '并发', cur: li + 1, total: levels.length, rep: 0, reps };
+          const rec = { reps: [], running: true };
+          state.conc[c] = rec;
+          for (let r = 0; r < reps; r++) {
+            if (state.abort) throw new Error('aborted');
+            state.progress.rep = r + 1;
+            state.cur = { phase: '并发', c, rep: r + 1, reps, tokens: 0, done: 0, total: c, t0: Date.now() };
+            const before = await getMetrics(s);
+            const t0 = Date.now();
+            const ac = new AbortController();
+            runAc.signal.addEventListener('abort', () => ac.abort(), { once: true }); // 随时停止联动
+            const jobs = [];
+            for (let i = 0; i < c; i++) {
+              const p = prompts[(i + r * c) % prompts.length];
+              const pmt = roundIso ? state.salt + 'r' + (r + 1) + 'j' + i + '\n' + p.prompt : p.prompt;
+              jobs.push(streamChat(s, model, pmt, maxTokens, ac.signal,
+                (tk) => { if (state.cur) state.cur.tokens = Math.max(state.cur.tokens, tk) + 0; })
+                .then((o) => { if (state.cur) state.cur.done++; return o; })
+                .catch((e) => { if (state.cur) state.cur.done++; return { err: String(e.message || e) }; }));
+            }
+            const outs = await Promise.all(jobs);
+            const wall = (Date.now() - t0) / 1000;
+            const ok = outs.filter((o) => !o.err);
+            const totalTokens = ok.reduce((sum, o) => sum + o.tokens, 0);
+            const after = await getMetrics(s);
+            const d = metricsDelta(before, after);
+            const acc = d['vllm:spec_decode_num_accepted_tokens_total'] || 0;
+            const dft = d['vllm:spec_decode_num_draft_tokens_total'] || 0;
+            rec.reps.push({
+              aggTps: wall ? +(totalTokens / wall).toFixed(1) : 0,
+              wall: +wall.toFixed(2), ok: ok.length, fail: outs.length - ok.length,
+              accept: dft ? +(100 * acc / dft).toFixed(1) : null,
+            });
+            rec.meanAgg = +mean(rec.reps.map((x) => x.aggTps)).toFixed(1);
+            if (roundIso) await roundIsolate(s, state, 'c=' + c + ' 第' + (r + 1) + '轮后');
+          }
+          rec.running = false;
+          rec.meanAccept = rec.reps.map((x) => x.accept).filter((x) => x !== null).length
+            ? +mean(rec.reps.map((x) => x.accept).filter((x) => x !== null)).toFixed(1) : null;
+          addEvent(state, 'conc', '✔ 并发 c=' + c,
+            '聚合 ' + rec.meanAgg + ' tok/s' + (rec.meanAccept != null ? ' · 接受率 ' + rec.meanAccept + '%' : '')
+            + ' · ' + reps + '轮 [' + rec.reps.map((x) => x.aggTps).join(' / ') + ']');
+        }
+        state.cur = null;
+      }
+
+      // 6c. 预填充（仅此模式执行；/v1/completions，每轮换 filler 变体规避前缀缓存）
+      if (mode === 'prefill' && prefill && prefill.enabled && Array.isArray(prefill.lengths) && prefill.lengths.length) {
+        state.prefill = {};
+        let ratio = 2.7;
+        try {
+          const cal = await streamPrefill(s, model, buildPrefillPrompt(1024, 997, ratio), runAc.signal);
+          if (cal.promptTokens) ratio = Math.round(1024 * 2.7) / cal.promptTokens;
+        } catch (e) {}
+        const lens = prefill.lengths.filter((n) => n >= 256 && n <= 131072).sort((a, b) => a - b);
+        for (let li = 0; li < lens.length; li++) {
+          const target = lens[li];
+          state.stage = 'prefill';
+          state.stageNote = `预填充 ~${target >= 1024 ? (target / 1024) + 'K' : target} tokens`;
+          state.progress = { phase: '预填充', cur: li + 1, total: lens.length, rep: 0, reps };
+          const rec = { reps: [], running: true };
+          state.prefill[target] = rec;
+          for (let r = 0; r < reps; r++) {
+            if (state.abort) throw new Error('aborted');
+            state.progress.rep = r + 1;
+            state.cur = { phase: '预填充', len: target, rep: r + 1, reps, tokens: 0, t0: Date.now() };
+            const prompt = buildPrefillPrompt(target, r * 7 + li, ratio);
+            const out = await streamPrefill(s, model, prompt, runAc.signal);
+            const pt = out.promptTokens || Math.round(target * 0.9);
+            rec.reps.push({
+              promptTokens: pt,
+              ttft: out.ttft,
+              ptps: out.ttft ? +(pt / (out.ttft / 1000)).toFixed(0) : null,
+            });
+            rec.meanPtps = +(mean(rec.reps.map((x) => x.ptps).filter(Boolean))).toFixed(0);
+            rec.meanTtft = Math.round(mean(rec.reps.map((x) => x.ttft).filter(Boolean)));
+            rec.meanPromptTokens = Math.round(mean(rec.reps.map((x) => x.promptTokens)));
+            if (roundIso) await roundIsolate(s, state, '~' + (target >= 1024 ? (target / 1024) + 'K' : target) + 'tok 第' + (r + 1) + '轮后');
+          }
+          rec.running = false;
+          addEvent(state, 'pf', '✔ 预填充 ~' + (target >= 1024 ? (target / 1024) + 'K' : target) + ' tok',
+            rec.meanPtps + ' tok/s · TTFT ' + rec.meanTtft + 'ms · ' + reps + '轮 [' + rec.reps.map((x) => x.ptps).join(' / ') + ']');
+        }
+        state.cur = null;
+      }
+
+      // 7. summary metrics
+      const mEnd = await getMetrics(s);
+      const dAll = metricsDelta(m0, mEnd);
+      state.summary = {
+        prefixHit: dAll['vllm:prefix_cache_queries_total'] > 0
+          ? +(100 * (dAll['vllm:prefix_cache_hits_total'] || 0) / dAll['vllm:prefix_cache_queries_total']).toFixed(1) : null,
+        accept: dAll['vllm:spec_decode_num_draft_tokens_total'] > 0
+          ? +(100 * (dAll['vllm:spec_decode_num_accepted_tokens_total'] || 0) / dAll['vllm:spec_decode_num_draft_tokens_total']).toFixed(1) : null,
+      };
+
+      // 8. 最终汇总
+      state.final = buildFinal(mode, state, reps);
+      if (state.final) {
+        let head = '';
+        if (mode === 'single') head = state.final.count + ' 类均值 ' + state.final.avg + ' tok/s，最快「' + state.final.best.name + '」' + state.final.best.tps + '，最慢「' + state.final.worst.name + '」' + state.final.worst.tps;
+        else if (mode === 'conc') head = '峰值 c=' + state.final.peak.c + ' 聚合 ' + state.final.peak.agg + ' tok/s' + (state.final.scale ? '（相对 c' + state.final.baseC + ' ×' + state.final.scale + '）' : '');
+        else head = '峰值 ~' + (state.final.best.len >= 1024 ? (state.final.best.len / 1024) + 'K' : state.final.best.len) + ' tok 档 ' + state.final.best.ptps + ' tok/s';
+        addEvent(state, 'final', '🏁 测试完成', head);
+      }
+
+      // 9. save
+      state.stage = 'save';
+      const file = `${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}_${(tag || 'run')}_${mode}.json`;
+      const record = {
+        file, tag: tag || 'run', mode, timestamp: new Date().toISOString(),
+        service: svc(s) || { port: s, name: String(s) },
+        model, params: { suite, reps, concLevels, maxTokens, settle, repSettle: isoSettle, roundIso, prefill: prefill || null },
+        single: state.single, conc: state.conc, prefill: state.prefill,
+        summary: state.summary, final: state.final, events: state.events,
+        order: state.order,
+      };
+      fs.writeFileSync(path.join(RESULT_DIR, file), JSON.stringify(record, null, 1));
+      state.status = 'done';
+      state.stage = 'done';
+      state.stageNote = '';
+      state.file = file;
+    } catch (e) {
+      state.status = state.abort ? 'aborted' : 'error';
+      state.error = String(e.message || e);
+      state.stage = state.error;
+    } finally {
+      if (liveTimer) clearInterval(liveTimer);
+      state.cur = null;
+      state.progress = {};
+      // 中断/出错时清掉「测试中」状态并结算已完成轮次的均值，避免前端永远显示 running
+      for (const g of [state.single, state.conc, state.prefill]) {
+        for (const k of Object.keys(g || {})) {
+          const rec = g[k];
+          if (rec && rec.running) {
+            rec.running = false;
+            if (rec.reps && rec.reps.length) {
+              if (rec.meanTps === undefined && rec.reps[0].tps !== undefined) rec.meanTps = +mean(rec.reps.map((x) => x.tps)).toFixed(1);
+              if (rec.meanAgg === undefined && rec.reps[0].aggTps !== undefined) rec.meanAgg = +mean(rec.reps.map((x) => x.aggTps)).toFixed(1);
+              if (rec.meanPtps === undefined && rec.reps[0].ptps !== undefined) rec.meanPtps = +(mean(rec.reps.map((x) => x.ptps).filter(Boolean))).toFixed(0);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ---------- API（pathname 前缀 /v1/internal/bench） ----------
+  // 对外一律不暴露 apiKey（前端用不到它，鉴权全部在服务端完成）
+  function publicSvc(x) { const { apiKey, ...rest } = x; return { ...rest, hasKey: !!apiKey }; }
+  async function handleApi(req, res, url) {
+    const sub = url.pathname.slice('/v1/internal/bench'.length);
+    if (sub === '/config' && req.method === 'GET') {
+      return json(res, 200, {
+        version: VERSION, embedded: true,
+        configFile: fs.existsSync(path.join(__dirname, 'bench-services.json')) ? path.join(__dirname, 'bench-services.json') : null,
+        resultsDir: RESULT_DIR,
+        promptFiles: PROMPT_FILES,
+        services: services().length,
+      });
+    }
+    if (sub === '/services' && req.method === 'GET') {
+      const out = [];
+      for (const x of services()) {
+        let healthy = false, model = null;
+        try {
+          const r = await fetchWithTimeout(baseUrl(x.id) + '/v1/models', 2500, svcKey(x.id));
+          if (r.ok) { const j = await r.json(); model = j.data && j.data[0] && j.data[0].id; healthy = true; }
+        } catch (e) {}
+        out.push({ ...publicSvc(x), healthy, model });
+      }
+      return json(res, 200, out);
+    }
+    if (sub === '/metrics' && req.method === 'GET') {
+      const key = url.searchParams.get('sid') || url.searchParams.get('port') || 'local';
+      const m = await getMetrics(key);
+      const q = m['vllm:prefix_cache_queries_total'] || 0, h = m['vllm:prefix_cache_hits_total'] || 0;
+      const dft = m['vllm:spec_decode_num_draft_tokens_total'] || 0, acc = m['vllm:spec_decode_num_accepted_tokens_total'] || 0;
+      return json(res, 200, {
+        prefixHit: q ? +(100 * h / q).toFixed(1) : null,
+        accept: dft ? +(100 * acc / dft).toFixed(1) : null,
+      });
+    }
+    if (sub === '/run' && req.method === 'POST') {
+      if (RUN && RUN.status === 'running') return json(res, 409, { error: '已有测试在跑' });
+      const b = await readBody(req);
+      b.mode = MODES.includes(b.mode) ? b.mode : 'single';
+      RUN = {
+        runId: ++RUN_SEQ, status: 'init', stage: 'init', stageNote: '', mode: b.mode,
+        params: b, abort: false, startedAt: new Date().toISOString(),
+        single: {}, conc: {}, prefill: {}, progress: {}, events: [], cur: null, final: null,
+      };
+      runBench(b); // async
+      return json(res, 200, { runId: RUN.runId, mode: b.mode });
+    }
+    if (sub === '/run' && req.method === 'GET') {
+      if (!RUN) return json(res, 200, {});
+      const st = { ...RUN };
+      delete st.abort;
+      delete st.params;
+      delete st.runAc;
+      return json(res, 200, st);
+    }
+    if (sub === '/stop' && req.method === 'POST') {
+      if (RUN) { RUN.abort = true; if (RUN.runAc) RUN.runAc.abort(); } // 随时停止：立刻掐断所有在途流
+      return json(res, 200, { ok: true });
+    }
+    if (sub === '/history' && req.method === 'GET') {
+      let files = [];
+      try { files = fs.readdirSync(RESULT_DIR).filter((f) => f.endsWith('.json')).sort().reverse(); } catch (e) {}
+      const list = [];
+      for (const f of files) {
+        try {
+          const j = JSON.parse(fs.readFileSync(path.join(RESULT_DIR, f), 'utf8'));
+          const singleIds = Object.keys(j.single || {});
+          const orderIds = j.order && j.order.length ? j.order : singleIds;
+          const mArr = singleIds.map((id) => (j.single[id] || {}).meanTps).filter((x) => x);
+          const singleMean = mArr.length ? +mean(mArr).toFixed(1) : null;
+          const tArr = orderIds.map((id) => (j.single[id] || {}).meanTtft).filter((x) => x != null && x);
+          const aArr = orderIds.map((id) => (j.single[id] || {}).accept).filter((x) => x != null);
+          const concMeans = {};
+          for (const c of Object.keys(j.conc || {})) concMeans[c] = j.conc[c].meanAgg;
+          const concPeak = j.final && j.final.mode === 'conc' && j.final.peak ? j.final.peak : null;
+          const pfPeak = j.final && j.final.mode === 'prefill' && j.final.best ? j.final.best.ptps : null;
+          list.push({
+            file: f, tag: j.tag, mode: j.mode || 'full', timestamp: j.timestamp,
+            service: j.service && j.service.name, model: j.model,
+            reps: (j.params && j.params.reps) || null, types: singleIds.length || null,
+            singleMean,
+            singleTtft: tArr.length ? Math.round(mean(tArr)) : null,
+            singleAccept: aArr.length ? +mean(aArr).toFixed(1) : null,
+            concMeans, concPeak, pfPeak,
+          });
+        } catch (e) {}
+      }
+      return json(res, 200, list);
+    }
+    if (sub === '/history/read' && req.method === 'GET') {
+      const f = url.searchParams.get('f') || '';
+      if (!f.endsWith('.json') || f.includes('..')) return json(res, 400, { error: 'bad file' });
+      try { return json(res, 200, JSON.parse(fs.readFileSync(path.join(RESULT_DIR, f), 'utf8'))); } catch (e) { return json(res, 404, { error: String(e) }); }
+    }
+    return json(res, 404, { error: 'not found' });
+  }
+
+  return { handleApi, VERSION };
+})();
+
 // ====== 09-20 控制台鉴权（可选启用）======
 // /home/ll/deploy/console-auth.json 存在且含 token 时启用：所有 /v1/internal/ 的 POST
 // （启动/停止模型、重置计费、改功耗等状态变更）必须带 X-Console-Token 头或 ?ct= 参数。
@@ -6898,7 +7709,7 @@ const server = http.createServer(async (req, res) => {
   const pathname = urlObj.pathname;
 
   // 09-20：内部 API/页面/静态资源启用 gzip；代理路径（chat/completions 流式）绝不压缩
-  if (pathname === '/' || pathname === '/index.html' || pathname === '/m' || pathname === '/mobile.html'
+  if (pathname === '/' || pathname === '/index.html' || pathname === '/m' || pathname === '/mobile.html' || pathname === '/bench.html'
       || pathname.startsWith('/static/') || pathname.startsWith('/v1/internal/')) {
     installGzip(req, res);
   }
@@ -6914,6 +7725,13 @@ const server = http.createServer(async (req, res) => {
         return;
       }
     }
+  }
+
+  // === Bench Console API（09-23 移植，详见 BENCH 模块头注释）===
+  if (pathname === '/v1/internal/bench' || pathname.startsWith('/v1/internal/bench/')) {
+    return BENCH.handleApi(req, res, urlObj).catch((e) => {
+      try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: String((e && e.message) || e) })); } catch (_) {}
+    });
   }
 
   // === Internal API: Model Running Parameters ===
@@ -6951,6 +7769,53 @@ const server = http.createServer(async (req, res) => {
         if (filled) p.sampling_source = 'generation_config';
       } catch (e) {}
     }
+    // [ple-display 0923] PLE n-gram 表精度与驻留位置（Flash-Next 脚本化模型专属）。
+    // 数据源=inner 启动时打进日志的 [FN-PLE-*] 标记行：引擎进程属 root（chroot），
+    // /proc/<pid>/environ 读不了、cmdline 也不含该信息，日志是唯一可靠判据；
+    // 取文件尾部 2MB 窗口内最后一次命中 = 最近一次启动的模式（10s TTL 缓存，
+    // 前端 500ms 轮询不至于反复读 6MB 日志）。三种判据：
+    //   INT8 磁盘驻留(mmap 可回收) / INT8 内存驻留(匿名堆 48.3GiB, VLLM_PLE_INT8_MEMORY=1) /
+    //   BF16 磁盘驻留(mmap 零堆) / BF16 内存驻留(匿名堆 95.4GiB，含旧文案"回退 BF16 匿名堆")。
+    function readPleStatusCached(logPath) {
+      if (!logPath) return null;
+      if (!global.__pleStatusCache) global.__pleStatusCache = new Map();
+      const hit = global.__pleStatusCache.get(logPath);
+      if (hit && Date.now() - hit.t < 10000) return hit.ple;
+      let ple = null;
+      const fdArr = [];
+      try {
+        const st = fs.statSync(logPath);
+        const CHUNK = 1024 * 1024, MIN_POS = Math.max(0, st.size - 64 * 1024 * 1024);
+        const fd = fs.openSync(logPath, 'r');
+        fdArr.push(fd);
+        let pos = st.size, carry = '';
+        scan:
+        while (pos > MIN_POS) {                       // 反向分块：找到的第一条=最近一次启动的判据
+          const start2 = Math.max(MIN_POS, pos - CHUNK);
+          const len = pos - start2;
+          const buf = Buffer.alloc(len);
+          fs.readSync(fd, buf, 0, len, start2);
+          const parts = (buf.toString('utf8') + carry).split('\n');
+          carry = parts.shift() || '';                // 块首残句，并入下一（更早）块
+          for (let i = parts.length - 1; i >= 0; i--) {
+            const line = parts[i];
+            if (line.indexOf('[FN-PLE-') < 0) continue;
+            // 引擎真值行（晚于 inner echo，反向先命中；含自校验回落后的实际形态）
+            if (line.indexOf('[FN-PLE-INT8]') >= 0 && line.indexOf('n-gram table attached') >= 0) { ple = { dtype: 'int8', loc: line.indexOf('anonymous heap') >= 0 ? 'heap' : 'disk' }; break scan; }
+            if (line.indexOf('[FN-PLE-DISK]') >= 0 && line.indexOf('n-gram table attached') >= 0) { ple = { dtype: 'bf16', loc: 'disk' }; break scan; }
+            // inner echo 行（heap 模式无引擎挂载行，靠它判定；旧文案"回退 BF16 匿名堆"同归 heap）
+            if (line.indexOf('INT8 磁盘驻留') >= 0) { ple = { dtype: 'int8', loc: 'disk' }; break scan; }
+            if (line.indexOf('INT8 内存驻留') >= 0) { ple = { dtype: 'int8', loc: 'heap' }; break scan; }
+            if (line.indexOf('BF16 磁盘驻留') >= 0) { ple = { dtype: 'bf16', loc: 'disk' }; break scan; }
+            if (line.indexOf('内存驻留') >= 0 || line.indexOf('匿名堆') >= 0) { ple = { dtype: 'bf16', loc: 'heap' }; break scan; }
+          }
+          pos = start2;
+        }
+      } catch (e) {}
+      for (const fd of fdArr) { try { fs.closeSync(fd); } catch (e) {} }
+      global.__pleStatusCache.set(logPath, { t: Date.now(), ple });
+      return ple;
+    }
     try {
       const { execSync } = require('child_process');
       const query = require('url').parse(req.url, true).query;
@@ -6964,6 +7829,17 @@ const server = http.createServer(async (req, res) => {
             const p = parseServerParams(cmdline, runtime, inst.port);
             if (runtime === 'sglang') p.attention_backend = null; // sglang 无此参数，避免显示 vLLM 默认值
             applyGenConfigDefaults(p, cmdline); // 未显式传采样参数时回落模型 generation_config
+            // [ple-display 0923] Flash-Next 脚本化实例：附 PLE 表精度/驻留（日志判据）。
+            // 注意：同端口可能注册着多个脚本模型条目（18420 先后有 NVFP4/W4A16 两栈，
+            // scriptModelForPort 取先到者会拿错日志）——这里枚举该端口全部条目，用进程
+            // cmdline 的模型路径命中排序，逐个尝试解析直到命中（日志文件经
+            // pickScriptModelLogFile 内容打分选定，防同端口换栈后拿旧文件说谎）。
+            const pleSm = scriptModelsForPort(inst.port, cmdline);
+            for (const cand of pleSm) {
+              const lf = pickScriptModelLogFile(inst, cand) || cand.log;
+              const ple = readPleStatusCached(lf);
+              if (ple) { p.ple_table = ple; break; }
+            }
             all.push({ ...p, port: inst.port, gpu: inst.gpu,
               gpus: inst.gpus || (inst.gpu != null ? [inst.gpu] : []),
               runtime, model: inst.servedName || inst.modelPath || '' });
@@ -6998,6 +7874,12 @@ const server = http.createServer(async (req, res) => {
       const cmdline = fs.readFileSync(`/proc/${out}/cmdline`, 'utf8').split('\0').filter(Boolean);
       const params = parseServerParams(cmdline, runtime, wantPort);
       applyGenConfigDefaults(params, cmdline); // 未显式传采样参数时回落模型 generation_config
+      // [ple-display 0923] 单端口模式同样附 PLE 表状态（脚本化模型端口才有效）
+      const smPle1 = scriptModelForPort(wantPort);
+      if (smPle1) {
+        const ple1 = readPleStatusCached(pickScriptModelLogFile({ pid: out, port: wantPort }, smPle1) || smPle1.log);
+        if (ple1) params.ple_table = ple1;
+      }
       // 思考模式：sglang 从 cmdline --default-chat-template-kwargs 读取（同 vllm）
       // 未传参时保持 null，前端显示「✅ 默认（开）」（模板缺省 enable_thinking=true）
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -8241,6 +9123,8 @@ const server = http.createServer(async (req, res) => {
               rememberPortGpu(_sglInstList); // 最近请求表 GPU 归因回溯
             }
             sg.cache_per_port = perPortCacheStats();
+            // [kvoff-display 09-22] SGLang 主分支同样输出（18420 这类 vLLM 从实例也要显示）
+            sg.kv_offload_ports = kvOffloadPortsInfo();
             // 0命中占比（vLLM+SGLang 双源，09-01 修复：此前仅 vLLM 分支调用，SGLang 主实例下恒缺失）
             try { const _zh = zeroHitStats(); if (_zh) sg.zero_hit = _zh; } catch (e) {}
             try {
@@ -8410,6 +9294,8 @@ const server = http.createServer(async (req, res) => {
 
           // 每 GPU 累计缓存命中率（各实例 ticker 累计计数器，独立于重置基线）
           result.cache_per_port = perPortCacheStats();
+          // [kvoff-display 09-22] 各 vLLM 实例 CPU KV 二级缓存状态（未开启的实例无条目）
+          result.kv_offload_ports = kvOffloadPortsInfo();
 
           // ====== Performance Benchmark Metrics (since last reset) ======
           // pp TPS：优先用 ticker 每秒实测的「未缓存预填充吞吐」（vLLM 每迭代
@@ -8629,31 +9515,30 @@ const server = http.createServer(async (req, res) => {
   // === Internal API: Power (各电子元件 + 进程级实时功耗，Scaphandre 式归因) ===
   if (pathname === '/v1/internal/power') {
     let gpu = { name: null, powerW: null, limitW: null, utilization: null, memUsedMiB: null, cardCount: 0 };
+    // 09-22：改用 1s 异步采样的全局缓存（sampleGpuStats → global.__gpuLive / __gpuStatic）。
+    // 此前这里是 execSync nvidia-smi（timeout 5s）——本机制卡驱动异常时 nvidia-smi 会进
+    // D 状态，execSync 的 timeout 对其无效，会把整个 Node 事件循环卡死 → 全站接口
+    // （含仪表盘 stats）成片停摆。违反 09-20 铁律「nvidia-smi 必须异步+真超时」。
     try {
-      const out = require('child_process').execSync(
-        'nvidia-smi --query-gpu=name,power.draw,power.limit,utilization.gpu,memory.used --format=csv,noheader',
-        { encoding: 'utf8', timeout: 5000 }
-      ).trim();
-      // 多卡求和：功率/上限/显存累加，利用率取最大值（单卡机行为不变）
-      const lines = out ? out.split('\n').filter(l => l.trim()) : [];
-      if (lines.length) {
+      const live = global.__gpuLive;
+      const st = global.__gpuStatic;
+      if (live && Array.isArray(live.gpus) && live.gpus.length) {
         let power = 0, limit = 0, mem = 0, utilMax = 0, name = null;
-        for (const l of lines) {
-          const p = l.split(',').map(s => s.trim());
-          name = p[0] || name;
-          power += parseFloat(p[1]) || 0;
-          limit += parseFloat(p[2]) || 0;
-          mem += parseInt(p[4], 10) || 0;
-          const u = parseInt(p[3], 10) || 0;
-          if (u > utilMax) utilMax = u;
+        for (const g of live.gpus) {
+          power += g.power_draw || 0;
+          mem += g.mem_used || 0;
+          if ((g.util_gpu || 0) > utilMax) utilMax = g.util_gpu || 0;
+        }
+        if (st && Array.isArray(st.gpus)) {
+          for (const s2 of st.gpus) { name = s2.name || name; limit += s2.power_limit || 0; }
         }
         gpu = {
           name,
           powerW: Math.round(power * 10) / 10,
-          limitW: Math.round(limit * 10) / 10,
+          limitW: limit ? Math.round(limit * 10) / 10 : null,
           utilization: utilMax,
           memUsedMiB: mem,
-          cardCount: lines.length,
+          cardCount: live.gpus.length,
         };
       }
     } catch (e) {}
@@ -9968,6 +10853,22 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       res.writeHead(404);
       res.end('Not found');
+    }
+    return;
+  }
+
+  // === Serve bench console UI（09-23：「基准测试」标签的内嵌页）===
+  if (pathname === '/bench.html' || pathname === '/bench') {
+    const benchPath = path.join(__dirname, 'bench.html');
+    try {
+      const content = fs.readFileSync(benchPath, 'utf8');
+      const etag = 'W/"' + Buffer.byteLength(content) + '-' + fs.statSync(benchPath).mtimeMs.toString(36) + '"';
+      if (req.headers['if-none-match'] === etag) { res.writeHead(304); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', 'ETag': etag });
+      res.end(content);
+    } catch (e) {
+      res.writeHead(404);
+      res.end('bench.html not found');
     }
     return;
   }

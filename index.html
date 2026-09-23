@@ -712,6 +712,7 @@
             <div class="nav-tab" onclick="switchTab('energy')">能耗统计</div>
             <div class="nav-tab" onclick="switchTab('storage')">硬件监视</div>
             <div class="nav-tab" onclick="switchTab('usage')">用量统计</div>
+            <div class="nav-tab" onclick="switchTab('bench')">基准测试</div>
         </div>
     </nav>
 
@@ -1690,6 +1691,18 @@
             </div>
         </div>
 
+        <!-- ==================== Bench（基准测试 · 09-23 内嵌 bench-console） ==================== -->
+        <div id="tab-bench" class="tab-content hidden">
+            <div class="dash-header">
+                <div class="dash-title">基准测试</div>
+                <div class="dash-meta">
+                    <span style="font-size:12px;color:var(--text-tertiary)">Bench Console v2.2.1 · 单流解码 / 并发档位 / 预填充 TTFT · 结果落盘 bench-results/</span>
+                    <button class="btn" onclick="reloadBenchFrame()">重载页面</button>
+                </div>
+            </div>
+            <iframe id="benchFrame" title="Bench Console" style="width:100%;height:calc(100vh - 200px);min-height:640px;border:1px solid var(--border);border-radius:14px;background:var(--bg-card)"></iframe>
+        </div>
+
     </main>
 
     <footer style="border-top:1px solid var(--border);margin-top:40px;padding:20px 0;text-align:center;font-size:12px;color:var(--text-tertiary)">
@@ -1819,13 +1832,26 @@ function switchTab(tab) {
     document.getElementById('tab-' + tab).classList.remove('hidden');
     // Find and activate the correct tab
     const tabs = document.querySelectorAll('.nav-tab');
-    const map = { dashboard: 0, models: 1, energy: 2, storage: 3, usage: 4 };
+    const map = { dashboard: 0, models: 1, energy: 2, storage: 3, usage: 4, bench: 5 };
     if (tabs[map[tab]]) tabs[map[tab]].classList.add('active');
+    if (tab === 'bench') initBenchTab();
     if (tab === 'dashboard' && isConnected) refreshDashboard();
     if (tab === 'models') { loadVllmLogs(); loadModels(); loadQuickStart(); if (autoRefreshLogs && !logRefreshInterval) logRefreshInterval = setInterval(loadVllmLogs, 2000); }
     if (tab === 'energy') startEnergyPolling();
     if (tab === 'storage') loadStorageData();
     if (tab === 'usage' && usageLastBilling) renderUsageStats(usageLastBilling);
+}
+
+// ====== 09-23 基准测试标签（内嵌 bench-console，见 server.js BENCH 模块） ======
+// 懒加载：首次激活才拉 /bench.html（避免开页就多一套 Chart.js 与轮询）；
+// 之后来回切标签不重载——测试运行状态由内嵌页自行每秒轮询 /v1/internal/bench/run 维持。
+function initBenchTab() {
+    const f = document.getElementById('benchFrame');
+    if (f && !f.getAttribute('src')) f.setAttribute('src', '/bench.html');
+}
+function reloadBenchFrame() {
+    const f = document.getElementById('benchFrame');
+    if (f) f.setAttribute('src', '/bench.html?r=' + Date.now());
 }
 
 function updateTimestamp() {
@@ -3722,12 +3748,12 @@ function startConfigDefaults(modelName, suggestPort, suggestGpu) {
             // W4A16 档缺省 MTP 开（=生产 MTP4），NVFP4 档缺省关（该镜像 PP2+MTP 不稳）。
             mtp: smd.mtp === '1' ? '1' : '0', dflash: '0', dspark: '0', mtpTokens: smd.mtpTokens || 6,
             kvCacheQuant: 'auto', retention: '', runtime: 'vllm',
-            // [kvoff-toggle 09-22] 脚本化模型（Flash-Next W4A16）：二级缓存=生产现状（开，64GiB）
-            kvOff: '1', kvOffGiB: Number(smd.kvOffGiB) || 64,
+            // [kvoff-toggle 09-22][sync 09-23] 脚本化模型（Flash-Next W4A16）：二级缓存=生产现状（开，96GiB，c5a 后命中已通）
+            kvOff: '1', kvOffGiB: Number(smd.kvOffGiB) || 96,
             // [ple-field 0923] PLE 表精度=生产现状（INT8 磁盘驻留；选 BF16 则下发 FN_PLE_INT8=0）
             pleInt8: '1',
-            // [ple-loc 0923] PLE 表位置=生产现状（磁盘驻留 mmap；选内存驻留则下发 FN_PLE_LOC=heap）
-            pleLoc: 'disk',
+            // [ple-loc 0923][sync 09-23] 生产=heap：大 pinned 二级层会挤压页缓存，disk 模式有 09-19 缺页拖垮 decode 的事故模式；heap 匿名堆免疫此压力
+            pleLoc: 'heap',
             vllmAttnBackend: '', vllmMaxBatchedTokens: smd.maxBatchedTokens,
             vllmMaxScheduledTokens: '', vllmSchedPolicy: '', vllmAsyncScheduling: '1',
             vllmEnforceEager: '0', vllmBlockSize: smd.blockSize, vllmCpuOffloadGb: '',

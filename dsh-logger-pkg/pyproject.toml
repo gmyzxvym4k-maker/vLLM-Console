@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsh-vllm-logger"
+version = "0.1.0"
+description = "DSH per-request stats logger plugin for vLLM (request-traces.jsonl + vllm-live-prefill.jsonl)"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["dsh_vllm_logger"]
+
+[project.entry-points."vllm.stat_logger_plugins"]
+dsh_vllm_logger = "dsh_vllm_logger:DshRequestLogger"

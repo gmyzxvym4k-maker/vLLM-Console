@@ -1,0 +1,38 @@
+[
+  {
+    "id": "code_gen",
+    "name": "代码生成",
+    "note": "纯代码输出，预期接受率最高",
+    "prompt": "请用 Python 实现一个支持 TTL 过期时间的线程安全 LRU 缓存类：\n1) 支持 get(key) / put(key, value, ttl=None)；\n2) 容量满时按最近最少使用淘汰，淘汰时执行可选的 on_evict 回调；\n3) 过期条目在读取时惰性清除，另有一个后台清理线程定期清理；\n4) 线程安全，且读操作尽量少加锁。\n要求：输出完整可运行的代码，包含类型注解和一段简短的使用示例。不要输出任何解释性文字。"
+  },
+  {
+    "id": "code_fix",
+    "name": "代码修bug",
+    "note": "定位并发缺陷 + 重写",
+    "prompt": "下面这段 Python 代码在多线程下统计出的计数总是偏小，请指出根本原因，并给出修复后的完整代码（保留原有类名和方法名）。\n\n```python\nimport threading\nimport time\n\n\nclass Counter:\n    def __init__(self):\n        self.n = 0\n\n    def inc(self):\n        v = self.n\n        time.sleep(0.0001)\n        self.n = v + 1\n\n    def run(self, threads=8, loops=200):\n        ts = []\n        for _ in range(threads):\n            t = threading.Thread(target=lambda: [Counter.inc(self) for _ in range(loops)])\n            ts.append(t)\n        for t in ts:\n            t.start()\n        for t in ts:\n            t.join()\n        return self.n\n\n\nif __name__ == \"__main__\":\n    print(Counter().run())\n```\n\n请先说明原因（不超过 200 字），再给出修复后的完整代码。"
+  },
+  {
+    "id": "code_read",
+    "name": "代码解释",
+    "note": "读码讲原理 + 复杂度",
+    "prompt": "请逐段解释下面这段 Python 代码的执行流程、设计意图、线程语义，以及每处的时间复杂度与可能踩到的坑。\n\n```python\nimport threading\nimport time\nimport random\nfrom functools import wraps\n\n\ndef retry(times=5, base=0.05, cap=2.0, exceptions=(Exception,)):\n    def deco(fn):\n        @wraps(fn)\n        def wrapper(*args, **kwargs):\n            for attempt in range(times):\n                try:\n                    return fn(*args, **kwargs)\n                except exceptions:\n                    if attempt == times - 1:\n                        raise\n                    delay = min(cap, base * (2 ** attempt))\n                    time.sleep(delay * (0.5 + random.random()))\n        return wrapper\n    return deco\n\n\nclass RWLock:\n    def __init__(self):\n        self._cond = threading.Condition(threading.Lock())\n        self._readers = 0\n        self._writer = False\n\n    def read_acquire(self):\n        with self._cond:\n            while self._writer:\n                self._cond.wait()\n            self._readers += 1\n\n    def read_release(self):\n        with self._cond:\n            self._readers -= 1\n            if self._readers == 0:\n                self._cond.notify_all()\n\n    def write_acquire(self):\n        with self._cond:\n            while self._writer or self._readers:\n                self._cond.wait()\n            self._writer = True\n\n    def write_release(self):\n        with self._cond:\n            self._writer = False\n            self._cond.notify_all()\n```\n\n请从 retry 装饰器的退避曲线开始，逐段说明。"
+  },
+  {
+    "id": "zh_writing",
+    "name": "中文技术写作",
+    "note": "说明文，与历史基线同一段",
+    "prompt": "请写一篇约 600 字的说明文，介绍深度学习中的注意力机制，包括其动机、公式和复杂度。"
+  },
+  {
+    "id": "math_reason",
+    "name": "数学多步推理",
+    "note": "高熵对照，预期接受率最低",
+    "prompt": "一个袋子里有 3 个红球、4 个白球、5 个黑球，球除颜色外完全相同。现在不放回地每次随机取出一个球，直到取出的球中包含全部三种颜色为止。求所需取出次数的期望值。\n\n请用至少两种相互独立的方法逐步推导（例如状态递推与首步条件分解），给出精确的分数或小数结果，并说明两种结果如何互相验证。"
+  },
+  {
+    "id": "json_extract",
+    "name": "JSON结构化抽取",
+    "note": "高约束输出",
+    "prompt": "下面是一段会议记录，请把它逐条抽取成 JSON 数组，每条记录包含字段：name（姓名）、company（公司）、position（职位）、amount（金额，数字，单位元；没有就填 null）、date（日期，格式 YYYY-MM-DD）。\n\n会议记录：\n1. 甲骨文云的李振宇，担任解决方案架构师，报出年度授权费用 128000 元，签约日定在 2026-03-12。\n2. 蓝汛数据的周雅，是采购主管，预算 46000 元，计划 2026-03-15 走流程。\n3. 拓维信息的陈立群以技术总监身份参会，暂未给出报价，日期待定。\n4. 恒生电子的吴珊，职位是高级项目经理，金额 215000 元，日期 2026-04-02。\n5. 星环科技的郑海涛，数据平台负责人，报价 89000 元，预计 2026-04-10 确认。\n6. 明略科技的黄薇，商务经理，金额未定，落在 2026-04-18。\n7. 云徙科技的马小龙，交付总监，金额 73000 元，日期 2026-05-06。\n8. 慧策网络的苏敏，财务分析师，金额 15400 元，日期 2026-05-20。\n\n只输出 JSON 数组本身，不要输出任何解释或 markdown 代码块标记。"
+  }
+]

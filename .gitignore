@@ -1,2 +1,29 @@
+# 系统与打包产物
 .DS_Store
+dist/
 *.bak-*
+*.reverted-*
+
+# 运行时产物（server.js / vLLM 插件在部署目录写出，不入仓）
+console-auth.json
+server.log
+server-error.log
+server.log.*
+server-error.log.*
+*.log
+*-state.json
+metrics-snapshot.json
+log-clear-state.json
+bench-results/
+request-traces.jsonl
+vllm-live-prefill.jsonl
+sglang-request-metrics/
+sglang-theory-*.json
+flash-next-launch-w4a16.env
+flash-next-w4a16-loadprofile.log
+ab-swap.status*
+*.result
+__pycache__/
+*.egg-info/
+build/
+node_modules/

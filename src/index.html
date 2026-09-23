@@ -625,6 +625,41 @@
             .stat-flex-row > div:first-child { flex: 1 1 100% !important; }
             .dash-meta { flex-wrap: wrap; }
         }
+        /* ===== 页头实时指标徽标（logo 右侧空白区）：总功耗 / 生成吞吐 / GPU% / KV Cache% ===== */
+        .header-metrics {
+            flex: 1 1 auto;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            margin: 0 20px;
+            min-width: 0;
+            overflow: hidden;
+        }
+        .hdr-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg-inset);
+            font-size: 12px;
+            line-height: 1.4;
+            white-space: nowrap;
+            color: var(--text-secondary);
+        }
+        .hdr-chip svg { flex: none; opacity: .7; }
+        .hdr-chip .hdr-val {
+            font-family: var(--font-mono);
+            font-weight: 700;
+            font-size: 13px;
+            color: var(--text-primary);
+            font-variant-numeric: tabular-nums;
+        }
+        .hdr-chip .hdr-unit { font-size: 10px; color: var(--text-tertiary); margin-left: -2px; }
+        .hdr-chip .hdr-dot { color: var(--text-tertiary); margin: 0 3px; font-weight: 400; }
+        @media (max-width: 1023px) { .header-metrics { display: none; } }
         </style>
     <link rel="stylesheet" href="/static/tailwind-build.css">
 </head>
@@ -638,10 +673,33 @@
                 </div>
                 <span>vLLM Console</span>
             </div>
+            <div class="header-metrics" id="hdrMetrics">
+                <span class="hdr-chip" id="hdrPowerChip" title="整机估算总功耗 = 全部 GPU + CPU(RAPL) + 补偿值，与能耗统计页口径一致（1s 采样）">
+                    <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                    <span>总功耗</span><span class="hdr-val" id="hdrPower" style="color:var(--red)">--</span><span class="hdr-unit">W</span>
+                </span>
+                <span class="hdr-chip" id="hdrGenChip" title="生成（输出）吞吐：最近 1 秒全部实例输出 token/s">
+                    <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 17l6-6 4 4 8-8M15 7h6v6"/></svg>
+                    <span>生成吞吐</span><span class="hdr-val" id="hdrGen">--</span><span class="hdr-unit">tok/s</span>
+                </span>
+                <span class="hdr-chip" id="hdrGpuChip" title="GPU SM 利用率（逐卡）">
+                    <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" stroke-width="2"/><path stroke-width="2" d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/></svg>
+                    <span>GPU</span><span class="hdr-val" id="hdrGpu">--</span><span class="hdr-unit">%</span>
+                </span>
+                <span class="hdr-chip" id="hdrTempChip" title="GPU 温度（逐卡）">
+                    <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 14.76V5a2 2 0 0 0-4 0v9.76a4 4 0 1 0 4 0z"/></svg>
+                    <span>温度</span><span class="hdr-val" id="hdrTemp">--</span><span class="hdr-unit">°C</span>
+                </span>
+                <span class="hdr-chip" id="hdrKvChip" title="KV Cache 池占用率（各实例最高值）">
+                    <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3" stroke-width="2"/><path stroke-width="2" d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
+                    <span>KV Cache</span><span class="hdr-val" id="hdrKv">--</span><span class="hdr-unit">%</span>
+                </span>
+            </div>
             <div class="flex items-center gap-3">
                 <span id="statusDot" class="w-2 h-2 rounded-full bg-gray-400"></span>
                 <span id="serverStatus" style="font-size:13px;color:var(--text-secondary)">连接中...</span>
                 <span id="pageVersion" style="font-size:11px;color:var(--text-tertiary)" title="页面版本号（如与服务器不符请强制刷新 Ctrl+Shift+R）"></span>
+                <span id="dataFresh" style="font-size:11px;color:var(--text-tertiary)" title="仪表盘数据新鲜度：<5s 正常；变黄=轮询变慢；变红=已停摆（页面内置看门狗会自动重建轮询，无需手动刷新）"></span>
             </div>
         </div>
     </header>
@@ -877,6 +935,11 @@
                     <div class="metric-item-label" style="color:var(--green)">KV Cache</div>
                     <div class="metric-item-hint" id="cacheDetails">--</div>
                     <div class="metric-item-value" id="cacheUsage" style="color:var(--green)">--</div>
+                </div>
+                <div class="metric-item" id="kvOffCard" style="display:none" title="CPU KV 二级缓存（vLLM OffloadingConnector）：当前驻留内存档的 KV 量 / 内存档容量；小字为累计写入与回载（数据源 vllm:kv_offload_*）">
+                    <div class="metric-item-label" style="color:#22d3ee">二级缓存·CPU</div>
+                    <div class="metric-item-hint" id="kvOffHint">--</div>
+                    <div class="metric-item-value" id="kvOffValue" style="color:#22d3ee">--</div>
                 </div>
                 <div class="metric-item" id="cachedTokensCard" title="累计前缀缓存命中 token（vllm:prefix_cache_hits_total，只增不减，反映缓存累计价值；全实例合计；悬浮看每卡明细）">
                     <div class="metric-item-label" style="color:var(--green)">已缓存 token</div>
@@ -1698,6 +1761,9 @@
 // 统一包装 setInterval：document.hidden 时跳过回调（定时器保留，回前台自动按原节奏恢复）。
 (function () {
   const orig = window.setInterval.bind(window);
+  // 09-23：导出原生 setInterval，供停摆看门狗使用——看门狗绝不能被 hidden 门控，
+  // 否则它正是"回到前台后发现轮询已死"的那个兜底角色，自己也被门控就失去意义。
+  window.__origSetInterval = orig;
   window.setInterval = function (fn, ms) {
     if (typeof fn === 'function') {
       const wrapped = function () { if (document.hidden) return; fn.apply(this, arguments); };
@@ -1706,13 +1772,17 @@
     return orig(fn, ms);
   };
   // 回到前台立即刷一次仪表盘，不等下一个轮询 tick
+  // 09-23：改走 kickDashboard（清忙标志 + 补刷 + 刷新鲜度徽章），并补齐另外三类
+  // "页面重新可见"来源：pageshow=BFCache 后退恢复、focus=窗口重新获得焦点、
+  // online=断网重连。现场只挂了 visibilitychange 时，从冻结/BFCache 回来的页面
+  // 可能收不到该事件，于是永远定格在最后一帧（用户表现为"必须刷新页面"）。
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) { try { if (typeof refreshDashboard === 'function') refreshDashboard(); } catch (e) {} }
+    if (!document.hidden) { try { if (typeof kickDashboard === 'function') kickDashboard('visibilitychange'); } catch (e) {} }
   });
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20260920-r3'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r0905 = 视觉回归 0905 原版设计）
+const PAGE_VERSION = '20260923-r1'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r1 = 停摆看门狗 + 自建 fetch 超时 + 新鲜度徽章）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -1785,6 +1855,7 @@ function initSysDetail() {
 // 0.5s polling: guard against overlapping refreshes (a slow fetch must not
 // queue up — just skip the tick)
 let _dashBusy = false;
+let _dashGen = 0; // 09-23：轮次令牌（见 refreshDashboard）
 // ===== GPU 排队·处理 时间线（真实数据）=====
 // 数据源：/v1/internal/stats 的 insts（每实例 active_requests + queued + waiting_requests）
 //   active_requests（运行中请求，带真实 phase/速度/预填充明细/taskId）→ prefill / decode 段
@@ -2127,12 +2198,19 @@ function renderModelInfo() {
 }
 
 async function refreshDashboard() {
-    if (_dashBusy) return;
-    _dashBusy = true;
+    // 09-22：忙标志看门狗——上一轮若卡滞超过 15s（极端情况下 fetch 挂起），放行新一轮，
+    // 避免一次卡住的请求把仪表盘轮询永久锁死。
+    if (_dashBusy && Date.now() - (window._dashBusyAt || 0) < 15000) return;
+    // 09-23：轮次令牌代替裸布尔。原实现看门狗放行新一轮后，卡住的旧轮最终结束时
+    // 它的 finally 会把新一轮刚置上的 _dashBusy 清成 false（两轮互踩），旧轮结果
+    // 还会晚到覆盖新数据。现在只有最后一轮有权清标志，旧轮一律作废。
+    const myGen = ++_dashGen;
+    _dashBusy = true; window._dashBusyAt = Date.now();
     try {
         await _doRefreshDashboard();
+        if (myGen === _dashGen) window._lastRenderAt = Date.now(); // 新鲜度徽章判据
     } finally {
-        _dashBusy = false;
+        if (myGen === _dashGen) _dashBusy = false;
     }
 }
 async function renderConcurrentCard(s) {
@@ -2459,9 +2537,10 @@ async function _doRefreshDashboard() {
     // Stats
     try {
         const s = await apiFetch('/v1/internal/stats');
-        if (!s) return;
+        if (!s || Object.keys(s).length === 0) return; // 09-22：上游不可达时后端返回 {}，视为无数据跳过（避免用空对象刷掉卡片）
         _modelInfoInstances = s.instances;
         renderModelInfo();
+        try { updateHdrFromStats(s); } catch (e) {}
 
         // Cache blocks
         if (s.cache_blocks) {
@@ -2527,6 +2606,39 @@ async function _doRefreshDashboard() {
                     _ctVal.title = '累计前缀缓存命中 ' + _hitsT.toLocaleString() + ' tokens（只增不减）· 当前池占用 ' + _usedT.toLocaleString() + ' / 最大 ' + s.kv_cache.max_tokens.toLocaleString() + ' tokens';
                 } else {
                     _ctVal.textContent = '--';
+                }
+            }
+        }
+        // [kvoff-display 09-22] CPU KV 二级缓存卡：主值=当前驻留 GiB / 内存档容量 GiB；
+        // 小字=回载命中 token（external_kv_transfer 真值）+ 占用% + 累计写入/回载。
+        // [kvoff-hit 09-22] 命中口径：回载 token = 引擎记为「外部缓存命中」免重算的
+        // prompt token（vllm:prompt_tokens_by_source source=external_kv_transfer），
+        // 与「缓存命中」卡的 GPU 前缀命中（local_cache_hit）互补、不重叠。
+        {
+            const _koCard = document.getElementById('kvOffCard');
+            if (_koCard) {
+                const _koPorts = (s.kv_offload_ports || []).filter(p => p && p.capacity_gb);
+                const _koVal = document.getElementById('kvOffValue');
+                const _koHint = document.getElementById('kvOffHint');
+                if (_koPorts.length) {
+                    _koCard.style.display = '';
+                    const _cap = _koPorts.reduce((n, p) => n + (p.capacity_gb || 0), 0);
+                    const _fill = _koPorts.reduce((n, p) => n + (p.fill_gb || 0), 0);
+                    const _sto = _koPorts.reduce((n, p) => n + (p.stored_gb || 0), 0);
+                    const _loa = _koPorts.reduce((n, p) => n + (p.loaded_gb || 0), 0);
+                    const _ext = _koPorts.reduce((n, p) => n + (p.ext_tokens || 0), 0);
+                    const _lc = _koPorts.reduce((n, p) => n + (p.load_count || 0), 0);
+                    const _sc = _koPorts.reduce((n, p) => n + (p.store_count || 0), 0);
+                    if (_koVal) _koVal.innerHTML = _fill.toFixed(1) + '<span class="metric-item-unit">/' + (_cap >= 1 ? _cap.toFixed(0) : _cap.toFixed(1)) + ' GiB</span>';
+                    if (_koHint) _koHint.textContent = '命中 ' + (typeof billingTokenFmt === 'function' ? billingTokenFmt(_ext) : _ext.toLocaleString()) + ' tok · 占用 ' + (_cap > 0 ? (_fill / _cap * 100).toFixed(0) : '--') + '% · 存 ' + _sto.toFixed(0) + '/载 ' + _loa.toFixed(1) + ' GiB';
+                    if (_koCard) _koCard.title = _koPorts.map(p =>
+                        ('GPU' + (p.gpus && p.gpus.length > 1 ? p.gpus.join('+') : (p.gpu != null ? p.gpu : '?'))) + ' :' + (p.model || p.port) +
+                        ' 驻留 ' + (p.fill_gb || 0).toFixed(1) + '/' + (p.capacity_gb || 0).toFixed(0) + ' GiB（' + (p.fill_pct || 0).toFixed(1) + '%）' +
+                        ' 回载命中 ' + (p.ext_tokens || 0).toLocaleString() + ' tok / ' + (p.load_count || 0) + ' 次' +
+                        ' 累计存 ' + (p.stored_gb || 0).toFixed(1) + ' GiB / ' + (p.store_count || 0) + ' 次'
+                    ).join('\n') + '\n命中=CPU→GPU 回载免重算的 prompt token（与 GPU 前缀缓存命中互补）\n存=GPU→CPU 累计写入（含被驱逐的重复写入）；次=传输任务数';
+                } else {
+                    _koCard.style.display = 'none';
                 }
             }
         }
@@ -2704,7 +2816,7 @@ const RUN_PARAMS_STATIC = (document.getElementById('runParamsBody') || {}).inner
 const SAMPLING_PARAMS_STATIC = (document.getElementById('samplingParamsBody') || {}).innerHTML || '';
 let __paramsSig = null;
 function loadModelParams() {
-    fetch('/v1/internal/model-params')
+    _fetchWithTimeout('/v1/internal/model-params', null, 8000)
         .then(r => r.json())
         .then(d => {
             const insts = (d && d.instances) || [];
@@ -2720,7 +2832,7 @@ function loadModelParams() {
                 return;
             }
             // 实例集合或其参数变化才重渲染（500ms 轮询避免无谓 DOM 重建）
-            const sig = JSON.stringify(insts.map(i => [i.port, i.gpu, i.runtime, i.tensor_parallel_size, i.pipeline_parallel_size, i.gpu_memory_utilization, i.max_num_seqs, i.block_size, i.attention_backend, i.enable_chunked_prefill, i.enable_prefix_caching, i.speculative_config, i.dflash, i.dflashMethod, i.dspark, i.dsparkMethod, i.gpus, i.thinking, i.thinkingEffort, i.kv_cache_quant, i.temperature, i.top_p, i.top_k, i.min_p, i.repetition_penalty]));
+            const sig = JSON.stringify(insts.map(i => [i.port, i.gpu, i.runtime, i.tensor_parallel_size, i.pipeline_parallel_size, i.gpu_memory_utilization, i.max_num_seqs, i.block_size, i.attention_backend, i.enable_chunked_prefill, i.enable_prefix_caching, i.speculative_config, i.dflash, i.dflashMethod, i.dspark, i.dsparkMethod, i.gpus, i.thinking, i.thinkingEffort, i.kv_cache_quant, i.ple_table, i.temperature, i.top_p, i.top_k, i.min_p, i.repetition_penalty]));
             if (sig === __paramsSig) return;
             __paramsSig = sig;
             const gpuChip = (g, gpus) => {
@@ -2755,6 +2867,8 @@ function loadModelParams() {
                 row('DSpark 投机解码', 'DSpark 草稿模型加速（method/草稿路径含 dspark）', inst.dspark ? '✅ 开启' + (inst.dsparkMethod ? ' (' + inst.dsparkMethod + ')' : '') : '❌ 关闭') +
                 row('思考模式', '是否启用 reasoning 链', (inst.thinking === null || inst.thinking === undefined) ? '✅ 默认（开）' : inst.thinking ? '✅ 开启 (' + (inst.thinkingEffort || 'medium') + ')' : '❌ 关闭') +
                 row('KV 缓存量化', 'KV cache 数据类型，量化可省显存', inst.kv_cache_quant || 'auto') +
+                (inst.ple_table ? row('PLE 表精度', 'Flash-Next n-gram 嵌入表数据类型（日志 [FN-PLE-*] 判据）', inst.ple_table.dtype === 'int8' ? 'INT8 — 离线量化' : 'BF16 — 原生精度') : '') +
+                (inst.ple_table ? row('PLE 表驻留', 'n-gram 表运行位置：硬盘=mmap 可回收页缓存 / 内存=匿名堆全驻留', inst.ple_table.loc === 'disk' ? '💾 硬盘（mmap 驻留，可回收）' : '🧠 内存（匿名堆，不可回收）') : '') +
                 '</div></div>'
             ).join('');
             samEl.innerHTML = insts.map(inst =>
@@ -2973,7 +3087,7 @@ function initRecentRowsSelect() {
 function loadRecentRequests() {
     // 拉取窗口 = GPU0 + GPU1 + 双卡分组各自行数之和 + 余量（上限 200），保证每组都能凑够自己设置的行数
     const limit = Math.min(200, recentRowsFor(0) + recentRowsFor(1) + recentCrossRowsMax() + 20);
-    fetch('/v1/internal/recent-requests?limit=' + limit)
+    _fetchWithTimeout('/v1/internal/recent-requests?limit=' + limit, null, 8000)
         .then(r => r.json())
         .then(d => { __recentReqs = (d && d.requests) || []; renderRecentRequests(); })
         .catch(() => {});
@@ -3232,7 +3346,7 @@ function syncRecentHeaderSelects(groups) {
 }
 
 function loadSysMem() {
-    fetch('/v1/internal/sysmem')
+    _fetchWithTimeout('/v1/internal/sysmem', null, 8000)
         .then(r => r.json())
         .then(d => {
             if (!d || !d.supported) return;
@@ -3407,7 +3521,7 @@ function loadVllmLogs() {
         btn.textContent = hideLogNoise ? '显示全部行' : '隐藏 /metrics 噪音';
         btn.style.color = hideLogNoise ? 'var(--green)' : '';
     }
-    fetch('/v1/internal/vllm-logs?tailLines=400')
+    _fetchWithTimeout('/v1/internal/vllm-logs?tailLines=400', null, 10000)
         .then(r => r.json())
         .then(d => {
             const pathEl = document.getElementById('vllmLogPath');
@@ -3552,6 +3666,12 @@ function startConfigDefaults(modelName, suggestPort, suggestGpu) {
         gpuMem: 0.90, servedName: modelName, temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: 0.0, repetitionPenalty: 1.0, thinking: '1', thinkingEffort: 'medium',
         mtp: defMtp, dflash: defDflash, dspark: defDspark, mtpTokens: 7, kvCacheQuant: 'bfloat16', retention: 1664, runtime: defRuntime,
+        // [kvoff-toggle 09-22] CPU KV 二级缓存：普通 vLLM 缺省关闭（行为与旧版一致）
+        kvOff: '0', kvOffGiB: 64,
+        // [ple-field 0923] PLE n-gram 表加载精度（仅脚本化模型 Flash-Next 生效）：缺省 INT8（=inner 脚本缺省）
+        pleInt8: '1',
+        // [ple-loc 0923] PLE 表位置（仅脚本化模型生效）：disk=磁盘驻留 mmap（缺省=生产现状）/ heap=内存驻留匿名堆
+        pleLoc: 'disk',
         // vLLM 高级参数（仅 vllm 运行时生效）：默认值与后端 startVllmModel 的硬编码一致，
         // 留空/不勾选 = 后端回落默认，行为与旧版完全相同。
         vllmAttnBackend: 'FLASHINFER', vllmMaxBatchedTokens: 2048, vllmMaxScheduledTokens: '',
@@ -3598,8 +3718,16 @@ function startConfigDefaults(modelName, suggestPort, suggestGpu) {
             temperature: smd.temperature, topP: smd.topP, topK: smd.topK, minP: smd.minP,
             presencePenalty: smd.presencePenalty, repetitionPenalty: smd.repetitionPenalty,
             thinking: '1', thinkingEffort: 'medium',
-            mtp: '0', dflash: '0', dspark: '0', mtpTokens: smd.mtpTokens || 6,
+            // [mtp-default 0923] 投机缺省镜像后端 scriptModelDefaults（唯一真源）：
+            // W4A16 档缺省 MTP 开（=生产 MTP4），NVFP4 档缺省关（该镜像 PP2+MTP 不稳）。
+            mtp: smd.mtp === '1' ? '1' : '0', dflash: '0', dspark: '0', mtpTokens: smd.mtpTokens || 6,
             kvCacheQuant: 'auto', retention: '', runtime: 'vllm',
+            // [kvoff-toggle 09-22] 脚本化模型（Flash-Next W4A16）：二级缓存=生产现状（开，64GiB）
+            kvOff: '1', kvOffGiB: Number(smd.kvOffGiB) || 64,
+            // [ple-field 0923] PLE 表精度=生产现状（INT8 磁盘驻留；选 BF16 则下发 FN_PLE_INT8=0）
+            pleInt8: '1',
+            // [ple-loc 0923] PLE 表位置=生产现状（磁盘驻留 mmap；选内存驻留则下发 FN_PLE_LOC=heap）
+            pleLoc: 'disk',
             vllmAttnBackend: '', vllmMaxBatchedTokens: smd.maxBatchedTokens,
             vllmMaxScheduledTokens: '', vllmSchedPolicy: '', vllmAsyncScheduling: '1',
             vllmEnforceEager: '0', vllmBlockSize: smd.blockSize, vllmCpuOffloadGb: '',
@@ -3643,6 +3771,11 @@ function applyStartConfig(def) {
     v('modalThinkingEffort', def.thinkingEffort);
     v('modalMtpTokens', def.mtpTokens);
     v('modalKvCacheQuant', def.kvCacheQuant);
+    v('modalKvOff', def.kvOff);
+    v('modalKvOffGiB', def.kvOffGiB);
+    v('modalPleInt8', def.pleInt8);
+    v('modalPleLoc', def.pleLoc);
+    syncPleLoc(); // [ple-mem 0923] 精度×位置四形态提示（INT8/BF16 均可放硬盘或放内存）
     v('modalRetention', def.retention);
     v('modalSglangExtraEnv', def.sglangExtraEnv);
     // 存储的附加参数拆进 SGLang 结构化字段（常用 flag → 输入框/选择框），其余留在 textarea
@@ -4064,6 +4197,41 @@ function startModalFieldsHtml(modelName, suggestPort, suggestGpu) {
                         fp8_kv：仅对 KV 缓存做 FP8 量化，模型权重保持原精度，兼容所有模型。
                     </div>
                 </div>
+                <div class="config-field" style="margin-top:12px" data-tip="CPU KV 二级缓存（vLLM OffloadingConnector）：把显存 KV 块溢出到 CPU 内存形成第二层前缀缓存，超出显存池的长前缀回发时可回载、免重算。脚本化模型（Flash-Next）默认开启 64GiB（需镜像内 kvoff-c1/c2 补丁，已打）；普通 vLLM 开启=追加 --kv-transfer-config（mamba 混合模型本机未验证，启动失败请关闭本开关）；SGLang 运行时忽略。容量须 ≥ GPU KV 池才有收益（小于则是负优化，09-18 实测）。">
+                    <label class="config-label">二级缓存（CPU KV offload）</label>
+                    <select id="modalKvOff" class="config-input" style="max-width:240px">
+                        <option value="0" selected>关闭 — 不溢出到内存</option>
+                        <option value="1">开启 — KV 缓存溢出到 CPU 内存</option>
+                    </select>
+                    <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+                        <label style="font-size:12px;color:var(--text-secondary)">内存档容量</label>
+                        <input type="number" id="modalKvOffGiB" class="config-input" min="8" max="256" step="8" value="64" style="max-width:110px">
+                        <span style="font-size:12px;color:var(--text-tertiary)">GiB</span>
+                    </div>
+                    <div style="font-size:11px;color:var(--text-tertiary);margin-top:4px">
+                        容量需 ≥ GPU KV 池才有效；启动后看仪表盘「二级缓存·CPU」卡确认。
+                    </div>
+                </div>
+                <div class="config-field" style="margin-top:12px" data-tip="PLE n-gram 表加载精度（脚本化模型 Qwen3.8-Flash-Next 专用，普通 vLLM/SGLang 忽略）。INT8 = 离线逐行量化 + 逐行 bf16 scale（/media/ll/data/ple，47.7GiB+0.6GiB，启动约 3.5 分钟，实测 decode 与 BF16 持平、relMSE 4.36e-05）；放硬盘=mmap 可回收页缓存，放内存=匿名堆 48.3GiB 不可回收（引擎侧 VLLM_PLE_INT8_MEMORY=1）；BF16 = checkpoint 原生精度（95.4GiB，具体驻留形态见下方「PLE 表位置」：放硬盘=mmap 零堆可回收 / 放内存=匿名堆不可回收，会与 CPU KV 二级缓存抢内存）。INT8 产物缺失时脚本自动回落 BF16 并打警告。判据：日志 [FN-PLE-INT8] 行。">
+                    <label class="config-label">PLE 表加载（n-gram 精度）</label>
+                    <select id="modalPleInt8" class="config-input" style="max-width:300px" onchange="syncPleLoc()">
+                        <option value="1" selected>INT8 — 压缩驻留 47.7GiB（推荐，启动快）</option>
+                        <option value="0">BF16 — 原生精度 95.4GiB（匿名堆，占内存）</option>
+                    </select>
+                    <div style="font-size:11px;color:var(--text-tertiary);margin-top:4px">
+                        对应 FN_PLE_INT8 开关；仅对脚本化模型（Flash-Next W4A16）生效。本项只管精度，驻留位置由下方「PLE 表位置」决定——INT8 与 BF16 均可放硬盘（mmap）或放内存（匿名堆里 INT8 省一半内存）。
+                    </div>
+                </div>
+                <div class="config-field" style="margin-top:12px" data-tip="PLE n-gram 表存放位置（脚本化模型 Qwen3.8-Flash-Next 专用，普通 vLLM/SGLang 忽略）。本项只决定放在内存还是硬盘，精度由上方「PLE 表加载（n-gram 精度）」决定，两者正交、四种组合都成立：INT8+硬盘=mmap 47.7GiB 可回收（生产现状）、INT8+内存=匿名堆 48.3GiB 不可回收、BF16+硬盘=mmap safetensors 零堆、BF16+内存=匿名堆 95.4GiB 不可回收。磁盘驻留 = mmap 直读产物、零堆分配、页缓存可回收：不与 CPU KV 二级缓存抢不可回收内存，内存紧张时 OS 可逐出、随机读回盘时 decode 可能抖动（推荐，当前生产）。内存驻留 = 匿名堆全驻留（零缺页、零磁盘 I/O 最稳，但完全不可回收，与二级缓存同开会顶爆内存账，09-22 卡死故障成因）：INT8 档 48.3GiB（引擎侧 VLLM_PLE_INT8_MEMORY=1）、BF16 档 95.4GiB。判据：日志 [FN-PLE-LOC]/[FN-PLE-INT8] 行。">
+                    <label class="config-label">PLE 表位置（内存/硬盘）</label>
+                    <select id="modalPleLoc" class="config-input" style="max-width:300px" onchange="syncPleLoc()">
+                        <option value="disk" selected>放硬盘 — mmap 磁盘驻留（可回收不挤内存，推荐）</option>
+                        <option value="heap">放内存 — 匿名堆全驻留（INT8 48.3GiB / BF16 95.4GiB，不可回收）</option>
+                    </select>
+                    <div id="pleLocHint" style="font-size:11px;color:var(--text-tertiary);margin-top:4px">
+                        对应 FN_PLE_LOC 开关；本项只决定放内存还是放硬盘，精度由上方「PLE 表加载（n-gram 精度）」决定。
+                    </div>
+                </div>
                 <div class="config-field" style="margin-top:12px" data-tip="vLLM 专用。混合（qwen3.5/3.8）模型 mamba 状态保留粒度：0 = 只保留 prompt 末尾状态（默认，共享前缀的新 prompt 首查 0 命中）；1664 = 每 1664-token 块保留一个状态（推荐，部分前缀命中率 0%→78~93%）。必须是 1664 的倍数，否则启动报错。纯 attention 模型后端自动回落 0（不受影响）。">
                     <label class="config-label">前缀缓存保留间隔（retention interval）</label>
                     <input type="number" id="modalRetention" class="config-input" min="0" step="1664" value="1664" style="max-width:200px">
@@ -4136,6 +4304,29 @@ function samplingVal(id, dflt) {
 // 运行模式联动：选 PD 分离时自动把显卡数量设为 2；投机解码（DFlash2/MTP）在 PD 下
 // 均可用（08-27 实测定版：prefill 端自动配相同投机配置对齐 KV 布局），保持用户选择。
 // DSpark 例外：PD 下不支持（NIXL conv 状态对齐问题），选 PD 时自动回落「关闭」。
+// [ple-mem 0923] 精度 × 位置 = 四种驻留形态（两者正交，无锁定）：
+//   INT8+硬盘 = mmap 47.7GiB 可回收页缓存（生产现状）
+//   INT8+内存 = 匿名堆 48.3GiB 不可回收、零磁盘 I/O（引擎侧 VLLM_PLE_INT8_MEMORY=1）
+//   BF16+硬盘 = mmap safetensors 零堆；BF16+内存 = 匿名堆 95.4GiB 不可回收
+// 本函数只把当前组合翻译成人话；实际形态由 inner 依据「精度+位置」推导下发。
+function syncPleLoc() {
+    const prec = document.getElementById('modalPleInt8');
+    const loc = document.getElementById('modalPleLoc');
+    if (!prec || !loc) return;
+    const isInt8 = prec.value === '1';
+    const isHeap = loc.value === 'heap';
+    const hint = document.getElementById('pleLocHint');
+    if (hint) {
+        hint.textContent = isInt8
+            ? (isHeap
+                ? 'INT8 + 放内存：匿名堆 48.3GiB（不可回收、零磁盘 I/O，比 BF16 内存档省一半内存）。'
+                : 'INT8 + 放硬盘：mmap 47.7GiB 可回收页缓存（生产现状，内存紧张时 OS 可逐出）。')
+            : (isHeap
+                ? 'BF16 + 放内存：匿名堆 95.4GiB（不可回收，与 CPU KV 二级缓存同开会顶爆内存账）。'
+                : 'BF16 + 放硬盘：mmap safetensors，零堆分配、页缓存可回收。');
+    }
+}
+
 function syncPdMode() {
     const sel = document.getElementById('modalPdMode');
     if (!sel) return;
@@ -4181,6 +4372,14 @@ function buildStartParams(modelName) {
         thinking: (document.querySelector('input[name="modalThinking"]:checked')?.value) || '1',
         thinkingEffort: document.getElementById('modalThinkingEffort')?.value || 'medium',
         kvCacheQuant: document.getElementById('modalKvCacheQuant')?.value || 'auto',
+        // [kvoff-toggle 09-22] CPU KV 二级缓存开关与容量（脚本模型→FN_KVOFF/FN_KVOFF_BYTES；
+        // 普通 vLLM→--kv-transfer-config；SGLang 忽略）
+        kvoff: document.getElementById('modalKvOff')?.value || '0',
+        kvoffGiB: parseInt(document.getElementById('modalKvOffGiB')?.value, 10) || 64,
+        // [ple-field 0923] PLE n-gram 表加载精度（脚本模型→FN_PLE_INT8；普通 vLLM/SGLang 忽略）
+        pleInt8: document.getElementById('modalPleInt8')?.value || '1',
+        // [ple-loc 0923] PLE 表位置（脚本模型→FN_PLE_LOC：disk=mmap驻盘 / heap=匿名堆驻内存）
+        pleLoc: document.getElementById('modalPleLoc')?.value || 'disk',
         // 前缀缓存保留间隔：0 是合法值（显式稀疏），不能用 || 兜底；NaN 由后端回落 1664
         retention: parseInt(document.getElementById('modalRetention')?.value, 10),
         sglangExtraEnv: document.getElementById('modalSglangExtraEnv')?.value || '',
@@ -4271,6 +4470,14 @@ async function execHotSwapModel(modelName) {
         thinking: (document.querySelector('input[name="modalThinking"]:checked')?.value) || '1',
         thinkingEffort: document.getElementById('modalThinkingEffort')?.value || 'medium',
         kvCacheQuant: document.getElementById('modalKvCacheQuant')?.value || 'auto',
+        // [kvoff-toggle 09-22] CPU KV 二级缓存开关与容量（脚本模型→FN_KVOFF/FN_KVOFF_BYTES；
+        // 普通 vLLM→--kv-transfer-config；SGLang 忽略）
+        kvoff: document.getElementById('modalKvOff')?.value || '0',
+        kvoffGiB: parseInt(document.getElementById('modalKvOffGiB')?.value, 10) || 64,
+        // [ple-field 0923] PLE n-gram 表加载精度（脚本模型→FN_PLE_INT8；普通 vLLM/SGLang 忽略）
+        pleInt8: document.getElementById('modalPleInt8')?.value || '1',
+        // [ple-loc 0923] PLE 表位置（脚本模型→FN_PLE_LOC：disk=mmap驻盘 / heap=匿名堆驻内存）
+        pleLoc: document.getElementById('modalPleLoc')?.value || 'disk',
         // 前缀缓存保留间隔：0 是合法值（显式稀疏），不能用 || 兜底；NaN 由后端回落 1664
         retention: parseInt(document.getElementById('modalRetention')?.value, 10),
         sglangExtraEnv: document.getElementById('modalSglangExtraEnv')?.value || '',
@@ -6090,6 +6297,7 @@ function startDashPowerPolling() {
             renderEnergyCard(en);
             renderCpuCard(en);
             renderMemCard(en);
+            updateHdrFromEnergy(en);
             const tsEl = document.getElementById('statsTimestamp');
             if (tsEl) tsEl.textContent = new Date().toLocaleTimeString('zh-CN');
         });
@@ -6428,9 +6636,125 @@ async function saveBillingConfig() {
 
 // ====== Utils ======
 function esc(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
-async function apiFetch(path, opts) {
-    try { const r = await fetch(path, opts); if (!r.ok) throw new Error('HTTP ' + r.status); return await r.json(); } catch (e) { return null; }
+// 09-23：超时不再交给 AbortSignal.timeout()。它由浏览器内部定时器驱动，标签页被
+// 节能冻结（Chrome Memory Saver / 后台节流）后解冻时，pending fetch 常被网络栈
+// 直接丢弃——既不 resolve 也不 reject，abort 事件也不再派发。上层 await 于是永不
+// settle，refreshDashboard 的忙标志永久停在 true，整页数字定格且只能刷新页面恢复
+// （现场实锤：「页面开久了就不刷新，刷新页面才恢复」）。改为自建 AbortController +
+// setTimeout（解冻后已过期的 setTimeout 一定会补跑），并在 settle 时清掉定时器。
+function _fetchWithTimeout(path, opts, ms) {
+    let ctrl;
+    try { ctrl = new AbortController(); } catch (e) { ctrl = null; }
+    const t = setTimeout(() => { try { if (ctrl) ctrl.abort(); } catch (e) {} }, ms || 8000);
+    const o = Object.assign({}, opts);
+    if (!o.signal && ctrl) o.signal = ctrl.signal;
+    return fetch(path, o).finally(() => clearTimeout(t));
 }
+async function apiFetch(path, opts) {
+    // 09-22：默认 8s 超时。此前服务端事件循环被同步调用卡死（如 nvidia-smi D 状态）时，
+    // fetch 可能永不返回 → refreshDashboard 的 _dashBusy 防重入标志被永久卡住 →
+    // 仪表盘整片静默停刷且无法自愈。加超时保证每个 await 必有结果。
+    // 09-23：顺带记录 _lastPollOkAt——它**不是**看门狗判据（判据是 _lastRenderAt，
+    // 见自愈层），只用于事后诊断：区分"请求发得出去但渲染链条卡死"（poll 新、render 旧）
+    // 与"请求根本出不去/后端无响应"（两者同旧）。
+    try {
+        const r = await _fetchWithTimeout(path, opts, 8000);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const j = await r.json();
+        window._lastPollOkAt = Date.now();
+        return j;
+    } catch (e) { return null; }
+}
+
+// ====== 09-23 仪表盘自愈层：定时器集中登记 + 停摆看门狗 + 回前台补刷 ======
+// 现场故障形态：页面开久了（切后台被节能冻结、网络栈丢弃 pending fetch）之后所有
+// 数字定格，必须刷新页面才恢复。根因是轮询链条一旦卡死就没有任何外力能把它拉回来：
+// 所有 setInterval 只在启动时建立一次，_dashBusy 又可能永久停在 true。补三层保险：
+// ① 仪表盘定时器全部登记进 __dashTimers，可随时整体重建（旧的一律先清，避免叠加）；
+// ② 看门狗每 2s 核对 _lastPollOkAt，前台超过 6s 没有任何成功响应即判停摆，
+//    清忙标志 + 整体重建 + 立即补刷（走原生 setInterval，不受 hidden 门控影响）；
+// ③ visibilitychange / pageshow / focus / online 四类"页面重新可见"来源都强制补刷。
+let __dashTimers = [];
+window.__dashRestarts = 0;
+function _dashEvery(fn, ms) {
+    // 走 window.setInterval（即 09-20 那个 hidden 门控包装版）：重建后的定时器同样
+    // 要在后台标签页停摆省电，不能因为重建就绕开门控去打扰上游 vLLM。
+    const id = window.setInterval(fn, ms);
+    __dashTimers.push(id);
+    return id;
+}
+function startDashboardTimers() {
+    if (!window._dashStartedAt) window._dashStartedAt = Date.now();
+    for (const id of __dashTimers) { try { clearInterval(id); } catch (e) {} }
+    __dashTimers = [];
+    refreshInterval = _dashEvery(refreshDashboard, 500);
+    // 并发请求独立 500ms 轮询（只拉 stats 渲染并发卡片，不受主轮询其他步骤阻塞）
+    const _concTick = async () => { try { const _cs = await apiFetch('/v1/internal/stats'); if (_cs && Object.keys(_cs).length) await renderConcurrentCard(_cs); } catch (e) { console.warn('Concurrent tick error:', e); } };
+    _concTick();
+    _dashEvery(_concTick, 500);
+    // GPU 排队·处理：已处理任务历史（右进左出）3s 轮询
+    refreshGqDone();
+    _dashEvery(refreshGqDone, 3000);
+    loadPdSeries(); // PD 动态图：预填充 vs 输出 token 走势（1s 独立轮询）
+    _dashEvery(loadPdSeries, 1000);
+}
+// 右上角数据新鲜度徽章：<5s 正常灰、5~15s 黄（轮询变慢）、>15s 红（停摆，看门狗会自愈）。
+// 有了它，"是不是又停刷了"不用再靠肉眼盯数字，历史停刷也能事后从「自愈 N 次」看出来。
+function renderFreshnessBadge() {
+    const el = document.getElementById('dataFresh');
+    if (!el) return;
+    const last = window._lastRenderAt || 0;
+    if (!last) { el.textContent = ''; return; }
+    const age = Math.max(0, Math.round((Date.now() - last) / 1000));
+    el.textContent = '数据 ' + age + 's 前' + (window.__dashRestarts ? ' · 自愈 ' + window.__dashRestarts + ' 次' : '');
+    el.style.color = age > 15 ? '#ef4444' : age > 5 ? '#f59e0b' : 'var(--text-tertiary)';
+}
+// 页面重新可见时强制补刷：清掉可能卡住的忙标志，不等下一个 tick。
+function kickDashboard(reason) {
+    if (document.hidden) return;
+    _dashBusy = false; window._dashBusyAt = 0;
+    // 后台期间回调全被门控跳过，_lastRenderAt 必然停在离开前；这里先给一个冷静期，
+    // 免得每次正常回前台都被看门狗误判成"停摆"而虚增自愈计数。
+    window._lastKickAt = Date.now();
+    try { refreshDashboard(); } catch (e) {}
+    try { renderFreshnessBadge(); } catch (e) {}
+    if (reason && window.console && window.__dashDebug) console.log('[dashboard] kick:', reason);
+}
+// 09-23：除 visibilitychange（在 setInterval 包装器里）外，再补三类"页面重新可见"来源。
+// 冻结/BFCache 后退/窗口遮挡恢复这些路径不一定派发 visibilitychange，只挂一个事件
+// 正是"必须刷新页面才恢复"的缺口所在。
+window.addEventListener('pageshow', function () { kickDashboard('pageshow'); });
+window.addEventListener('focus', function () { kickDashboard('focus'); });
+window.addEventListener('online', function () { kickDashboard('online'); });
+// 看门狗：判据必须是**渲染有没有推进**（_lastRenderAt），不能是"有没有请求成功"。
+// 09-23 仿真实锤：主轮询被卡死的忙标志锁住时，旁路的 _concTick 仍在独立拉 stats 并
+// 成功返回，任何以"请求成功"为准的判据都会被它掩盖，看门狗因此永不触发、页面永久
+// 定格。_lastRenderAt 只在 refreshDashboard 走完一轮后盖上，主链条一停它就停，才是
+// 真信号；同时它不受后端故障误伤——stats 返回 {} 或 apiFetch 超时都算正常走完一轮。
+// 另用 _lastKickAt 做回前台冷静期，避免每次正常切回标签页都被误计一次自愈。
+(window.__origSetInterval || window.setInterval)(function () {
+    try {
+        renderFreshnessBadge();
+        if (document.hidden || !isConnected) return;
+        const last = Math.max(window._lastRenderAt || 0, window._lastKickAt || 0);
+        // 从未成功渲染过一轮（开局即被冻结/首轮就撞上死 fetch）时不能直接放行，
+        // 否则页面永久停在空白数值上、看门狗反倒失灵——改用"启动后 12s 仍无渲染"兜底。
+        let stalledSec;
+        if (!last) {
+            if (!window._dashStartedAt || Date.now() - window._dashStartedAt < 12000) return;
+            stalledSec = Math.round((Date.now() - window._dashStartedAt) / 1000);
+        } else {
+            if (Date.now() - last < 6000) return;
+            stalledSec = Math.round((Date.now() - last) / 1000);
+        }
+        window.__dashRestarts++;
+        console.warn('[dashboard] 主轮询已停摆 ' + stalledSec + 's（无渲染推进），自动重建定时器（第 ' + window.__dashRestarts + ' 次）');
+        _dashBusy = false; window._dashBusyAt = 0;
+        window._lastKickAt = Date.now(); // 冷静期，等新轮真正跑起来再判
+        startDashboardTimers();
+        refreshDashboard();
+    } catch (e) { console.warn('[dashboard] watchdog error:', e); }
+}, 2000);
 
 // ====== PD 动态图：预填充 vs 输出 token 实时走势（Canvas 自绘） ======
 let __pdSeriesCache = [];
@@ -6527,6 +6851,82 @@ function drawPdChart() {
     }
 }
 
+// ==== 页头实时指标徽标（红框区）：总功耗 / 生成吞吐 / GPU% / KV Cache% ====
+// 数据源：功耗=现有 /v1/internal/energy 1s 轮询顺带更新；吞吐/KV=现有 stats 500ms 轮询顺带更新；
+// GPU%=新增 /v1/internal/gpu 1s 轮询（后端为内存驻留采样，接口本身零开销）。
+function hdrVal(id, text, color) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = text;
+    if (color !== undefined) el.style.color = color;
+}
+function hdrHtml(id, html) {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = html;
+}
+function updateHdrFromEnergy(en) {
+    if (!en || typeof en.current_power_w !== 'number') return;
+    hdrVal('hdrPower', Math.round(en.current_power_w).toLocaleString(), 'var(--red)');
+}
+function updateHdrFromStats(s) {
+    // 生成吞吐：各实例最近 1s 输出 tok/s 求和；无实例数据时回落 bench_tg_tps
+    try {
+        let sum = 0, n = 0; const parts = [];
+        for (const i of (s.instances || [])) {
+            const ls = i.last_second;
+            if (ls && typeof ls.speed === 'number' && ls.speed > 0) {
+                sum += ls.speed; n++;
+                parts.push('端口 ' + i.port + '：' + ls.speed.toFixed(1) + ' tok/s');
+            }
+        }
+        const v = n > 0 ? sum : (typeof s.bench_tg_tps === 'number' ? s.bench_tg_tps : null);
+        hdrVal('hdrGen', v == null ? '--' : Math.round(v).toLocaleString());
+        const chip = document.getElementById('hdrGenChip');
+        if (chip) chip.title = '生成（输出）吞吐：最近 1 秒全部实例输出 token/s' + (parts.length ? '\n' + parts.join('\n') : '');
+    } catch (e) {}
+    // KV Cache：各实例池占用率取最高（最差卡）；tooltip 逐池列 已用/最大
+    try {
+        const kvs = (s.instances || []).map(i => i.kv).filter(k => k && k.max_tokens > 0);
+        let pct = null, tip = '';
+        if (kvs.length) {
+            pct = Math.max(...kvs.map(k => (k.usage_pct || 0) * 100));
+            tip = kvs.map(k => (k.usage_pct * 100).toFixed(1) + '%（' + (k.used_tokens || 0).toLocaleString() + ' / ' + k.max_tokens.toLocaleString() + ' tok）').join('\n');
+        } else if (s.cache_blocks) {
+            pct = s.cache_blocks.used || 0;
+            tip = (s.cache_blocks.used || 0).toFixed(1) + '%（主实例）';
+        }
+        const col = pct == null ? 'var(--text-primary)' : pct >= 80 ? 'var(--red)' : pct >= 60 ? 'var(--orange)' : 'var(--green)';
+        hdrVal('hdrKv', pct == null ? '--' : pct.toFixed(0), col);
+        const chip = document.getElementById('hdrKvChip');
+        if (chip) chip.title = 'KV Cache 池占用率（各实例最高值）\n' + tip;
+    } catch (e) {}
+}
+function updateHdrFromGpu(d) {
+    try {
+        const gs = (d && d.gpus) || [];
+        if (!gs.length) { hdrVal('hdrGpu', '--', 'var(--text-primary)'); hdrVal('hdrTemp', '--', 'var(--text-primary)'); return; }
+        // 利用率与温度：逐卡显示（G0 xx · G1 xx），每卡按各自阈值独立变色
+        const utilCol = v => v >= 90 ? 'var(--red)' : v >= 70 ? 'var(--orange)' : 'var(--green)';
+        const tempCol = v => v >= 80 ? 'var(--red)' : v >= 70 ? 'var(--orange)' : 'var(--green)';
+        const seg = (g, val, colFn) => '<span style="color:' + (val == null ? 'var(--text-primary)' : colFn(val)) + '">G' + g.index + ' ' + (val == null ? '--' : val) + '</span>';
+        const dot = '<span class="hdr-dot">·</span>';
+        hdrHtml('hdrGpu', gs.map(g => seg(g, typeof g.util_gpu === 'number' ? Math.round(g.util_gpu) : null, utilCol)).join(dot));
+        hdrHtml('hdrTemp', gs.map(g => seg(g, typeof g.temp === 'number' ? Math.round(g.temp) : null, tempCol)).join(dot));
+        const chip = document.getElementById('hdrGpuChip');
+        if (chip) chip.title = 'GPU SM 利用率（逐卡）\n' + gs.map(g =>
+            'GPU' + g.index + '：' + (g.util_gpu == null ? '--' : g.util_gpu) + '% · 显存 ' + g.mem_used + '/' + g.mem_total + ' MiB · ' + (g.power_draw == null ? '--' : g.power_draw) + ' W').join('\n');
+        const tChip = document.getElementById('hdrTempChip');
+        if (tChip) tChip.title = 'GPU 温度（逐卡）\n' + gs.map(g => 'GPU' + g.index + '：' + (g.temp == null ? '--' : g.temp) + ' °C').join('\n');
+    } catch (e) {}
+}
+let _hdrGpuTimer = null;
+function startHdrGpuPolling() {
+    if (_hdrGpuTimer) return;
+    const tick = () => { apiFetch('/v1/internal/gpu').then(updateHdrFromGpu).catch(() => {}); };
+    tick();
+    _hdrGpuTimer = setInterval(tick, 1000);
+}
+
 // Init
 (async () => {
     try {
@@ -6534,6 +6934,7 @@ function drawPdChart() {
         if (pv) pv.textContent = PAGE_VERSION;
         loadModels(); // 页面加载即拉取可用模型列表，模型管理 tab 直接展示
         startDashPowerPolling(); // 仪表盘「总功耗/数据截至」1 秒独立轮询（不依赖 stats 循环）
+        startHdrGpuPolling(); // 页头 GPU 利用率徽标：1s 轮询 /v1/internal/gpu（后端内存驻留采样，零开销）
         startEnergyPolling(); // 能耗统计页 2 秒轮询各元件实时功耗
         startStoragePolling(); // 存储管理页 5 秒轮询磁盘信息
         const st = await apiFetch('/admin/api/server-status');
@@ -6542,16 +6943,8 @@ function drawPdChart() {
             document.getElementById('statusDot').className = 'w-2 h-2 rounded-full bg-green-500 pulse';
             document.getElementById('serverStatus').textContent = '已连接';
             refreshDashboard();
-            refreshInterval = setInterval(refreshDashboard, 500);
-            // 并发请求独立 500ms 轮询（只拉 stats 渲染并发卡片，不受主轮询其他步骤阻塞）
-            const _concTick = async () => { try { const _cs = await apiFetch('/v1/internal/stats'); if (_cs) await renderConcurrentCard(_cs); } catch (e) { console.warn('Concurrent tick error:', e); } };
-            _concTick();
-            setInterval(_concTick, 500);
-            // GPU 排队·处理：已处理任务历史（右进左出）3s 轮询
-            refreshGqDone();
-            setInterval(refreshGqDone, 3000);
-            loadPdSeries(); // PD 动态图：预填充 vs 输出 token 走势（1s 独立轮询）
-            setInterval(loadPdSeries, 1000);
+            // 09-23：定时器改为集中登记（startDashboardTimers），停摆时可整体重建
+            startDashboardTimers();
         } else {
             document.getElementById('serverStatus').textContent = '未连接';
             document.getElementById('statusDot').className = 'w-2 h-2 rounded-full bg-red-500';

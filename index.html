@@ -166,28 +166,28 @@
         }
 
         /* Main */
-        .main { max-width: 1280px; margin: 0 auto; padding: 24px; }
+        .main { max-width: 1280px; margin: 0 auto; padding: 12px 16px 16px; }
 
         /* Cards */
         .card {
             background: var(--bg-card);
             border: 1px solid var(--border);
-            border-radius: 14px;
+            border-radius: 10px;
             transition: border-color 0.15s;
         }
         .card-header {
-            padding: 20px 24px 0;
+            padding: 12px 16px 0;
         }
         .card-body {
-            padding: 16px 24px 20px;
+            padding: 12px 16px 14px;
         }
 
         /* KPI cards */
         .kpi-card {
             background: var(--bg-card);
             border: 1px solid var(--border);
-            border-radius: 14px;
-            padding: 20px;
+            border-radius: 10px;
+            padding: 10px 12px;
             transition: all 0.2s;
         }
         .kpi-card:hover {
@@ -195,47 +195,47 @@
             box-shadow: 0 4px 24px rgba(99,102,241,0.06);
         }
         .kpi-label {
-            font-size: 12px;
+            font-size: 10px;
             font-weight: 500;
             color: var(--text-tertiary);
             text-transform: uppercase;
             letter-spacing: 0.05em;
-            margin-bottom: 8px;
+            margin-bottom: 3px;
         }
         .kpi-value {
-            font-size: 28px;
+            font-size: 17px;
             font-weight: 700;
             letter-spacing: -0.03em;
-            line-height: 1.1;
+            line-height: 1.15;
         }
         .kpi-sub {
-            font-size: 12px;
+            font-size: 10px;
             color: var(--text-tertiary);
-            margin-top: 6px;
+            margin-top: 2px;
         }
 
         /* Stat row cards */
         .stat-card {
             background: var(--bg-card);
             border: 1px solid var(--border);
-            border-radius: 14px;
-            padding: 20px;
+            border-radius: 10px;
+            padding: 10px 12px;
         }
         .stat-card-title {
-            font-size: 12px;
+            font-size: 10px;
             font-weight: 600;
             color: var(--text-tertiary);
             text-transform: uppercase;
             letter-spacing: 0.05em;
-            margin-bottom: 4px;
+            margin-bottom: 2px;
         }
         .stat-card-value {
-            font-size: 26px;
+            font-size: 17px;
             font-weight: 700;
             letter-spacing: -0.02em;
         }
         .stat-card-hint {
-            font-size: 12px;
+            font-size: 10px;
             color: var(--text-tertiary);
             margin-top: 2px;
         }
@@ -280,7 +280,7 @@
 
         /* Progress bar */
         .progress {
-            height: 5px;
+            height: 4px;
             background: var(--border);
             border-radius: 10px;
             overflow: hidden;
@@ -405,16 +405,21 @@
             display: flex;
             align-items: center;
             justify-content: space-between;
-            margin-bottom: 24px;
+            margin-bottom: 10px;
         }
-        .dash-title { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }
+        .dash-title { font-size: 16px; font-weight: 700; letter-spacing: -0.02em; }
         .dash-meta {
             display: flex;
             align-items: center;
-            gap: 12px;
-            font-size: 12px;
+            gap: 10px;
+            font-size: 11px;
             color: var(--text-tertiary);
         }
+
+        /* ===== 仪表盘紧凑化：收紧区块间距与栅格间隙（仅作用于仪表盘页签，不动 tailwind 构建） ===== */
+        #tab-dashboard .mb-6 { margin-bottom: 12px !important; }
+        #tab-dashboard .gap-4 { gap: 10px !important; }
+        #tab-dashboard .mt-2 { margin-top: 4px !important; }
 
         /* Chat */
         .chat-box {
@@ -548,11 +553,11 @@
             background: var(--bg-inset);
             border: 1px solid var(--border-light);
             border-radius: var(--radius-xs);
-            padding: 6px 8px;
+            padding: 4px 7px;
             min-width: 0;
         }
         .metric-tile-label {
-            font-size: 10px;
+            font-size: 9.5px;
             font-weight: 600;
             color: var(--text-tertiary);
             letter-spacing: 0.02em;
@@ -561,7 +566,7 @@
             text-overflow: ellipsis;
         }
         .metric-tile-value {
-            font-size: 17px;
+            font-size: 14px;
             font-weight: 700;
             letter-spacing: -0.02em;
             font-variant-numeric: tabular-nums;
@@ -610,14 +615,13 @@
         /* ===== 移动端窄屏适配：防止卡片文字溢出（视口 <768px 时自动生效） ===== */
         @media (max-width: 767px) {
             .token-grid { grid-template-columns: 1fr !important; }
-            .stat-card, .kpi-card { padding: 14px !important; }
-            .stat-card-value { font-size: 20px; }
-            .kpi-value { font-size: 20px; }
-            #totalInputTokens, #totalOutputTokens { font-size: 22px; }
-            #energyKwh, #energyCost { font-size: 22px; }
-            .metric-tile-value { font-size: 16px; }
-            #cacheHitRate, #zeroHitRate { font-size: 16px; }
-            #energyKwh, #energyCost { font-size: 20px; }
+            .stat-card, .kpi-card { padding: 10px 12px !important; }
+            .stat-card-value { font-size: 16px; }
+            .kpi-value { font-size: 16px; }
+            #totalInputTokens, #totalOutputTokens { font-size: 16px; }
+            #energyKwh, #energyCost { font-size: 15px; }
+            .metric-tile-value { font-size: 13px; }
+            #cacheHitRate, #zeroHitRate { font-size: 13px; }
             .metric-grid { flex-wrap: wrap; }
             .metric-item { flex: 1 1 45% !important; }
             .metric-item-value { font-size: 18px; }
@@ -735,7 +739,7 @@
                     <div class="kpi-value" id="gpuMemory" style="color:var(--blue)">--</div>
                     <div class="progress mt-2"><div class="progress-bar" id="gpuMemoryBar" style="width:0%;background:var(--blue)"></div></div>
                     <div class="kpi-sub" id="gpuMemoryPct">--</div>
-                    <div id="gpuDetail" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px"></div>
+                    <div id="gpuDetail" style="margin-top:4px;display:flex;flex-wrap:wrap;gap:4px"></div>
                 </div>
                 <div class="kpi-card" title="GPU 利用率（nvidia-smi）+ 处理器 CPU 整机利用率（/proc/stat 采样，全部核心平均）">
                     <div class="kpi-label">GPU 利用率 · CPU</div>
@@ -749,9 +753,9 @@
                             <div class="kpi-sub" id="cpuUtilSub">CPU</div>
                         </div>
                     </div>
-                    <div style="display:flex;flex-direction:column;gap:5px;margin-top:8px">
-                        <div class="progress" style="height:5px"><div class="progress-bar" id="gpuUtilBar" style="width:0%;background:var(--green)"></div></div>
-                        <div class="progress" style="height:5px"><div class="progress-bar" id="cpuUtilBar" style="width:0%;background:var(--blue)"></div></div>
+                    <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px">
+                        <div class="progress" style="height:4px"><div class="progress-bar" id="gpuUtilBar" style="width:0%;background:var(--green)"></div></div>
+                        <div class="progress" style="height:4px"><div class="progress-bar" id="cpuUtilBar" style="width:0%;background:var(--blue)"></div></div>
                     </div>
                 </div>
                 <div class="kpi-card">
@@ -766,7 +770,7 @@
                             <div class="kpi-sub" id="tempSub">°C（最高卡）</div>
                         </div>
                     </div>
-                    <div id="powerTempDetail" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px"></div>
+                    <div id="powerTempDetail" style="margin-top:4px;display:flex;flex-wrap:wrap;gap:4px"></div>
                 </div>
                 <div class="kpi-card" title="系统内存使用率（/proc/meminfo，已用 / 总量）">
                     <div class="kpi-label">内存</div>
@@ -778,22 +782,22 @@
 
             <!-- Token 吞吐（左 2/3）+ 能耗电费（右 1/3） -->
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6" style="align-items:stretch">
-                <div class="lg:col-span-2 stat-card" style="display:flex;flex-direction:column;padding:14px 16px">
+                <div class="lg:col-span-2 stat-card" style="display:flex;flex-direction:column;padding:10px 12px">
                     <!-- 双主数值：输入 + 输出 并排 -->
-                    <div style="display:flex;flex-wrap:wrap;gap:10px 24px;align-items:flex-end">
+                    <div style="display:flex;flex-wrap:wrap;gap:8px 16px;align-items:flex-end">
                         <div style="min-width:0;flex:1">
                             <div class="stat-card-title" style="color:var(--blue)">输入 Token</div>
-                            <div class="stat-card-value" id="totalInputTokens" style="color:var(--blue);font-size:26px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">--</div>
+                            <div class="stat-card-value" id="totalInputTokens" style="color:var(--blue);font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">--</div>
                             <div class="stat-card-hint">未命中缓存 <span id="uncachedInputTokens" style="color:var(--orange);font-weight:600;white-space:nowrap">--</span></div>
                         </div>
-                        <div style="min-width:0;flex:1;border-left:1px solid var(--border);padding-left:24px">
+                        <div style="min-width:0;flex:1;border-left:1px solid var(--border);padding-left:16px">
                             <div class="stat-card-title" style="color:var(--violet)">输出 Token</div>
-                            <div class="stat-card-value" id="totalOutputTokens" style="color:var(--violet);font-size:26px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">--</div>
+                            <div class="stat-card-value" id="totalOutputTokens" style="color:var(--violet);font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">--</div>
                             <div class="stat-card-hint">生成速度 <span id="totalSpeedLabel" style="color:var(--green);font-weight:600">--</span> tok/s</div>
                         </div>
                     </div>
                     <!-- 指标格 4 列 -->
-                    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:auto;padding-top:10px">
+                    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-top:auto;padding-top:8px">
                         <div class="metric-tile" title="命中的 prompt token / 全部 prompt token（缓存命中的部分不占预填充计算量）">
                             <div class="metric-tile-label">缓存命中</div>
                             <div class="metric-tile-value" style="color:var(--green)" id="cacheHitRate">--%</div>
@@ -811,42 +815,42 @@
                             <div class="metric-tile-value" style="color:var(--green)" id="cacheHitGpu1">--%</div>
                                                     </div>
                     </div>
-                    <div class="stat-card-hint" id="zeroHitSub" style="margin-top:8px;padding-top:6px;font-size:11px;border-top:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="近 1 小时完成请求中缓存命中为 0 的条数占比（request-traces 真值）；>16k 子集=其中 prompt>16k 的请求">近60min --</div>
+                    <div class="stat-card-hint" id="zeroHitSub" style="margin-top:6px;padding-top:5px;font-size:10px;border-top:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="近 1 小时完成请求中缓存命中为 0 的条数占比（request-traces 真值）；>16k 子集=其中 prompt>16k 的请求">近60min --</div>
                 </div>
                 <!-- 能耗 · 电费 卡（右 1/3，通高） -->
-                <div class="kpi-card" id="gpuEnergyCard" style="overflow:hidden;display:flex;flex-direction:column;padding:14px 16px" title="能耗：按「整机估算总功耗」（全部 GPU + CPU + 补偿值） 1 秒级积分累计，持久化不丢">
+                <div class="kpi-card" id="gpuEnergyCard" style="overflow:hidden;display:flex;flex-direction:column;padding:10px 12px" title="能耗：按「整机估算总功耗」（全部 GPU + CPU + 补偿值） 1 秒级积分累计，持久化不丢">
                     <div style="flex:1;display:flex;flex-direction:column;justify-content:center">
-                        <div class="kpi-label" style="margin-bottom:8px">能耗 · 电费</div>
-                        <div id="energyKwh" style="font-size:24px;font-weight:700;letter-spacing:-0.02em;color:var(--blue);line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">-- kWh</div>
-                        <div id="energyCost" style="margin-top:3px;font-size:24px;font-weight:700;letter-spacing:-0.02em;line-height:1.15;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">--</div>
-                        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:5px">
-                            <div class="kpi-sub" style="font-size:11px;line-height:1.4" title="历史累计（含已重置部分），持久化不丢">历史 <span id="energyHistory" style="font-variant-numeric:tabular-nums">--</span></div>
-                            <div style="display:flex;align-items:center;flex-wrap:wrap;gap:3px 4px;font-size:11px">
+                        <div class="kpi-label" style="margin-bottom:4px">能耗 · 电费</div>
+                        <div id="energyKwh" style="font-size:17px;font-weight:700;letter-spacing:-0.02em;color:var(--blue);line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">-- kWh</div>
+                        <div id="energyCost" style="margin-top:2px;font-size:17px;font-weight:700;letter-spacing:-0.02em;line-height:1.2;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">--</div>
+                        <div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:4px">
+                            <div class="kpi-sub" style="font-size:10px;line-height:1.4;margin-top:0" title="历史累计（含已重置部分），持久化不丢">历史 <span id="energyHistory" style="font-variant-numeric:tabular-nums">--</span></div>
+                            <div style="display:flex;align-items:center;flex-wrap:wrap;gap:3px 4px;font-size:10px">
                                 <span style="color:var(--text-tertiary)">电价</span>
                                 <input id="energyPrice" type="number" min="0" max="100" step="0.01" value="1.00"
-                                    style="width:46px;padding:1px 3px;font-size:11px;text-align:right;background:var(--bg-primary);border:1px solid var(--border);border-radius:4px;color:var(--text-primary)"
+                                    style="width:42px;padding:1px 3px;font-size:10px;text-align:right;background:var(--bg-primary);border:1px solid var(--border);border-radius:4px;color:var(--text-primary)"
                                     onchange="saveEnergyPrice()" title="电费单价（元/度），修改后自动保存">
                                 <span id="energyUnit" style="color:var(--text-tertiary)">元/度</span>
                             </div>
                         </div>
-                        <div style="display:flex;gap:4px;margin-top:8px">
-                            <button class="btn" style="font-size:11px;padding:4px 8px;white-space:nowrap;flex:1" onclick="resetEnergy('current')" title="清零「已用电/电费」，不影响历史累计">重置电量</button>
-                            <button class="btn" style="font-size:11px;padding:4px 8px;white-space:nowrap;flex:1" onclick="resetEnergy('history')" title="清零「历史累计」">重置历史</button>
+                        <div style="display:flex;gap:4px;margin-top:6px">
+                            <button class="btn" style="font-size:10px;padding:3px 6px;white-space:nowrap;flex:1" onclick="resetEnergy('current')" title="清零「已用电/电费」，不影响历史累计">重置电量</button>
+                            <button class="btn" style="font-size:10px;padding:3px 6px;white-space:nowrap;flex:1" onclick="resetEnergy('history')" title="清零「历史累计」">重置历史</button>
                         </div>
                     </div>
                 </div>
             </div>
 
             <!-- PD 走势图（全宽） -->
-            <div class="stat-card mb-6" style="padding:14px 16px" id="pdChartCard">
+            <div class="stat-card mb-6" style="padding:10px 12px" id="pdChartCard">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;flex-wrap:wrap;gap:6px">
-                    <div style="font-size:13px;font-weight:600;color:var(--text-secondary)">预填充 → 输出 token 走势 <span style="font-size:10px;color:var(--text-tertiary);font-weight:400">近 3 分钟 · 每秒 · 未缓存预填充计入 prefill · 左右双轴独立缩放</span></div>
-                    <div style="display:flex;gap:14px;font-size:12px">
+                    <div style="font-size:12px;font-weight:600;color:var(--text-secondary)">预填充 → 输出 token 走势 <span style="font-size:10px;color:var(--text-tertiary);font-weight:400">近 3 分钟 · 每秒 · 未缓存预填充计入 prefill · 左右双轴独立缩放</span></div>
+                    <div style="display:flex;gap:14px;font-size:11px">
                         <span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--blue);margin-right:4px;vertical-align:middle"></span>预填充 <b id="pdPrefillNow" style="color:var(--blue);font-variant-numeric:tabular-nums">--</b> tok/s</span>
                         <span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--orange);margin-right:4px;vertical-align:middle"></span>输出 <b id="pdGenNow" style="color:var(--orange);font-variant-numeric:tabular-nums">--</b> tok/s</span>
                     </div>
                 </div>
-                <canvas id="pdChart" style="width:100%;height:200px;display:block;margin-top:10px"></canvas>
+                <canvas id="pdChart" style="width:100%;height:150px;display:block;margin-top:8px"></canvas>
             </div>
 
             <!-- Billing Panel (实时费用) -->
@@ -1795,7 +1799,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20260923-r1'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r1 = 停摆看门狗 + 自建 fetch 超时 + 新鲜度徽章）
+const PAGE_VERSION = '20260924-r1'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r1 = 仪表盘全面紧凑化：字号/内边距/间距整体收小）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -2801,7 +2805,7 @@ async function _doRefreshDashboard() {
             const ptDetailEl = document.getElementById('powerTempDetail');
             if (ptDetailEl) {
                 ptDetailEl.innerHTML = multi ? g.gpu.perGpu.map(x =>
-                    `<span style="font-size:11px;background:var(--bg-primary);border-radius:6px;padding:2px 8px;white-space:nowrap;color:var(--text-secondary)">GPU${x.index} ${x.power.toFixed(0)}W · ${x.temperature > 0 ? x.temperature.toFixed(0) : '--'}°C</span>`
+                    `<span style="font-size:10px;background:var(--bg-primary);border-radius:5px;padding:1px 6px;white-space:nowrap;color:var(--text-secondary)">GPU${x.index} ${x.power.toFixed(0)}W · ${x.temperature > 0 ? x.temperature.toFixed(0) : '--'}°C</span>`
                 ).join('') : '';
             }
             const powerSub = document.getElementById('powerSub');
@@ -2813,7 +2817,7 @@ async function _doRefreshDashboard() {
             if (gpuDetailEl) {
                 if (multi) {
                     gpuDetailEl.innerHTML = g.gpu.perGpu.map(x =>
-                        `<span style="font-size:11px;background:var(--bg-primary);border-radius:6px;padding:2px 8px;white-space:nowrap;color:var(--text-secondary)">GPU${x.index} ${x.utilization}% · ${(x.used/1073741824).toFixed(1)}/${(x.total/1073741824).toFixed(0)}GB</span>`
+                        `<span style="font-size:10px;background:var(--bg-primary);border-radius:5px;padding:1px 6px;white-space:nowrap;color:var(--text-secondary)">GPU${x.index} ${x.utilization}% · ${(x.used/1073741824).toFixed(1)}/${(x.total/1073741824).toFixed(0)}GB</span>`
                     ).join('');
                 } else {
                     gpuDetailEl.innerHTML = '';

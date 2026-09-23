@@ -243,36 +243,36 @@
         /* Metrics grid */
         .metric-grid {
             display: flex;
-            gap: 12px;
+            gap: 10px;
         }
         .metric-item {
             background: var(--bg-card);
             border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 16px 16px;
+            border-radius: 10px;
+            padding: 10px 12px;
             flex: 1;
             min-width: 0;
         }
         .metric-item-label {
-            font-size: 11px;
+            font-size: 10px;
             font-weight: 600;
             color: var(--text-tertiary);
             text-transform: uppercase;
             letter-spacing: 0.05em;
         }
         .metric-item-hint {
-            font-size: 11px;
+            font-size: 9.5px;
             color: var(--text-tertiary);
             margin-top: 1px;
         }
         .metric-item-value {
-            font-size: 22px;
+            font-size: 17px;
             font-weight: 700;
             letter-spacing: -0.02em;
-            margin-top: 6px;
+            margin-top: 3px;
         }
         .metric-item-unit {
-            font-size: 13px;
+            font-size: 11px;
             font-weight: 500;
             color: var(--text-tertiary);
             margin-left: 3px;
@@ -629,7 +629,7 @@
             #cacheHitRate, #zeroHitRate { font-size: 13px; }
             .metric-grid { flex-wrap: wrap; }
             .metric-item { flex: 1 1 45% !important; }
-            .metric-item-value { font-size: 18px; }
+            .metric-item-value { font-size: 15px; }
             .stat-flex-row { flex-wrap: wrap !important; row-gap: 12px; }
             .stat-flex-row > div:first-child { flex: 1 1 100% !important; }
             .dash-meta { flex-wrap: wrap; }
@@ -1804,7 +1804,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20260924-r2'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r2 = 能耗卡大屏与「内存」卡同列对齐）
+const PAGE_VERSION = '20260924-r3'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r3 = TTFT/KV Cache 指标行同步紧凑化）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;

@@ -556,7 +556,7 @@ function loadHist(){
     var html='<tr><th>时间</th><th>标签</th><th>模式</th><th>服务</th><th>类型</th><th>轮</th><th>decode均值</th><th>TTFT ms</th><th>接受率</th><th>并发峰值</th><th>pf峰值</th><th></th></tr>';
     list.forEach(function(x,i){
       var peakTx=x.concPeak?('<b>'+x.concPeak.agg+'</b> c='+x.concPeak.c):'—';
-      html+='<tr data-i="'+i+'"><td>'+x.timestamp.replace('T',' ').slice(5,16)+'</td><td>'+x.tag+'</td><td class="small">'+(MN[x.mode]||x.mode||'—')+'</td><td class="small">'+(x.service||'—')+'</td><td class="num">'+(x.types||'—')+'</td><td class="num">'+(x.reps||'—')+'</td><td class="num"><b>'+(x.singleMean||'—')+'</b></td><td class="num">'+(x.singleTtft||'—')+'</td><td class="num">'+(x.singleAccept!=null?x.singleAccept+'%':'—')+'</td><td class="num small">'+peakTx+'</td><td class="num small">'+(x.pfPeak||'—')+'</td><td><button class="dbtn" data-file="'+x.file+'">详情</button></td></tr>';
+      html+='<tr data-i="'+i+'"><td>'+fmtLocal(x.timestamp)+'</td><td>'+x.tag+'</td><td class="small">'+(MN[x.mode]||x.mode||'—')+'</td><td class="small">'+(x.service||'—')+'</td><td class="num">'+(x.types||'—')+'</td><td class="num">'+(x.reps||'—')+'</td><td class="num"><b>'+(x.singleMean||'—')+'</b></td><td class="num">'+(x.singleTtft||'—')+'</td><td class="num">'+(x.singleAccept!=null?x.singleAccept+'%':'—')+'</td><td class="num small">'+peakTx+'</td><td class="num small">'+(x.pfPeak||'—')+'</td><td><button class="dbtn" data-file="'+x.file+'">详情</button></td></tr>';
     });
     t.innerHTML=html;
     t.querySelectorAll('tr[data-i]').forEach(function(tr){
@@ -587,7 +587,7 @@ function doCompare(list){
     var A=rs[0],B=rs[1];
     if(A.error||B.error){alert('读取失败');return}
     document.getElementById('cmpWrap').style.display='';
-    document.getElementById('cmpTitle').innerHTML='A/B 对比：<span style="color:var(--ac)">'+A.tag+' '+A.timestamp.slice(5,16)+'</span> vs <span style="color:var(--warn)">'+B.tag+' '+B.timestamp.slice(5,16)+'</span><span class="small">（B 相对 A）</span>';
+    document.getElementById('cmpTitle').innerHTML='A/B 对比：<span style="color:var(--ac)">'+A.tag+' '+fmtLocal(A.timestamp)+'</span> vs <span style="color:var(--warn)">'+B.tag+' '+fmtLocal(B.timestamp)+'</span><span class="small">（B 相对 A）</span>';
     var html='',tiles=[];
     var order=B.order||A.order||[];
     var common=order.filter(function(id){return (A.single||{})[id]&&(B.single||{})[id]});
@@ -666,7 +666,10 @@ function doCompare(list){
 }
 // ---------- 历史详情 ----------
 function med(a){if(!a.length)return null;a=a.slice().sort(function(x,y){return x-y});return a.length%2?a[(a.length-1)/2]:(a[a.length/2-1]+a[a.length/2])/2}
-function fmtDT(iso){return(iso||'').replace('T',' ').slice(0,19)}
+// 服务端 timestamp 存 UTC ISO（toISOString 带 Z），直接截字符串显示的是 UTC 时间（比北京早 8 小时）。
+// fmtLocal：转浏览器本地时区。full=true → YYYY-MM-DD HH:mm:ss；缺省 → MM-DD HH:mm。解析失败退回原截断。
+function fmtLocal(iso,full){var d=new Date(iso);if(isNaN(d.getTime()))return(iso||'').replace('T',' ').slice(0,full?19:16);var p=function(n){return(n<10?'0':'')+n};var s=p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());return full?d.getFullYear()+'-'+s+':'+p(d.getSeconds()):s}
+function fmtDT(iso){return fmtLocal(iso,true)}
 function dTiles(arr){var s='<div class="mgrid">';arr.forEach(function(it){s+='<div class="stat"><div class="v" style="font-size:18px">'+(it[0]!=null&&it[0]!==''?it[0]:'—')+'</div><div class="l">'+it[1]+'</div></div>'});return s+'</div>'}
 function openDetail(file){
   fetch('/v1/internal/bench/history/read?f='+encodeURIComponent(file)).then(r=>r.json()).then(function(j){

@@ -3547,6 +3547,32 @@ function startWithScheme(key) {
         .catch(e => alert('请求失败：' + e.message));
 }
 
+// vLLM 原生时间戳 "MM-DD HH:MM:SS" 不带时区：进程跑在 chroot 里、chroot 内无时区配置，
+// 打出来的是 UTC，比系统本地时间慢 8 小时（2026-09-25 实锤：系统 20:03 CST 时日志尾行 12:03）。
+// 自适应换算：把时间戳分别按 UTC 与按本地各解释一次（年份取今年/去年），谁离当前时间近用谁——
+// 现状（日志=UTC）会被正确换算成本地显示；将来若 chroot 配好 TZ、日志本身已是本地时间，
+// 本地解释更近 → 不会被二次平移。判据不依赖后端，纯前端，index.html 刷新即生效。
+function nativeTsToLocal(ts) {
+    const m = ts.match(/^(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
+    if (!m) return ts;
+    const mo = +m[1], da = +m[2], hh = +m[3], mi = +m[4], ss = +m[5];
+    if (mo < 1 || mo > 12 || da < 1 || da > 31 || hh > 23 || mi > 59 || ss > 60) return ts;
+    const now = Date.now();
+    const yr = new Date().getFullYear();
+    let best = null;
+    for (const asUtc of [true, false]) {
+        for (const y of [yr, yr - 1]) {
+            const d = asUtc ? new Date(Date.UTC(y, mo - 1, da, hh, mi, ss))
+                            : new Date(y, mo - 1, da, hh, mi, ss);
+            const diff = Math.abs(now - d.getTime());
+            if (!best || diff < best.diff) best = { d, diff };
+        }
+    }
+    const p = n => String(n).padStart(2, '0');
+    return p(best.d.getMonth() + 1) + '-' + p(best.d.getDate()) + ' ' +
+           p(best.d.getHours()) + ':' + p(best.d.getMinutes()) + ':' + p(best.d.getSeconds());
+}
+
 function loadVllmLogs() {
     const container = document.getElementById('vllmLogContainer');
     const content = document.getElementById('vllmLogContent');
@@ -3584,10 +3610,11 @@ function loadVllmLogs() {
                 // 3) 引擎原生时间（"09-16 13:29:43"，可带毫秒）；已有 server.js 前缀则不覆盖。
                 //    vLLM V1 行是 `INFO 09-16 13:29:43 [loggers.py:310] ...`——级别词在时间之前，
                 //    只吞时间、保留级别词，否则 ERROR/WARNING 的着色会失效。
+                //    chroot 内无时区配置 → 原生时间是 UTC，经 nativeTsToLocal 自适应换算为本地显示。
                 if (!badgeText) {
                     const nt = line.match(/^(?:(INFO|ERROR|WARNING|DEBUG|CRITICAL)\s+)?(\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)/);
                     if (nt) {
-                        badgeText = nt[2];
+                        badgeText = nativeTsToLocal(nt[2]);
                         line = (nt[1] ? nt[1] + ' ' : '') + line.slice(nt[0].length).replace(/^\s*/, '');
                     }
                 }

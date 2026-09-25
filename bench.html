@@ -320,39 +320,55 @@ document.getElementById('go').onclick=function(){
 };
 document.getElementById('stop').onclick=function(){fetch('/v1/internal/bench/stop',{method:'POST'})};
 
+// ---------- 轮询骨架（09-25 加固）----------
+// 原实现两个致命脆弱点，症状就是「跑完一整轮，图表/表格全是空白」：
+//  ① 渲染链中途抛错 → .then 提前退出，末尾的 setTimeout(poll) 永不执行，轮询从此永久停摆，
+//     页面定格在最后一次渲染的样子（进度条还是新的，因为它在抛错之前那几行已经写了 DOM）。
+//     实锤触发点：单流模式第 1 类一测完就调 renderSingle→renderStats，而 renderStats 无守卫地读
+//     cur.summary.accept——summary 是服务端整轮跑完（第 7 步）才有的字段，运行中恒为 null → TypeError。
+//  ② fetch 只有成功分支，一次网络失败（控制台重启/瞬断）同样把轮询链打断。
+// 修法是通用的：状态落地与渲染分离，每个渲染段各自兜底，轮询排程放在 try 之外必定执行。
+function safeRun(fn){var a=[].slice.call(arguments,1);try{fn.apply(null,a)}catch(e){console.error('[bench] '+(fn&&fn.name?fn.name:'render')+' 异常（已忽略，轮询继续）：',e)}}
 function poll(){
-  fetch('/v1/internal/bench/run').then(r=>r.json()).then(function(s){
-    var pill=document.getElementById('pill'),go=document.getElementById('go'),stop=document.getElementById('stop');
-    running=s.status==='running';
-    go.disabled=running; // 停止按钮常驻：随时可点（空闲时点了无害）
-    document.querySelectorAll('#modeChips .chip').forEach(function(c){c.classList.toggle('locked',running)});
-    pill.className='pill '+(running?'run':(s.status==='done'?'done':(s.status==='error'||s.status==='aborted'?'err':'')));
-    pill.textContent={init:'初始化',running:'运行中',done:'完成',error:'出错',aborted:'已停止'}[s.status]||'空闲';
-    document.getElementById('stageNote').textContent=(s.mode?('['+({single:'单流',conc:'并发',prefill:'预填充'}[s.mode])+'] '):'')+(s.stageNote||'')+(s.iso?(' · '+s.iso):'');
-    var pct=0,tx='';
-    if(s.progress&&s.progress.total){
-      var p=s.progress;pct=Math.round(100*(p.cur-1+(p.rep/Math.max(p.reps,1)))/p.total);
-      tx=p.phase+' '+p.cur+'/'+p.total+' · 第 '+p.rep+'/'+p.reps+' 轮';
-    }else if(s.stage==='settle'){tx='静置预热中…';}
-    document.getElementById('pbar').style.width=pct+'%';
-    document.getElementById('progTx').textContent=tx+(s.error?(' ⚠ '+s.error):'');
-    renderLive(s);
-    renderEvents(s);
-    if(s.single&&Object.keys(s.single).length){var g1=j(s.single,s.order);if(g1!==sig.single){sig.single=g1;cur.single=s.single;cur.order=s.order||Object.keys(s.single);renderSingle();}}
-    if(s.conc&&Object.keys(s.conc).length){var g2=j(s.conc);if(g2!==sig.conc){sig.conc=g2;cur.conc=s.conc;renderConc();}}
-    if(s.prefill&&Object.keys(s.prefill).length){var g3=j(s.prefill);if(g3!==sig.prefill){sig.prefill=g3;cur.prefill=s.prefill;renderPf();}}
-    if(s.summary){var g4=j(s.summary);if(g4!==sig.summary){sig.summary=g4;cur.summary=s.summary;renderStats();}}
-    if(s.final){var g5=j(s.final);if(g5!==sig.fin){sig.fin=g5;renderFinal(s.final,wasRunning);}}
+  fetch('/v1/internal/bench/run').then(function(r){return r.json()}).then(function(s){
+    try{applyState(s)}catch(e){console.error('[bench] 状态渲染异常（已忽略，轮询继续）：',e)}
     wasRunning=running;
     if(running)setTimeout(poll,1000);else loadLive();
+  },function(e){
+    console.warn('[bench] /bench/run 轮询失败，3s 后重试：',e);
+    setTimeout(poll,3000); // 失败也必须续链，否则整页定格
   });
+}
+function applyState(s){
+  var pill=document.getElementById('pill'),go=document.getElementById('go'),stop=document.getElementById('stop');
+  running=s.status==='running';
+  go.disabled=running; // 停止按钮常驻：随时可点（空闲时点了无害）
+  document.querySelectorAll('#modeChips .chip').forEach(function(c){c.classList.toggle('locked',running)});
+  pill.className='pill '+(running?'run':(s.status==='done'?'done':(s.status==='error'||s.status==='aborted'?'err':'')));
+  pill.textContent={init:'初始化',running:'运行中',done:'完成',error:'出错',aborted:'已停止'}[s.status]||'空闲';
+  document.getElementById('stageNote').textContent=(s.mode?('['+({single:'单流',conc:'并发',prefill:'预填充'}[s.mode])+'] '):'')+(s.stageNote||'')+(s.iso?(' · '+s.iso):'');
+  var pct=0,tx='';
+  if(s.progress&&s.progress.total){
+    var p=s.progress;pct=Math.round(100*(p.cur-1+(p.rep/Math.max(p.reps,1)))/p.total);
+    tx=p.phase+' '+p.cur+'/'+p.total+' · 第 '+p.rep+'/'+p.reps+' 轮';
+  }else if(s.stage==='settle'){tx='静置预热中…';}
+  document.getElementById('pbar').style.width=pct+'%';
+  document.getElementById('progTx').textContent=tx+(s.error?(' ⚠ '+s.error):'');
+  if(s.summary)cur.summary=s.summary; // 先落数据再渲染（原顺序 renderStats 会读到 null）
+  safeRun(renderLive,s);
+  safeRun(renderEvents,s);
+  if(s.single&&Object.keys(s.single).length){var g1=j(s.single,s.order);if(g1!==sig.single){sig.single=g1;cur.single=s.single;cur.order=s.order||Object.keys(s.single);safeRun(renderSingle);}}
+  if(s.conc&&Object.keys(s.conc).length){var g2=j(s.conc);if(g2!==sig.conc){sig.conc=g2;cur.conc=s.conc;safeRun(renderConc);}}
+  if(s.prefill&&Object.keys(s.prefill).length){var g3=j(s.prefill);if(g3!==sig.prefill){sig.prefill=g3;cur.prefill=s.prefill;safeRun(renderPf);}}
+  if(s.summary){var g4=j(s.summary);if(g4!==sig.summary){sig.summary=g4;safeRun(renderStats);}}
+  if(s.final){var g5=j(s.final);if(g5!==sig.fin){sig.fin=g5;safeRun(renderFinal,s.final,wasRunning);}}
 }
 // ---------- 实时监控 ----------
 function renderLive(s){
   var card=document.getElementById('liveCard');
   var L=s.live;
   if(!L||!L.t||!L.t.length){card.style.display='none';return;}
-  card.style.display='';
+  card.style.display='block'; // 必须显式 block：CSS 里 #liveCard{display:none}，置空等于沿用该规则，卡片永远出不来
   var n=L.t.length,last=n-1;
   document.getElementById('liveHead').textContent='每 1s 采样 /metrics · 已录 '+n+' 点（保留最近 300）';
   var stats=[[L.tg[last]!=null?L.tg[last]:'—','decode tok/s'],
@@ -403,7 +419,7 @@ function renderEvents(s){
   for(var i2=s.events.length-1;i2>=0;i2--){if(s.events[i2].kind!=='final'){lastEv=s.events[i2];break;}}
   if(lastEv){
     var ls=document.getElementById('lastSumm');
-    ls.style.display='';
+    ls.style.display='block'; // 同上：#lastSumm 由 CSS 隐藏，置空不会显示
     ls.innerHTML='最新一段： <b>'+lastEv.title.replace('✔ ','')+'</b> → '+lastEv.text;
   }
 }
@@ -411,7 +427,7 @@ function renderEvents(s){
 function renderFinal(f,doScroll){
   var card=document.getElementById('finalCard');
   var b=document.getElementById('finalBody');
-  card.style.display='';
+  card.style.display='block'; // 同上：#finalCard 由 CSS 隐藏，置空不会显示（原「最终汇总」永不出场）
   var html='';
   function tiles(arr){
     var s='<div class="mgrid">';
@@ -459,13 +475,14 @@ function renderFinal(f,doScroll){
 }
 function renderStats(){
   var w=document.getElementById('sgStats');w.innerHTML='';
+  var SM=cur.summary||{}; // 运行中 summary 字段服务端还没产出，不能当对象直读（09-25 停摆根因）
   var singleMean=null;
   if(cur.single&&cur.order){var arr=cur.order.map(function(id){return (cur.single[id]||{}).meanTps}).filter(Boolean);singleMean=arr.length?(arr.reduce(function(a,b){return a+b},0)/arr.length):null;}
   var pfBest=null;
   if(cur.prefill){var ks=Object.keys(cur.prefill);if(ks.length){var v=ks.map(function(k){return cur.prefill[k].meanPtps||0});pfBest=Math.max.apply(null,v);}}
   [[singleMean?singleMean.toFixed(1):'—','单流均值 tok/s'],
-   [cur.summary.accept!=null?cur.summary.accept+'%':'—','投机接受率'],
-   [cur.summary.prefixHit!=null?cur.summary.prefixHit+'%':'—','前缀缓存命中'],
+   [SM.accept!=null?SM.accept+'%':'—','投机接受率'],
+   [SM.prefixHit!=null?SM.prefixHit+'%':'—','前缀缓存命中'],
    [pfBest?pfBest+' tok/s':'—','prefill 峰值档']
   ].forEach(function(it){
     var d=h('div','stat');d.innerHTML='<div class="v">'+(it[0]||'—')+'</div><div class="l">'+it[1]+'</div>';w.appendChild(d);

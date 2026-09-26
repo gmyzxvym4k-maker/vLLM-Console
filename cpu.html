@@ -44,6 +44,7 @@ input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(99,102
   <h1><span class="logo">⚙</span> CPU 控制 <span style="font-size:13px;font-weight:500;color:var(--tx2)">X99-T8 · E5-2696 v4</span></h1>
   <span id="cpuChip">加载中…</span>
   <span style="flex:1"></span>
+  <span id="cpuFresh" style="font-size:11.5px;color:var(--tx3)"></span>
   <span style="font-size:11.5px;color:var(--tx3)">运行时软控制 sysfs，重启回 BIOS 默认 · 22 同构物理核（无大小核/超线程）</span>
 </header>
 <div class="sub">逐核上/下线 · 睿频开关 · 任意上/下限锁频 · 调速器 · 逐核温度 · 性能测试</div>
@@ -148,7 +149,7 @@ input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(99,102
 let cpuTimer = null, cpuCmdBusy = false, cpuTileSig = '', cpuOptSig = '';
 
 function safeRun(fn) { try { fn(); } catch (e) { console.error('cpu render:', e); } }
-function startCpuPolling() { if (!cpuTimer) cpuTimer = setInterval(() => { if (!document.hidden) loadCpuCtl(); }, 5000); }
+function startCpuPolling() { if (!cpuTimer) cpuTimer = setInterval(() => { if (!document.hidden) loadCpuCtl(); }, 3000); }
 function stopCpuPolling() { if (cpuTimer) { clearInterval(cpuTimer); cpuTimer = null; } }
 function cpuGHz(khz) { return khz ? (khz / 1000000).toFixed(2) : '–'; }
 function tempColor(t) { return t == null ? 'var(--tx3)' : t >= 80 ? 'var(--bad)' : t >= 65 ? 'var(--warn)' : 'var(--ok)'; }
@@ -156,7 +157,9 @@ function tempColor(t) { return t == null ? 'var(--tx3)' : t >= 80 ? 'var(--bad)'
 function loadCpuCtl() {
   return fetch('/v1/internal/cpuctl', { cache: 'no-store' })
     .then(r => r.json())
-    .then(d => { safeRun(() => { if (d && d.ok === false) renderCpuErr(d.error || '未知错误'); else if (d) renderCpuCtl(d); }); })
+    // 服务端 GET 回包是 {ok, state} 信封——必须拆 state 再渲染；
+    // 直接把信封递给 renderCpuCtl 会在第一行抛错（被 safeRun 吞掉），表现为"首绘后数字冻结"。
+    .then(d => { safeRun(() => { if (d && d.ok === false) renderCpuErr(d.error || '未知错误'); else if (d && d.state) renderCpuCtl(d.state); }); })
     .catch(() => {});
 }
 
@@ -167,6 +170,7 @@ function renderCpuErr(msg) {
 
 function renderCpuCtl(d) {
   const set = (id, txt, color) => { const el = document.getElementById(id); if (el) { el.textContent = txt; if (color) el.style.color = color; } };
+  set('cpuFresh', '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }));
   const chip = document.getElementById('cpuChip');
   if (chip) {
     chip.textContent = '在线 ' + d.onlineCount + ' / ' + d.present.length + ' 核 [' + d.onlineStr + ']'

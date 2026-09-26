@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# cpu-ctl — 运行时 CPU 控制台（单文件，vLLM 管理台「CPU 控制」页调用）
-# 移植自 bench-console/cpu-control（上游针对 i5-14600K），本版通用化：
-#   · P/E 分类为学习式（在线核 cpuinfo_max_freq 比最高档低 ≥500MHz 记为 E），无 12-19 硬编码兜底
-#   · 同构 CPU（如本机 E5-2696 v4，22 物理核、BIOS 关超线程）时 E 列表为空，小核命令自动空操作
-#   · 新增 core all-on：把全部可下线的离线核一键上线（对应开机脚本误下线核的恢复场景）
-#   · minFreqTotal 实读 cpuinfo_min_freq，不再硬编码 800MHz
-# 全部为运行时软控制（写 /sys/devices/system/cpu/...），重启回 BIOS/内核默认。
+# cpu-ctl — X99 / E5-2696 v4 运行时 CPU 控制台（单文件，vLLM 管理台「CPU 控制」页调用）
+# 移植自 bench-console/cpu-control（i5-14600K 版），本版为当前平台定制：
+#   · 平台事实：HUANANZHI X99-T8，E5-2696 v4 = 22 个同构物理核（无大小核），BIOS 已关超线程
+#     → 删除 P/E 分类、小核簇、超线程、EPP 等混合架构专属逻辑（本机全部无意义）
+#   · 新增睿频开关：/sys/devices/system/cpu/intel_pstate/no_turbo（X99/E5 平台级控制）
+#   · 新增逐核温度：coretemp hwmon，label "Core N" 与 topology/core_id 对应（core_id 不连续，
+#     如 cpu20→Core 27，实测映射成立）
+#   · 频率 1.2~3.7GHz（intel_pstate active，无 HWP），调速器 performance/powersave/ondemand 等
+# 全部为运行时软控制（写 /sys），重启回 BIOS/内核默认。
 # 用法: cpu-ctl <命令>（非 root 自动提权）  cpu-ctl help 查看全部
 # 依赖: bash / python3（status --json 与 bench）/ taskset（bench）
 set -uo pipefail
 
 CPU=/sys/devices/system/cpu
+PSTATE=$CPU/intel_pstate
 STATE=/var/lib/cpu-ctl
 
 [[ $EUID -ne 0 ]] && exec sudo "$0" "$@"
@@ -23,41 +26,12 @@ is_online() { local n=$1; local f="$CPU/cpu$n/online"; [[ ! -e $f ]] || [[ $(cat
 online_str() { cat "$CPU/online" 2>/dev/null || echo "?"; }
 set_online() { local n=$1 v=$2; local f="$CPU/cpu$n/online"; [[ -e $f ]] && echo "$v" > "$f"; }
 cpu_model() { grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//'; }
-has_nosmt() { grep -qw nosmt /proc/cmdline; }
 
-# P/E 分类: 读得到 cpuinfo_max_freq 的按频率分（最高档=P，低 >=500MHz 的=E）；
-# 离线读不到的: 用已知缓存 $STATE/ecores（只增不减，防止只有部分 E 核在线时缓存被覆盖残缺）。
-# 同构 CPU 缓存恒为空 = 没有小核，这是正确状态而非缺陷。
-ecore_list() {
-  if [[ -s $STATE/ecores ]]; then cat "$STATE/ecores"; fi
-}
-learn_ecores() {
-  local top=0 c m existing=""
-  for c in $(present_list); do
-    is_online "$c" || continue
-    m=$(cat "$CPU/cpu$c/cpufreq/cpuinfo_max_freq" 2>/dev/null) || continue
-    (( m > top )) && top=$m
-  done
-  (( top > 0 )) || return 0
-  [[ -s $STATE/ecores ]] && existing=$(cat "$STATE/ecores")
-  for c in $(present_list); do
-    is_online "$c" || continue
-    m=$(cat "$CPU/cpu$c/cpufreq/cpuinfo_max_freq" 2>/dev/null) || continue
-    if (( top - m >= 500000 )); then
-      grep -qw "$c" <<<"$existing" 2>/dev/null || existing="$existing $c"
-    fi
-  done
-  echo $existing | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tr '\n' ' ' | sed 's/ $//' > "$STATE/ecores"
-  return 0
-}
-
-# 规格展开: all | p | e | 0-7,16 单个数字 -> cpu 序列
+# 规格展开: all | 0-7,16 -> cpu 序列（同构 CPU 无 p/e 概念）
 expand_spec() {
   local spec=$1 a b part
   case "$spec" in
     all) present_list ;;
-    p)   for c in $(present_list); do grep -qw "$c" <(ecore_list) || echo "$c"; done ;;
-    e)   ecore_list ;;
     *)   local IFS=,
          for part in $spec; do
            if [[ $part = *-* ]]; then a=${part%-*}; b=${part#*-}; seq "$a" "$b"; else echo "$part"; fi
@@ -78,56 +52,50 @@ fmt_khz() { awk "BEGIN{printf \"%.2f GHz\", $1/1000000}"; }
 
 # ---------- status --json ----------
 do_status_json() {
-  learn_ecores
-  python3 - "$STATE" <<'PYEOF'
-import json, os, sys
-state = sys.argv[1]
+  python3 - <<'PYEOF'
+import glob, json, os
 CPU = '/sys/devices/system/cpu'
+PSTATE = f'{CPU}/intel_pstate'
 def rd(p, default=None):
     try:
         with open(p) as f: return f.read().strip()
     except OSError: return default
 present = sorted(int(x[3:]) for x in os.listdir(CPU) if x.startswith('cpu') and x[3:].isdigit())
-ecores = set()
-try:
-    with open(os.path.join(state, 'ecores')) as f:
-        ecores = set(int(x) for x in f.read().split())
-except OSError: pass
 nosmt = 'nosmt' in rd('/proc/cmdline', '')
 smt_control = rd(f'{CPU}/smt/control') or 'missing'
-cores = []
-top = 0
-hw_min = 0
+# coretemp 每核温度：label "Core N" 的 N 与 topology/core_id 对应；"Package id 0" 单独取
+core_temps = {}
+pkg_temp = None
+for h in glob.glob('/sys/class/hwmon/hwmon*'):
+    if rd(f'{h}/name') != 'coretemp': continue
+    for inp in glob.glob(f'{h}/temp*_input'):
+        try: v = int(rd(inp))
+        except (TypeError, ValueError): continue
+        lab = rd(inp.replace('_input', '_label'), '')
+        if lab.startswith('Core'):
+            try: core_temps[int(lab.split()[1])] = v
+            except (IndexError, ValueError): pass
+        elif lab.startswith('Package'):
+            pkg_temp = v
 online_cpus = []
 for c in present:
     if not os.path.exists(f'{CPU}/cpu{c}/online') or rd(f'{CPU}/cpu{c}/online') == '1':
         online_cpus.append(c)
-# 最高/最低档频率（在线核中取极值）
+top = 0
+hw_min = 0
 for c in online_cpus:
     m = rd(f'{CPU}/cpu{c}/cpufreq/cpuinfo_max_freq')
     if m: top = max(top, int(m))
     n = rd(f'{CPU}/cpu{c}/cpufreq/cpuinfo_min_freq')
     if n: hw_min = min(hw_min, int(n)) if hw_min else int(n)
+cores = []
 for c in present:
     onv = rd(f'{CPU}/cpu{c}/online')
     online = (onv is None) or (onv == '1')   # 无 online 文件 = 恒在线（cpu0）
-    typ = 'E' if c in ecores else 'P'
-    sib = None
-    sl = rd(f'{CPU}/cpu{c}/topology/thread_siblings_list')
-    if sl and ',' in sl:
-        parts = [int(x) for x in sl.replace('-', ',').split(',')]
-        # 展开 "0,4" 或 "0-1" 形式，取除自身外的兄弟
-        exp = []
-        i = 0
-        while i < len(parts):
-            if i + 1 < len(parts) and parts[i + 1] == parts[i] + 1 and '-' in (sl or ''):
-                j = i
-                while j + 1 < len(parts) and parts[j + 1] == parts[j] + 1: j += 1
-                exp.extend(range(parts[i], parts[j] + 1)); i = j + 1
-            else:
-                exp.append(parts[i]); i += 1
-        sib = [x for x in exp if x != c] or None
-    d = {'cpu': c, 'type': typ, 'online': online, 'siblings': sib}
+    cid = rd(f'{CPU}/cpu{c}/topology/core_id')
+    d = {'cpu': c, 'online': online, 'core_id': int(cid) if cid else None}
+    if online and cid is not None and int(cid) in core_temps:
+        d['tempC'] = round(core_temps[int(cid)] / 1000)
     if online:
         cf = f'{CPU}/cpu{c}/cpufreq'
         d['cur'] = int(rd(f'{cf}/scaling_cur_freq', 0) or 0)
@@ -136,25 +104,32 @@ for c in present:
         d['hwMin'] = int(rd(f'{cf}/cpuinfo_min_freq', 0) or 0)
         d['hwMax'] = int(rd(f'{cf}/cpuinfo_max_freq', 0) or 0)
         d['governor'] = rd(f'{cf}/scaling_governor')
-        d['epp'] = rd(f'{cf}/energy_performance_preference')
-        d['eppAvail'] = (rd(f'{cf}/energy_performance_available_preferences') or '').split()
         d['govAvail'] = (rd(f'{cf}/scaling_available_governors') or '').split()
     cores.append(d)
+model = ''
+for line in (rd('/proc/cpuinfo') or '').splitlines():
+    if line.startswith('model name'):
+        model = line.split(':', 1)[1].strip(); break
 out = {
-    'model': '',
+    'platform': 'X99 / E5（22 同构核 · BIOS 关超线程 · 单 NUMA）',
+    'model': model,
     'nosmt': nosmt,
     'smtControl': smt_control,
     'present': present,
     'onlineStr': rd(f'{CPU}/online'),
     'onlineCount': len(online_cpus),
     'cores': cores,
-    'ecores': sorted(ecores),
+    'pkgTempC': round(pkg_temp / 1000) if pkg_temp else None,
+    'pstate': {
+        'driver': rd(f'{CPU}/cpu0/cpufreq/scaling_driver'),
+        'noTurbo': rd(f'{PSTATE}/no_turbo'),
+        'maxPerfPct': rd(f'{PSTATE}/max_perf_pct'),
+        'minPerfPct': rd(f'{PSTATE}/min_perf_pct'),
+        'turboPct': rd(f'{PSTATE}/turbo_pct'),
+        'numPstates': rd(f'{PSTATE}/num_pstates'),
+    },
     'minFreqTotal': hw_min, 'maxFreqTotal': top,
 }
-# model name
-for line in (rd('/proc/cpuinfo') or '').splitlines():
-    if line.startswith('model name'):
-        out['model'] = line.split(':', 1)[1].strip(); break
 print(json.dumps(out, ensure_ascii=False))
 PYEOF
 }
@@ -163,7 +138,7 @@ PYEOF
 do_freq() {
   local sub=${1:-show} arg=${2:-} spec=${3:-all} kHz c f orig cur_max ok=0 fail=0
   case "$sub" in
-    show) do_status_json >/dev/null  # 顺带 learn
+    show)
       printf "%-7s %-10s %-10s %-10s %s\n" "cpu" "当前" "下限" "上限"
       for c in $(present_list); do
         is_online "$c" || { printf "%-7s %s\n" "cpu$c" "(下线)"; continue; }
@@ -171,7 +146,7 @@ do_freq() {
         printf "%-7s %-10s %-10s %-10s\n" "cpu$c" "$(cat $f/scaling_cur_freq 2>/dev/null)" "$(cat $f/scaling_min_freq 2>/dev/null)" "$(cat $f/scaling_max_freq 2>/dev/null)"
       done ;;
     max|min)
-      [[ -z $arg ]] && { echo "用法: cpu-ctl freq $sub <4G|3800M|kHz> [all|p|e|0-19]" >&2; return 1; }
+      [[ -z $arg ]] && { echo "用法: cpu-ctl freq $sub <3.7G|2000M|kHz> [all|0-19]" >&2; return 1; }
       kHz=$(parse_freq "$arg") || return 1
       for c in $(expand_spec "${spec:-all}"); do
         is_online "$c" || continue
@@ -208,43 +183,40 @@ do_freq() {
   esac
 }
 
-# ---------- governor / EPP ----------
-do_gov() {  # gov performance [spec] / epp balance_performance [spec]
-  local what=${1:-} val=${2:-} spec=${3:-all} c
-  [[ $what != gov && $what != epp ]] && { echo "用法: cpu-ctl gov <performance|powersave> [spec] | epp <值> [spec]" >&2; return 1; }
-  [[ -z $val ]] && { echo "缺少值" >&2; return 1; }
+# ---------- governor ----------
+do_gov() {  # gov performance [spec]
+  local val=${1:-} spec=${2:-all} c
+  [[ -z $val ]] && { echo "用法: cpu-ctl gov <performance|powersave|ondemand|...> [spec]" >&2; return 1; }
   local ok=0 fail=0
   for c in $(expand_spec "${spec:-all}"); do
     is_online "$c" || continue
-    if [[ $what = epp && ! -e "$CPU/cpu$c/cpufreq/energy_performance_preference" ]]; then
-      continue   # 无 HWP 的平台（如 Broadwell-EP）没有 EPP，静默跳过
-    fi
-    if echo "$val" > "$CPU/cpu$c/cpufreq/scaling_$([[ $what = gov ]] && echo governor || echo energy_performance_preference)" 2>/dev/null; then
+    if echo "$val" > "$CPU/cpu$c/cpufreq/scaling_governor" 2>/dev/null; then
       ok=$((ok+1)); else fail=$((fail+1)); echo "cpu$c 写入失败" >&2
     fi
   done
-  if [[ $what = epp && $ok = 0 && $fail = 0 ]]; then echo "本平台不支持 EPP（无 HWP）"; return 0; fi
-  echo "$what -> $val: 成功 $ok, 失败 $fail"
+  echo "gov -> $val: 成功 $ok, 失败 $fail"
 }
 
-# ---------- 小核 / 单核 ----------
-do_ecore() {
-  local action=${1:-list} c v on=0 off=0
-  local list; list=$(ecore_list)
+# ---------- 睿频（intel_pstate/no_turbo，平台级） ----------
+do_turbo() {
+  local action=${1:-status} cur
+  [[ -e $PSTATE/no_turbo ]] || { echo "本平台无 intel_pstate/no_turbo" >&2; return 1; }
+  cur=$(cat "$PSTATE/no_turbo")
   case "$action" in
-    list) if [[ -z $list ]]; then echo "本机未识别到 E 核簇（同构 CPU 属正常）"; return 0; fi
-          echo "E 簇: $list"; for c in $list; do is_online "$c" && on=$((on+1)) || off=$((off+1)); done; echo "在线 $on / 离线 $off" ;;
-    on|off)
-      if [[ -z $list ]]; then echo "本机无 E 核簇，无需操作"; return 0; fi
-      v=0; [[ $action = on ]] && v=1
-      for c in $list; do
-        set_online "$c" "$v" && echo "cpu$c -> $([[ $v = 1 ]] && echo 上线 || echo 下线)" || echo "cpu$c 失败" >&2
-      done
-      echo "当前在线: $(online_str)" ;;
-    *) echo "用法: cpu-ctl ecore <list|on|off>" >&2; return 1 ;;
+    status)
+      [[ $cur = 0 ]] && echo "睿频: 开启（no_turbo=0，单核可冲 3.7GHz）" || echo "睿频: 关闭（no_turbo=1，封顶基频 2.2GHz）"
+      echo "当前在线: $(online_str)  max_perf_pct=$(cat $PSTATE/max_perf_pct 2>/dev/null)" ;;
+    on)
+      [[ $cur = 0 ]] && { echo "已经是开启状态"; return 0; }
+      echo 0 > "$PSTATE/no_turbo" && echo "睿频已开启" || { echo "写入失败" >&2; return 1; } ;;
+    off)
+      [[ $cur = 1 ]] && { echo "已经是关闭状态"; return 0; }
+      echo 1 > "$PSTATE/no_turbo" && echo "睿频已关闭（频率封顶到基频 2.2GHz）" || { echo "写入失败" >&2; return 1; } ;;
+    *) do_turbo status ;;
   esac
 }
 
+# ---------- 单核上/下线 ----------
 do_core() {
   local action=${1:-} n=${2:-} c on_cnt=0
   case "$action" in
@@ -273,51 +245,16 @@ do_core() {
   esac
 }
 
-# ---------- 超线程（运行时直切，无需重启）----------
-# 走 /sys/devices/system/cpu/smt/control（on/off/forceoff/notsupported）。
-# 注意：BIOS 已关超线程的机器（如本机 E5-2696 v4）每核只有 1 线程，control 常显示 on
-# 但没有兄弟线程可切——属正常，写 off 也只是禁用未来可能出现的兄弟核。
-SMT_CTL=$CPU/smt/control
-
-do_ht() {
-  local action=${1:-status} cur
-  cur=$(cat "$SMT_CTL" 2>/dev/null || echo missing)
-  case "$action" in
-    status)
-      case "$cur" in
-        on)  echo "超线程: 开启（smt/control=on）  当前在线: $(online_str)" ;;
-        off) echo "超线程: 关闭（smt/control=off，运行时可直接开启）  当前在线: $(online_str)" ;;
-        forceoff) echo "超线程: 被 BIOS/内核强制关闭（forceoff），运行时无法开启" ;;
-        notsupported) echo "此内核不支持 SMT 控制" ;;
-        *) echo "smt/control 不可读（$cur）" ;;
-      esac ;;
-    on)
-      [[ $cur = on ]] && { echo "已经是开启状态"; return 0; }
-      [[ $cur = on || $cur = off ]] || { echo "smt/control=$cur，无法运行时开启" >&2; return 1; }
-      echo on > "$SMT_CTL" && echo "超线程已开启；当前在线: $(online_str)" || { echo "写入失败" >&2; return 1; } ;;
-    off)
-      [[ $cur = off ]] && { echo "已经是关闭状态"; return 0; }
-      [[ $cur = on || $cur = off ]] || { echo "smt/control=$cur，无法运行时关闭" >&2; return 1; }
-      echo off > "$SMT_CTL" && echo "超线程已关闭；当前在线: $(online_str)" || { echo "写入失败" >&2; return 1; } ;;
-    *) do_ht status ;;
-  esac
-}
-
 # ---------- 性能测试 ----------
 do_bench() {
   local secs=${1:-4} c out iter fmax
   command -v taskset >/dev/null || { echo "缺少 taskset" >&2; return 1; }
-  learn_ecores
-  echo "体质检测: 每在线主线程单线程满载 ${secs}s × 3 轮取中位 …"
-  printf "%-7s %-14s %-10s %s\n" "cpu" "体质分(中位)" "峰值频率" "类型"
+  echo "体质检测: 每在线核单线程满载 ${secs}s × 3 轮取中位 …"
+  printf "%-7s %-14s %s\n" "cpu" "体质分(中位)" "峰值频率"
   local best=0 bestcpu=""
   for c in $(present_list); do
     is_online "$c" || continue
-    # 只测策略主线程（在线且为其 cpufreq 组内编号最小者）
-    local rel
-    rel=$(cat "$CPU/cpu$c/cpufreq/affected_cpus" 2>/dev/null) || continue
-    [[ ${rel%% *} = "$c" ]] || continue
-    local typ="P"; grep -qw "$c" <(ecore_list) && typ="E"
+    # 本机无超线程：每个在线 cpu 就是一个物理核，直接逐个测
     out=$(taskset -c "$c" python3 - "$secs" "$c" <<'PYEOF' 2>/dev/null
 import sys, time
 dur = float(sys.argv[1]); cpuid = sys.argv[2]
@@ -337,19 +274,17 @@ PYEOF
 )
     iter=${out%% *}; fmax=${out##* }
     if [[ ! $iter =~ ^[0-9]+$ ]]; then
-      printf "%-7s %-14s %-10s %s\n" "cpu$c" "失败" "-" "$typ"; continue
+      printf "%-7s %-14s %s\n" "cpu$c" "失败" "-"; continue
     fi
     (( iter > best )) && { best=$iter; bestcpu=$c; }
-    printf "%-7s %-14s %-10s %s\n" "cpu$c" "$iter" "$(fmt_khz "$fmax")" "$typ"
+    printf "%-7s %-14s %s\n" "cpu$c" "$iter" "$(fmt_khz "$fmax")"
   done
-  # 多核分: 全部在线主线程并行满载 secs 秒，逐核分数落临时文件求和
+  # 多核分: 全部在线核并行满载 secs 秒，逐核分数落临时文件求和
   echo
-  echo "多核性能: 全部在线主线程并行满载 ${secs}s …"
-  local mains=() c2 rel tmpd total=0
+  echo "多核性能: 全部在线核并行满载 ${secs}s …"
+  local mains=() c2 tmpd total=0
   for c in $(present_list); do
-    is_online "$c" || continue
-    rel=$(cat "$CPU/cpu$c/cpufreq/affected_cpus" 2>/dev/null) || continue
-    [[ ${rel%% *} = "$c" ]] && mains+=("$c")
+    is_online "$c" && mains+=("$c")
   done
   tmpd=$(mktemp -d)
   for c2 in "${mains[@]}"; do
@@ -368,7 +303,7 @@ PYEOF
     [[ -s $f ]] && total=$(( total + $(cat "$f") ))
   done
   rm -rf "$tmpd"
-  echo "多核总分(各主线程并行迭代数求和): $total"
+  echo "多核总分(各核并行迭代数求和): $total"
   echo ">> 单核体质最佳: cpu$bestcpu (体质分 $best)"
   echo "(提示: core off <编号> 可下线不想要的核; core all-on 一键全部上线)"
 }
@@ -378,27 +313,26 @@ case "${1:-}" in
   status)
     [[ ${2:-} = --json ]] && do_status_json || do_freq show ;;
   freq)   shift; do_freq "$@" ;;
-  gov)    shift; do_gov gov "$@" ;;
-  epp)    shift; do_gov epp "$@" ;;
-  ecore)  shift; do_ecore "$@" ;;
+  gov)    shift; do_gov "$@" ;;
+  turbo)  shift; do_turbo "$@" ;;
   core)   shift; do_core "$@" ;;
-  ht)     shift; do_ht "$@" ;;
   bench)  shift; do_bench "$@" ;;
   ""|help|-h|--help)
     cat <<'EOF'
-cpu-ctl — 运行时 CPU 控制台（移植自 bench-console/cpu-control，通用化；重启回默认）
+cpu-ctl — X99 / E5-2696 v4 运行时 CPU 控制台（重启回默认）
 
-  cpu-ctl status --json        总览 JSON（管理台用）
-  cpu-ctl freq max 4G [spec]   限最高频率  spec: all|p|e|0-7,16
-  cpu-ctl freq min 800M [spec] 锁最低频率（任意下限）
+  cpu-ctl status --json        总览 JSON（管理台用，含逐核温度与 intel_pstate 状态）
+  cpu-ctl freq max 3.5G [spec] 限最高频率  spec: all|0-7,16
+  cpu-ctl freq min 1.2G [spec] 锁最低频率（任意下限）
   cpu-ctl freq reset           恢复改动前的原始上/下限
-  cpu-ctl gov performance      调速器（performance/powersave 等，随平台）
-  cpu-ctl epp balance_performance  能效偏好（仅 HWP 平台；无则提示不支持）
-  cpu-ctl ecore off|on|list    一键下/上 E 核簇（学习式识别；同构 CPU 空操作）
+  cpu-ctl gov performance      调速器（performance/powersave/ondemand/...）
+  cpu-ctl turbo on|off|status  睿频开关（intel_pstate/no_turbo，平台级）
   cpu-ctl core off|on <n>      单个逻辑核下/上线
   cpu-ctl core all-on          一键上线全部离线核（恢复被脚本/手动下线的核）
-  cpu-ctl ht on|off|status     超线程运行时直切（smt/control，立即生效无需重启）
   cpu-ctl bench [秒]           性能测试: 逐核单线程体质 ×3 轮 + 多核并行
+
+平台事实: 22 同构物理核（无大小核），BIOS 关超线程（无兄弟线程可切），
+intel_pstate active 无 HWP（频率 1.2~3.7GHz，无 EPP），单 NUMA 节点。
 EOF
     ;;
   *) echo "未知命令: $1" >&2; exit 1 ;;

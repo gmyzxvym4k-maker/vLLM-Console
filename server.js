@@ -7825,16 +7825,18 @@ function installGzip(req, res) {
 process.on('unhandledRejection', (e) => { try { console.error('[unhandledRejection]', (e && e.stack) || e); } catch (_) {} });
 process.on('uncaughtException', (e) => { try { console.error('[uncaughtException]', (e && e.stack) || e); } catch (_) {} });
 
-// ---------------- 5) CPU 控制（移植自 bench-console/cpu-control，通用化适配） ----------------
+// ---------------- 5) CPU 控制（X99 / E5-2696 v4 定制版，移植自 bench-console/cpu-control） ----------------
 // 调 /usr/local/bin/cpu-ctl（脚本随本仓库部署；非 root 时自提权，需 sudoers.d 白名单，
 // 见 ops/install-cpu-ctl-127.sh）。全部为运行时软控制 sysfs，重启回 BIOS/内核默认。
+// 本机 22 同构核、BIOS 关超线程、无 HWP → 上游的小核簇/超线程/EPP 动作已删，
+// 新增睿频开关（intel_pstate/no_turbo）。
 // 接口: GET  /v1/internal/cpuctl      状态 JSON（1.5s TTL 缓存 + 单飞，防轮询叠发）
 //       POST /v1/internal/cpuctl/cmd  action 白名单（走既有 /v1/internal/ POST 口令拦截）
 // 铁律遵守：execFile + 自身 timeout，绝不 execSync——sysfs/脚本卡住不许拖垮事件循环。
 const CPU_CTL = process.env.CPU_CTL || '/usr/local/bin/cpu-ctl';
-const CPU_FREQ_RE = /^\d+(\.\d+)?\s*[GgMm]?$/;          // 4G / 3800M / 5300000
-const CPU_SPEC_RE = /^(all|p|e|[0-9][0-9,\-]{0,31})$/;  // all|p|e|0-7,16
-const CPU_VAL_RE  = /^[a-z_]{1,40}$/;                    // governor / EPP 值
+const CPU_FREQ_RE = /^\d+(\.\d+)?\s*[GgMm]?$/;          // 3.7G / 2000M / 1200000
+const CPU_SPEC_RE = /^(all|[0-9][0-9,\-]{0,31})$/;      // all | 0-7,16（同构核无 p/e）
+const CPU_VAL_RE  = /^[a-z_]{1,40}$/;                    // governor 值
 
 function cpuCtlRun(args, timeoutMs) {
   return new Promise((resolve) => {
@@ -7883,20 +7885,18 @@ function cpuCtlAction(body) {
       return { args: ['freq', a === 'freq_max' ? 'max' : 'min', f, spec(body.spec)], timeout: 25000 };
     }
     case 'freq_reset': return { args: ['freq', 'reset'], timeout: 25000 };
-    case 'gov': case 'epp': {
+    case 'gov': {
       if (!CPU_VAL_RE.test(String(body.val || '')) || !spec(body.spec)) return null;
-      return { args: [a, body.val, spec(body.spec)], timeout: 25000 };
+      return { args: ['gov', body.val, spec(body.spec)], timeout: 25000 };
     }
-    case 'ecore_on':  return { args: ['ecore', 'on'],  timeout: 30000 };
-    case 'ecore_off': return { args: ['ecore', 'off'], timeout: 30000 };
+    case 'turbo_on':  return { args: ['turbo', 'on'],  timeout: 25000 };
+    case 'turbo_off': return { args: ['turbo', 'off'], timeout: 25000 };
     case 'core_on': case 'core_off': {
       const n = body.cpu;
       if (!/^\d{1,3}$/.test(String(n))) return null;
       return { args: ['core', a === 'core_on' ? 'on' : 'off', String(n)], timeout: 30000 };
     }
     case 'all_on': return { args: ['core', 'all-on'], timeout: 90000 };
-    case 'ht_off': return { args: ['ht', 'off'], timeout: 30000 };
-    case 'ht_on':  return { args: ['ht', 'on'],  timeout: 30000 };
     case 'bench': {
       const s = parseInt(body.secs, 10);
       if (!isFinite(s) || s < 1 || s > 30) return null;

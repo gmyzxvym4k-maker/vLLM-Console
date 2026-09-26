@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CPU 控制 · vLLM 管理台</title>
+<title>CPU 控制 · X99 / E5-2696 v4</title>
 <style>
 :root{--bg:#f1f5f9;--panel:#ffffff;--panel2:#f8fafc;--bd:#e2e8f0;--bd2:#cbd5e1;--tx:#0f172a;--tx2:#475569;--tx3:#94a3b8;--ac:#6366f1;--ac2:#eef2ff;--ok:#059669;--warn:#b45309;--bad:#dc2626;--mono:'SF Mono',Consolas,monospace;--sh:0 1px 3px rgba(28,42,70,.06),0 4px 14px rgba(28,42,70,.05)}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -32,30 +32,26 @@ input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(99,102
 .kv:last-child{border-bottom:none}
 .kv .k{color:var(--tx2)}
 .kv .v{font-weight:600;font-variant-numeric:tabular-nums}
-#cpuCoreGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:9px}
+#cpuCoreGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:9px}
 .tile{position:relative;border:1px solid var(--bd);border-radius:8px;padding:6px 9px}
 .tile.tog{cursor:pointer;transition:.15s}
 .tile.tog:hover{border-color:var(--ac);box-shadow:0 0 0 1px var(--ac)}
 #cpuLog{background:var(--panel2);border:1px solid var(--bd);border-radius:9px;padding:11px 13px;font:12px/1.55 var(--mono);white-space:pre-wrap;word-break:break-all;min-height:70px;max-height:340px;overflow:auto;color:var(--tx2)}
-.pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600}
-.pill.g{background:#ecfdf5;color:var(--ok);border:1px solid #6ee7b7}
-.pill.o{background:#fffbeb;color:var(--warn);border:1px solid #fbbf24}
-.pill.r{background:#fef2f2;color:var(--bad);border:1px solid #fca5a5}
 </style>
 </head>
 <body>
 <header>
-  <h1><span class="logo">⚙</span> CPU 控制</h1>
+  <h1><span class="logo">⚙</span> CPU 控制 <span style="font-size:13px;font-weight:500;color:var(--tx2)">X99-T8 · E5-2696 v4</span></h1>
   <span id="cpuChip">加载中…</span>
   <span style="flex:1"></span>
-  <span style="font-size:11.5px;color:var(--tx3)">全部为运行时软控制（sysfs），重启后回 BIOS/内核默认 · 移植自 bench-console/cpu-control</span>
+  <span style="font-size:11.5px;color:var(--tx3)">运行时软控制 sysfs，重启回 BIOS 默认 · 22 同构物理核（无大小核/超线程）</span>
 </header>
-<div class="sub">逐核上/下线 · 任意上/下限频率 · 调速器 · 超线程 · 一键恢复全部核心 · 逐核性能测试</div>
+<div class="sub">逐核上/下线 · 睿频开关 · 任意上/下限锁频 · 调速器 · 逐核温度 · 性能测试</div>
 
 <div class="wrap">
   <div>
     <div class="card" id="cpuCtlCard">
-      <h3>核心矩阵（点击瓦片 = 上/下线该核）</h3>
+      <h3>核心矩阵（点击瓦片 = 上/下线该核 · 右上=温度 右下=实时频率）</h3>
       <div id="cpuCoreGrid" style="min-height:60px"><span style="color:var(--tx3);font-size:12px">加载中…</span></div>
       <div class="hint" id="cpuIdleHint" style="display:none">灰色频率读数 = 空闲核采样（含 C-state 空闲周期，可低于锁定下限）。锁频以<b>负载下</b>的实际频率为准。</div>
     </div>
@@ -66,7 +62,7 @@ input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(99,102
         <div style="flex:0 0 120px"><label>每核秒数</label><input id="cpuBenchSecs" type="number" min="1" max="30" value="2"></div>
         <button class="btn primary" id="cpuBenchBtn" onclick="cpuBench()">开始测试</button>
       </div>
-      <div class="hint">每个在线主线程单线程满载 N 秒 × 3 轮取中位（体质分 + 峰值频率），再来一轮全部主线程并行求总分。期间温度升高、占用 CPU。</div>
+      <div class="hint">每个在线核单线程满载 N 秒 × 3 轮取中位（体质分 + 峰值频率），再来一轮全部在线核并行求总分。期间温度升高、占用 CPU。</div>
     </div>
 
     <div class="card">
@@ -81,56 +77,45 @@ input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(99,102
       <div class="kv"><span class="k">型号</span><span class="v" id="cpuModel">–</span></div>
       <div class="kv"><span class="k">在线核</span><span class="v" id="cpuOnline">–</span></div>
       <div class="kv"><span class="k">频率范围</span><span class="v" id="cpuRange">–</span></div>
-      <div class="kv"><span class="k">超线程 (smt/control)</span><span class="v" id="cpuHtState">–</span></div>
+      <div class="kv"><span class="k">封装温度</span><span class="v" id="cpuPkgTemp">–</span></div>
+      <div class="kv"><span class="k">睿频 (no_turbo)</span><span class="v" id="cpuTurboState">–</span></div>
       <div class="btns">
-        <button class="btn" id="cpuHtBtn" onclick="cpuHtToggle()">超线程开关</button>
+        <button class="btn" id="cpuTurboBtn" onclick="cpuTurboToggle()">睿频开关</button>
         <button class="btn warn" onclick="cpuAllOn()">一键全部上线</button>
       </div>
-      <div class="btns" id="cpuEcoreRow" style="display:none">
-        <button class="btn" onclick="cpuEcoreCmd('ecore_on')">上线小核</button>
-        <button class="btn warn" onclick="cpuEcoreCmd('ecore_off')">下线小核</button>
-      </div>
-      <div class="hint">「一键全部上线」把被脚本/手动下线的核全部恢复（cpu0 恒在线不参与）。</div>
+      <div class="hint">「一键全部上线」把被脚本/手动下线的核全部恢复（cpu0 恒在线不参与）。关睿频 = 全核封顶基频 2.2GHz，降功耗降温；vLLM 瓶颈在 GPU，一般无需关。</div>
     </div>
 
     <div class="card">
       <h3>频率锁定</h3>
       <label>限制最高频率</label>
-      <input id="cpuFreqMax" placeholder="如 4.5G / 3800M / 5300000(kHz)">
+      <input id="cpuFreqMax" placeholder="如 3.0G / 2500M / 1200000(kHz)">
       <label>锁定最低频率</label>
       <input id="cpuFreqMin" placeholder="如 2.0G（下限高于当前上限会被拒绝）">
       <label>作用范围</label>
-      <div class="row">
-        <select id="cpuSpecMax" onchange="cpuSpecPick(this,'max')">
-          <option value="all">全部核</option><option value="p">仅 P 核</option><option value="e">仅 E 核</option><option value="">按编号…</option>
-        </select>
-        <select id="cpuSpecMin" onchange="cpuSpecPick(this,'min')">
-          <option value="all">全部核</option><option value="p">仅 P 核</option><option value="e">仅 E 核</option><option value="">按编号…</option>
-        </select>
-      </div>
-      <input id="cpuSpecNum" placeholder="编号，如 0-7,12" style="margin-top:8px;display:none">
+      <select id="cpuFreqSpec" onchange="document.getElementById('cpuSpecNum').style.display=this.value==='all'?'none':''">
+        <option value="all">全部核</option><option value="">按编号…</option>
+      </select>
+      <input id="cpuSpecNum" placeholder="编号，如 0-7,20" style="margin-top:8px;display:none">
       <div class="btns">
         <button class="btn primary" onclick="cpuFreqCmd('freq_max')">限最高</button>
         <button class="btn primary" onclick="cpuFreqCmd('freq_min')">锁最低</button>
         <button class="btn warn" onclick="cpuFreqReset()">恢复默认</button>
       </div>
-      <div class="hint">首次改动会自动记住原始上/下限，「恢复默认」逐项还原。空闲核读数偏低属 APERF/MPERF 采样特性，非锁频失效。</div>
+      <div class="hint">首次改动会自动记住原始上/下限，「恢复默认」逐项还原。上下限同钉同一值 = 锁死该频率。</div>
     </div>
 
     <div class="card">
-      <h3>调速器 / 能效偏好</h3>
+      <h3>调速器</h3>
       <label>governor</label>
       <select id="cpuGov"><option value="">（当前）</option></select>
-      <div id="cpuEppWrap">
-        <label>EPP（HWP 平台）</label>
-        <select id="cpuEpp"><option value="">（当前）</option></select>
-      </div>
       <label>作用范围</label>
       <select id="cpuGovSpec">
-        <option value="all">全部核</option><option value="p">仅 P 核</option><option value="e">仅 E 核</option>
+        <option value="all">全部核</option><option value="">按编号…</option>
       </select>
+      <input id="cpuGovSpecNum" placeholder="编号，如 0-7,20" style="margin-top:8px;display:none" oninput="document.getElementById('cpuGovSpec').value=''">
       <div class="btns"><button class="btn primary" onclick="cpuGovApply()">应用</button></div>
-      <div class="hint">vLLM 推理场景常用 performance（消除调度器犹豫的升频延迟）。</div>
+      <div class="hint">vLLM 推理场景常用 performance（消除调度器犹豫的升频延迟）；本机 intel_pstate active，powersave 亦能满频。</div>
     </div>
   </div>
 </div>
@@ -156,16 +141,17 @@ input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(99,102
 })();
 </script>
 <script>
-/* CPU 控制前端 —— 移植自 bench-console/dsh-console-ui.snippet.js，按本台 09-25 前端教训加固：
+/* CPU 控制前端 —— X99 / E5-2696 v4 定制版（移植 bench-console/cpu-control，去混合架构控件）
    · 轮询用独立 setInterval（每拍自成一体，渲染抛错不影响下一拍），渲染分段 safeRun 兜底
    · 瓦片 DOM 仅在「核集合签名」变化时重建，每拍只刷新数值（不打掉用户正点的按钮）
    · 后台标签页停轮询（visibilitychange 门控），回前台立即补一拍 */
-let cpuTimer = null, cpuCmdBusy = false, cpuTileSig = '', cpuOptSig = '', cpuLastOk = 0;
+let cpuTimer = null, cpuCmdBusy = false, cpuTileSig = '', cpuOptSig = '';
 
 function safeRun(fn) { try { fn(); } catch (e) { console.error('cpu render:', e); } }
 function startCpuPolling() { if (!cpuTimer) cpuTimer = setInterval(() => { if (!document.hidden) loadCpuCtl(); }, 5000); }
 function stopCpuPolling() { if (cpuTimer) { clearInterval(cpuTimer); cpuTimer = null; } }
 function cpuGHz(khz) { return khz ? (khz / 1000000).toFixed(2) : '–'; }
+function tempColor(t) { return t == null ? 'var(--tx3)' : t >= 80 ? 'var(--bad)' : t >= 65 ? 'var(--warn)' : 'var(--ok)'; }
 
 function loadCpuCtl() {
   return fetch('/v1/internal/cpuctl', { cache: 'no-store' })
@@ -176,72 +162,59 @@ function loadCpuCtl() {
 
 function renderCpuErr(msg) {
   const chip = document.getElementById('cpuChip');
-  if (chip) { chip.textContent = '离线 — ' + msg; chip.className = ''; chip.style.color = 'var(--bad)'; }
+  if (chip) { chip.textContent = '离线 — ' + msg; chip.style.color = 'var(--bad)'; }
 }
 
 function renderCpuCtl(d) {
-  cpuLastOk = Date.now();
   const set = (id, txt, color) => { const el = document.getElementById(id); if (el) { el.textContent = txt; if (color) el.style.color = color; } };
   const chip = document.getElementById('cpuChip');
   if (chip) {
-    chip.textContent = '在线 ' + d.onlineCount + ' 核 [' + d.onlineStr + ']' + (d.ecores && d.ecores.length ? ' · 小核 ' + d.ecores.length + ' 个' : '') + (d.nosmt ? ' · nosmt' : '');
-    chip.style.color = 'var(--ok)';
+    chip.textContent = '在线 ' + d.onlineCount + ' / ' + d.present.length + ' 核 [' + d.onlineStr + ']'
+      + (d.pkgTempC != null ? ' · 封装 ' + d.pkgTempC + '°C' : '');
+    chip.style.color = d.onlineCount === d.present.length ? 'var(--ok)' : 'var(--warn)';
   }
   set('cpuModel', d.model || '–');
-  set('cpuOnline', d.onlineCount + ' / ' + d.present.length + ' 逻辑核');
+  set('cpuOnline', d.onlineCount + ' / ' + d.present.length + ' 物理核' + (d.onlineCount < d.present.length ? '（有核被下线）' : ''));
   set('cpuRange', (d.minFreqTotal ? cpuGHz(d.minFreqTotal) : '?') + ' ~ ' + (d.maxFreqTotal ? cpuGHz(d.maxFreqTotal) : '?') + ' GHz');
-  set('cpuHtState', d.smtControl === 'on' ? '开启（' + d.onlineCount + ' 线程在线）'
-      : d.smtControl === 'off' ? '关闭'
-      : d.smtControl === 'forceoff' ? '被 BIOS 强制关闭' : (d.smtControl || '未知'),
-      d.smtControl === 'on' ? 'var(--ok)' : 'var(--warn)');
-  const htBtn = document.getElementById('cpuHtBtn');
-  if (htBtn) {
-    htBtn.textContent = d.smtControl === 'on' ? '关闭超线程' : '开启超线程';
-    htBtn.disabled = (d.smtControl !== 'on' && d.smtControl !== 'off');
-  }
-  // 小核按钮：仅识别到 E 核簇时显示（同构 CPU 隐藏）
-  const erow = document.getElementById('cpuEcoreRow');
-  if (erow) erow.style.display = (d.ecores && d.ecores.length) ? '' : 'none';
+  const pt = document.getElementById('cpuPkgTemp');
+  if (pt) { pt.textContent = d.pkgTempC != null ? d.pkgTempC + ' °C' : '–'; pt.style.color = tempColor(d.pkgTempC); }
+  const nt = d.pstate && d.pstate.noTurbo;
+  set('cpuTurboState', nt === '0' ? '开启（可冲 3.7GHz）' : nt === '1' ? '关闭（封顶基频 2.2GHz）' : (nt == null ? '不可用' : nt),
+      nt === '0' ? 'var(--ok)' : 'var(--warn)');
+  const tb = document.getElementById('cpuTurboBtn');
+  if (tb) { tb.textContent = nt === '0' ? '关闭睿频' : '开启睿频'; tb.disabled = (nt !== '0' && nt !== '1'); }
 
-  // 调速器 / EPP 下拉：仅当可选值变化时重建（避免打掉用户正选着的项）
+  // 调速器下拉：仅当可选值变化时重建（避免打掉用户正选着的项）
   const first = d.cores.find(c => c.online && c.govAvail && c.govAvail.length);
   if (first) {
-    const hasEpp = !!(first.eppAvail && first.eppAvail.length);
-    const ew = document.getElementById('cpuEppWrap');
-    if (ew) ew.style.display = hasEpp ? '' : 'none';
-    const osig = first.govAvail.join(',') + '|' + (hasEpp ? first.eppAvail.join(',') : '');
+    const osig = first.govAvail.join(',');
     if (osig !== cpuOptSig) {
       cpuOptSig = osig;
-      const g = document.getElementById('cpuGov'), e = document.getElementById('cpuEpp');
+      const g = document.getElementById('cpuGov');
       if (g) { g.innerHTML = '<option value="">（当前 ' + (first.governor || '?') + '）</option>' + first.govAvail.map(v => '<option value="' + v + '">' + v + '</option>').join(''); g.value = ''; }
-      if (e && hasEpp) { e.innerHTML = '<option value="">（当前 ' + (first.epp || '?') + '）</option>' + first.eppAvail.map(v => '<option value="' + v + '">' + v + '</option>').join(''); e.value = ''; }
     }
   }
 
-  // 核瓦片：仅在核集合/在线状态/类型变化时重建 DOM，每拍只刷新数值
-  const sig = d.cores.map(c => c.cpu + ':' + (c.online ? 1 : 0) + ':' + c.type).join(',');
+  // 核瓦片：仅在核集合/在线状态变化时重建 DOM，每拍只刷新数值
+  const sig = d.cores.map(c => c.cpu + ':' + (c.online ? 1 : 0)).join(',');
   const grid = document.getElementById('cpuCoreGrid');
   if (!grid) return;
   if (sig !== cpuTileSig) {
     cpuTileSig = sig;
     grid.innerHTML = d.cores.map(c => {
       const canToggle = c.cpu !== 0;   // cpu0 无 online 文件，恒在线
-      // 右下角身份标签：Physical = 物理核主线程，HT = 超线程兄弟线程
-      const isSib = c.siblings && c.siblings.length && c.cpu > Math.min.apply(null, c.siblings);
-      const tag = isSib ? ['HT', '#8b5cf6'] : ['Physical', 'var(--ac)'];
       const cls = 'tile' + (canToggle ? ' tog' : '');
-      const attrs = 'data-ctile="' + c.cpu + '"' + (canToggle ? '' : ' style="opacity:' + (c.online ? '1' : '.5') + '"');
-      return '<div class="' + cls + '" ' + attrs + ' title="' + (canToggle ? '点击' + (c.online ? '下线' : '上线') + ' cpu' + c.cpu : 'cpu0 恒在线，不可下线') + '"' +
+      return '<div class="' + cls + '" data-ctile="' + c.cpu + '" title="' + (canToggle ? '点击' + (c.online ? '下线' : '上线') + ' cpu' + c.cpu : 'cpu0 恒在线，不可下线') + '"' +
         (canToggle ? ' onclick="cpuCoreCmd(' + c.cpu + ',' + (c.online ? "'core_off'" : "'core_on'") + ')"' : '') + '>'
         + '<div style="display:flex;align-items:center;gap:5px;font-size:12px;font-weight:600">'
         + '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:' + (c.online ? 'var(--ok)' : 'var(--tx3)') + '"></span>'
         + '<span>cpu' + c.cpu + '</span>'
-        + '<span style="font-size:10px;padding:1px 5px;border-radius:4px;background:' + (c.type === 'E' ? 'var(--warn)' : 'var(--ac2)') + ';color:' + (c.type === 'E' ? '#fff' : 'var(--ac)') + '">' + c.type + '</span>'
+        + (c.core_id != null ? '<span style="font-size:9.5px;color:var(--tx3)">core' + c.core_id + '</span>' : '')
         + '<span style="flex:1"></span>'
+        + (c.online ? '<span id="cpuTempV-' + c.cpu + '" style="font-size:11px;font-weight:700;color:' + tempColor(c.tempC) + '">' + (c.tempC != null ? c.tempC + '°C' : '–') + '</span>' : '<span style="font-size:10.5px;color:var(--tx3)">已下线</span>')
         + '</div>'
-        + '<div id="cpuFreqV-' + c.cpu + '" style="font-size:15px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--tx)">–</div>'
-        + '<div id="cpuRangeV-' + c.cpu + '" style="font-size:10.5px;color:var(--tx3);font-variant-numeric:tabular-nums">–</div>'
-        + '<span style="position:absolute;right:7px;bottom:5px;font-size:9.5px;line-height:1;padding:2px 5px;border-radius:4px;color:#fff;background:' + tag[1] + ';opacity:0.85">' + tag[0] + '</span>'
+        + '<div id="cpuFreqV-' + c.cpu + '" style="font-size:15px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--tx)">' + (c.online ? '–' : '–') + '</div>'
+        + '<div id="cpuRangeV-' + c.cpu + '" style="font-size:10.5px;color:var(--tx3);font-variant-numeric:tabular-nums">' + (c.online ? '' : '点击上线') + '</div>'
         + '</div>';
     }).join('');
   }
@@ -249,7 +222,7 @@ function renderCpuCtl(d) {
   d.cores.forEach(c => {
     const f = document.getElementById('cpuFreqV-' + c.cpu);
     if (f) {
-      if (!c.online) { f.textContent = '（下线）'; f.title = ''; f.style.color = 'var(--tx3)'; }
+      if (!c.online) { f.textContent = '–'; f.title = ''; f.style.color = 'var(--tx3)'; }
       else if (c.min && c.cur < c.min - 200000) {
         f.textContent = cpuGHz(c.cur) + ' GHz';
         f.style.color = 'var(--tx3)';
@@ -257,8 +230,10 @@ function renderCpuCtl(d) {
         idleShown = true;
       } else { f.textContent = cpuGHz(c.cur) + ' GHz'; f.style.color = 'var(--tx)'; f.title = ''; }
     }
+    const tp = document.getElementById('cpuTempV-' + c.cpu);
+    if (tp && c.online) { tp.textContent = c.tempC != null ? c.tempC + '°C' : '–'; tp.style.color = tempColor(c.tempC); }
     const r = document.getElementById('cpuRangeV-' + c.cpu);
-    if (r) r.textContent = c.online ? (cpuGHz(c.min) + ' ~ ' + cpuGHz(c.max) + ' GHz') : (c.type === 'E' ? 'E 核 · 已下线' : '已下线');
+    if (r && c.online) r.textContent = cpuGHz(c.min) + ' ~ ' + cpuGHz(c.max) + ' GHz';
   });
   const ih = document.getElementById('cpuIdleHint');
   if (ih) ih.style.display = idleShown ? '' : 'none';
@@ -267,7 +242,7 @@ function renderCpuCtl(d) {
 async function cpuCmd(action, extra, label) {
   if (cpuCmdBusy) return;
   cpuCmdBusy = true;
-  document.querySelectorAll('#cpuCtlCard .btn, .btn').forEach(b => { b.dataset.cpuCtlWasDisabled = b.disabled ? '1' : ''; b.disabled = true; });
+  document.querySelectorAll('.btn').forEach(b => { b.dataset.cpuCtlWasDisabled = b.disabled ? '1' : ''; b.disabled = true; });
   const log = document.getElementById('cpuLog');
   const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
   if (log) log.textContent = '[' + t + '] ' + label + '\n执行中…（不要离开本页）';
@@ -287,27 +262,22 @@ async function cpuCmd(action, extra, label) {
   loadCpuCtl();
 }
 
-function cpuSpecPick(sel, which) {
-  const num = document.getElementById('cpuSpecNum');
-  if (num) num.style.display = sel.value === '' ? '' : 'none';
-}
-function cpuSpecValue(which) {
-  const sel = document.getElementById(which === 'max' ? 'cpuSpecMax' : 'cpuSpecMin');
+function cpuFreqSpecValue() {
+  const sel = document.getElementById('cpuFreqSpec');
   let spec = sel ? sel.value : 'all';
   if (spec === '') {
     spec = (document.getElementById('cpuSpecNum').value || '').trim();
-    if (!spec) { alert('请先填「按编号」，如 0-7,12'); return null; }
+    if (!spec) { alert('请先填「按编号」，如 0-7,20'); return null; }
   }
   return spec;
 }
 
 function cpuFreqCmd(kind) {
-  const which = kind === 'freq_max' ? 'max' : 'min';
-  const spec = cpuSpecValue(which);
+  const spec = cpuFreqSpecValue();
   if (!spec) return;
   const inp = document.getElementById(kind === 'freq_max' ? 'cpuFreqMax' : 'cpuFreqMin');
   const v = (inp.value || '').trim();
-  if (!v) { alert('请输入频率，如 4.5G / 3800M / 5300000(kHz)'); return; }
+  if (!v) { alert('请输入频率，如 3.0G / 2500M / 1200000(kHz)'); return; }
   const act = kind === 'freq_max' ? '限制最高' : '锁定最低';
   cpuCmd(kind, { freq: v, spec: spec }, act + '频率 ' + v + ' @ ' + spec);
 }
@@ -319,12 +289,13 @@ function cpuFreqReset() {
 
 function cpuGovApply() {
   const g = document.getElementById('cpuGov').value;
-  const e = document.getElementById('cpuEpp').value;
-  const spec = document.getElementById('cpuGovSpec').value;
-  if (!g && !e) { alert('先在下拉里选一个调速器或 EPP 值'); return; }
-  const go = () => { if (e) cpuCmd('epp', { val: e, spec: spec }, 'EPP -> ' + e + ' @ ' + spec); };
-  if (g) cpuCmd('gov', { val: g, spec: spec }, '调速器 -> ' + g + ' @ ' + spec).then(go);
-  else go();
+  let spec = document.getElementById('cpuGovSpec').value;
+  if (spec === '') {
+    spec = (document.getElementById('cpuGovSpecNum').value || '').trim();
+    if (!spec) { alert('请先填「按编号」，如 0-7,20'); return; }
+  }
+  if (!g) { alert('先在「调速器」下拉里选一个值'); return; }
+  cpuCmd('gov', { val: g, spec: spec }, '调速器 -> ' + g + ' @ ' + spec);
 }
 
 function cpuCoreCmd(cpu, action) {
@@ -339,25 +310,19 @@ function cpuAllOn() {
   cpuCmd('all_on', {}, '一键全部上线');
 }
 
-function cpuEcoreCmd(action) {
-  const off = action === 'ecore_off';
-  if (!confirm((off ? '下线' : '上线') + '全部 E 小核？')) return;
-  cpuCmd(action, {}, (off ? '下线' : '上线') + '小核');
-}
-
-function cpuHtToggle() {
-  const st = (document.getElementById('cpuHtState').textContent || '').trim();
+function cpuTurboToggle() {
+  const st = (document.getElementById('cpuTurboState').textContent || '').trim();
   const turningOn = st.indexOf('关闭') >= 0;
-  if (!confirm((turningOn ? '开启' : '关闭') + '超线程？（smt/control 运行时直切，立即生效，无需重启）')) return;
-  cpuCmd(turningOn ? 'ht_on' : 'ht_off', {}, (turningOn ? '开启' : '关闭') + '超线程');
+  if (!confirm((turningOn ? '开启' : '关闭') + '睿频？（intel_pstate/no_turbo 运行时直切，立即生效）')) return;
+  cpuCmd(turningOn ? 'turbo_on' : 'turbo_off', {}, (turningOn ? '开启' : '关闭') + '睿频');
 }
 
 function cpuBench() {
   if (cpuCmdBusy) return;
   const secs = parseInt(document.getElementById('cpuBenchSecs').value, 10) || 2;
   const chip = document.getElementById('cpuChip');
-  const m = chip && chip.textContent.match(/在线 (\d+) 核/);
-  const onlineN = m ? parseInt(m[1], 10) : 6;
+  const m = chip && chip.textContent.match(/在线 (\d+) /);
+  const onlineN = m ? parseInt(m[1], 10) : 22;
   if (!confirm('性能测试：' + onlineN + ' 个在线核逐个单线程满载 ' + secs + 's × 3 轮，再加一轮多核并行，约 ' + (onlineN * secs * 3 + secs) + ' 秒。\n期间温度会升高，继续？')) return;
   cpuCmd('bench', { secs: secs }, '性能测试 ' + secs + 's/核');
 }

@@ -30,7 +30,7 @@
 | **最近完成请求** | 逐请求真实 tok/s 表格。数据源双轨：vLLM 侧由 `dsh-logger-pkg` 插件写 `request-traces.jsonl`；SGLang 侧直接解析其日志与 metrics |
 | **硬件监视** | GPU 实时（利用率/显存/功耗/温度，异步采样+熔断保护）、PCIe 拓扑、CPU 详情、内存带宽（perf 可选）、磁盘 SMART/IO 走势 |
 | **基准测试** | 移植自 [bench-console v2.2.1](https://github.com/polyuij42-del/bench-console)（MIT）：单流解码（13/6 类提示词）· 并发档位扫描 · 预填充 TTFT，三种模式各自独立，测试期间 1s 实时折线，结果落盘 `bench-results/` 可 A/B 对比。UI 为独立页 `/bench.html`，主界面 iframe 懒加载 |
-| **CPU 控制** | 移植自 [bench-console/cpu-control](https://github.com/polyuij42-del/bench-console/tree/main/cpu-control)（MIT，已通用化适配同构 Xeon）：逐核上/下线（点瓦片）、任意上/下限锁频（首次改动自动记忆原始值，可一键恢复）、调速器、超线程运行时直切（`smt/control`）、一键恢复全部被下线核、逐核体质+多核并行性能测试。全部为运行时写 sysfs 的软控制，**重启回 BIOS/内核默认**。后端 `cpu-ctl` 脚本走 sudoers 固定路径白名单提权（`ops/install-cpu-ctl-127.sh`），API 挂 `/v1/internal/cpuctl*`（POST 受控制台口令拦截），UI 为独立页 `/cpu.html`，主界面 iframe 懒加载 |
+| **CPU 控制** | **X99-T8 / E5-2696 v4 平台定制版**（移植自 [bench-console/cpu-control](https://github.com/polyuij42-del/bench-console/tree/main/cpu-control)，MIT；本机 22 同构核无大小核、BIOS 关超线程、无 HWP，故删除 P/E 簇、超线程、EPP 等混合架构控件）：逐核上/下线（点瓦片）、一键恢复全部被下线核、睿频开关（`intel_pstate/no_turbo`）、任意上/下限锁频（首次改动自动记忆原始值，可一键恢复）、调速器、逐核温度（coretemp，core_id 映射）、逐核体质+多核并行性能测试。全部为运行时写 sysfs 的软控制，**重启回 BIOS/内核默认**。后端 `cpu-ctl` 脚本走 sudoers 固定路径白名单提权（`ops/install-cpu-ctl-127.sh`），API 挂 `/v1/internal/cpuctl*`（POST 受控制台口令拦截），UI 为独立页 `/cpu.html`，主界面 iframe 懒加载 |
 | **计费/能耗** | 按 token 计费台账（`billing-config.json`）、RAPL 功耗采样与电费估算（`energy-config.json`） |
 | **日志查看** | 网页内 tail vLLM/SGLang 启动日志，支持关键字过滤 |
 | **移动视图** | `/mobile.html` 精简只读面板 |

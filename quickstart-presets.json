@@ -5,8 +5,8 @@
     "scriptModel": "qwen3.8-flash-next-w4a16",
     "presets": [
       {
-        "key": "current-262k-mtp4-kv96-pleheap",
-        "name": "当前固化-256K-MTP4-KV96G-PLE-BF16-Heap",
+        "key": "current-1m-mtp4-kv96-plebf16-heap",
+        "name": "当前固化-1M-MTP4-KV96G-PLE-BF16-Heap",
         "engine": "script",
         "standard": true,
         "port": 18420,
@@ -16,7 +16,7 @@
           "modelName": "qwen3.8-flash-next-w4a16",
           "port": "18420",
           "servedName": "qwen3.8-flash-next",
-          "maxModelLen": "262144",
+          "maxModelLen": "1048576",
           "gpuMemUtil": "0.95",
           "maxNumSeqs": "4",
           "blockSize": "1616",
@@ -38,8 +38,10 @@
           "kvoff": "1",
           "kvoffGiB": "96",
           "pleInt8": "0",
-          "pleLoc": "heap"
-        }
+          "pleLoc": "heap",
+          "longCtx": "1m"
+        },
+        "note": "固化自 2026-09-26 18:42 实际运行实例（ENVFILE+cmdline 双源核对）：1M(YaRN×4)、block1616、MTP×4、KV96G、PLE BF16-heap、冷启动约8分钟"
       },
       {
         "key": "bak-1m-mtp5-kv96",
@@ -73,10 +75,10 @@
           "mtp": "1",
           "mtpTokens": "5",
           "enforceEager": "0",
-          "kvoff": "1",
+          "kvoff": "0",
           "kvoffGiB": "96",
-          "pleInt8": "0",
-          "pleLoc": "heap"
+          "pleInt8": "1",
+          "pleLoc": "disk"
         }
       },
       {
@@ -111,7 +113,8 @@
           "mtpTokens": "4",
           "enforceEager": "0",
           "longCtx": "512k",
-          "vllmExtraEnv": "NCCL_P2P_LEVEL=PHB"
+          "vllmExtraEnv": "NCCL_P2P_LEVEL=PHB",
+          "kvoff": "0"
         }
       }
     ]

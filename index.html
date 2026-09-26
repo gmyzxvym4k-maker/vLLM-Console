@@ -3612,7 +3612,9 @@ function loadVllmLogs() {
         .then(d => {
             const pathEl = document.getElementById('vllmLogPath');
             if (pathEl && d.file) pathEl.textContent = d.file;
-            if (!d.logs) { content.innerHTML = '<div style="text-align:center;padding:20px;color:#76828f">无日志（vLLM 未运行时可能无日志文件）</div>'; return; }
+            if (!d.logs) { content.innerHTML = d.cleared
+                ? '<div style="text-align:center;padding:20px;color:#76828f">已清空，等待新日志…（引擎一有输出就会显示在这里）</div>'
+                : '<div style="text-align:center;padding:20px;color:#76828f">无日志（vLLM 未运行时可能无日志文件）</div>'; return; }
             // Escape HTML and apply color coding
             let lines = d.logs.split('\n');
             let html = '';

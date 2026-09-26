@@ -517,9 +517,15 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   script: '/home/ll/deploy/start-flash-next-w4a16.sh',
   inner: '/home/ll/deploy/flash-next-w4a16-inner.sh',
   stopScript: '/home/ll/deploy/stop-flash-next-w4a16.sh',
+  // 新栈（官方 0.30.0）在位时优先用新栈脚本对（resolve* 按 DISABLED 哨兵动态选，同看门狗）
+  scriptNew: '/home/ll/deploy/vllm-0300/start-flash-next-0300.sh',
+  stopScriptNew: '/home/ll/deploy/vllm-0300/stop-flash-next-0300.sh',
   port: 18420,
   served: 'qwen3.8-flash-next',
   log: '/home/ll/deploy/vllm-flash-next-w4a16.log',
+  // 官方 0.30.0 新栈的日志（start-flash-next-0300.sh 里 FN_LOG 缺省值）。祖先链 cmdline
+  // 通常已能定位到它（见 ancestorLogFiles），这里兜底：cmdline 拿不到时仍能选中新日志。
+  altLogs: ['/home/ll/deploy/vllm-flash-next-0300.log'],
   note: '\u5bb9\u5668\u955c\u50cf PP2 \u811a\u672c\u542f\u52a8\uff08W4A16-AutoRound\uff0c\u5b98\u65b9\u624b\u518c \u00a74\uff09\uff0c\u52a0\u8f7d\u7ea6 3~9 \u5206\u949f',
   base: {
     maxModelLen: 262144, gpuMemUtil: 0.95, maxNumSeqs: 4, maxBatchedTokens: 8192,
@@ -575,7 +581,10 @@ function scriptModelInstance(sm) {
   const paths = [sm.modelPath].concat(sm.altModelPaths || []).filter(Boolean);
   try {
     const { execSync } = require('child_process');
-    const out = execSync('pgrep -f "[v]llm.entrypoints" 2>/dev/null || true', { encoding: 'utf8', timeout: 3000 }).trim();
+    // 09-26：两种栈形态都要认——旧 chroot 栈 cmdline 是 `python -m vllm.entrypoints.cli.main serve`，
+    // 新官方 0.30.0 栈是 `/…/bin/vllm serve …`（comm=vllm）。旧模式只认前者，导致新栈在跑
+    // 而本函数恒返回 null（停止/状态判活全瞎）。括号技巧防匹配到发起 pgrep 的父 shell 自身。
+    const out = execSync('pgrep -f "[v]llm.entrypoints|[v]llm serve" 2>/dev/null || true', { encoding: 'utf8', timeout: 3000 }).trim();
     for (const pid of out.split('\n').filter(Boolean)) {
       try {
         const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ');
@@ -592,16 +601,45 @@ function scriptModelAlive(sm) { return !!scriptModelInstance(sm); }
 function scriptModelForPort(port) {
   const p = parseInt(port);
   if (!p) return null;
-  for (const k of Object.keys(SCRIPT_MODELS)) {
-    const v = SCRIPT_MODELS[k];
-    if (v.port === p) return Object.assign({ key: k }, v);
-  }
+  // ① 先认「真有活进程」的条目（scriptModelInstance 已兼容新旧栈形态）
   for (const k of Object.keys(SCRIPT_MODELS)) {
     const v = SCRIPT_MODELS[k];
     const inst = scriptModelInstance(v);
     if (inst && inst.port === p) return Object.assign({ key: k }, v);
   }
+  // ② 再按端口声明兜底，但跳过启停脚本都已不存在的退役条目
+  //（18420 先后注册过 NVFP4+W4A16 两条目，盲取第一个会拿到退役栈不存在的
+  //  stop-flash-next-18420.sh——09-26「停止按钮点了没任何动静」的直接根因）
+  const hasScripts = (v) => { try { return fs.existsSync(v.stopScript || '') || fs.existsSync(v.script || ''); } catch (e) { return false; } };
+  for (const k of Object.keys(SCRIPT_MODELS)) {
+    const v = SCRIPT_MODELS[k];
+    if (v.port === p && hasScripts(v)) return Object.assign({ key: k }, v);
+  }
   return null;
+}
+// 栈感知停止脚本解析（09-26）：18420 现由看门狗托管在【官方 vLLM 0.30.0 新栈】，
+// 其主进程 comm=vllm、cmdline 是 "vllm serve"——旧栈停止脚本的 find_pids（只认 VLLM:: 子进程
+// 与 entrypoints.cli.main）抓不到主进程，点了等于没杀；且看门狗 60s 内会按 launch.env 拉起，
+// 表现为「停止不成功」。规则与 fnx-18420-watchdog.sh 选栈同源：DISABLED 哨兵缺席=新栈。
+// 新栈 stop 脚本同时兼容旧栈主进程判据，并在入口 touch 人工停止闩锁 fnx-manual-stop。
+const STACK0300_DISABLED = '/home/ll/deploy/vllm-0300/DISABLED';
+function stack0300Active() {
+  try { return !fs.existsSync(STACK0300_DISABLED); } catch (e) { return false; }
+}
+function resolveStopScript(sm) {
+  try {
+    if (sm && sm.stopScriptNew && stack0300Active() && fs.existsSync(sm.stopScriptNew)) return sm.stopScriptNew;
+  } catch (e) {}
+  return sm && sm.stopScript;
+}
+// 启动脚本同样栈感知：新栈在位时用 start-flash-next-0300.sh（其 FN_* 透传/落盘机制与旧栈
+// wrapper 同构）。注意解析到新栈时不能再传 INNER=<旧栈 inner>——新栈 wrapper 的 INNER 缺省
+// 指向自家 inner，被旧值覆盖会跑出「新栈环境 + 旧栈 inner」的杂交命令（09-26 评审发现）。
+function resolveStartScript(sm) {
+  try {
+    if (sm && sm.scriptNew && stack0300Active() && fs.existsSync(sm.scriptNew)) return sm.scriptNew;
+  } catch (e) {}
+  return sm && sm.script;
 }
 // 弹窗默认值（= 生产基准）：前端 startConfigDefaults 用它覆盖 localStorage 记忆，
 // 避免别的模型（如 27B 的 --mamba-ssm-cache-dtype）参数串到该栈上。
@@ -3348,12 +3386,58 @@ function scriptModelsForPort(port, cmdlineArr) {
   }
   return out;
 }
+// 09-26 修复「vLLM 运行日志看不到当前输出」的根因：日志文件名跟着栈走，注册表跟不上。
+// 官方 0.30.0 新栈的日志由 start-flash-next-0300.sh 里的 FN_LOG 决定
+// （vllm-flash-next-0300.log），而 SCRIPT_MODELS.w4a16.log 记的还是旧栈的
+// vllm-flash-next-w4a16.log；只按「端口推导语径 + sm.log + altLogs」打分挑选，
+// 栈一切换就永久锁死在陈旧文件上——面板表现为「一堆老日志 + 全是 /metrics +
+// 提示已 N 分钟没有新内容」，看起来就是"没有日志"。
+// 权威来源＝进程祖先链 argv 里的 .log 路径：启动 wrapper 形态是
+//   sudo -S sh -c 'exec setsid bash "$1" >> "$2" 2>&1 </dev/null' _ <inner> <logfile>
+// 真实日志路径就写在它自己的 cmdline 里。root 进程的 /proc/<pid>/fd 普通用户读不到
+// （chroot 栈的引擎正是 root），但 /proc/<pid>/cmdline 全局可读，比读 fd 更通用。
+function ancestorLogFiles(pid, maxHops) {
+  const HOP = maxHops || 4;
+  const found = [];
+  let cur = pid | 0;
+  for (let hop = 0; hop <= HOP && cur > 1; hop++) {
+    let toks = [];
+    try { toks = fs.readFileSync('/proc/' + cur + '/cmdline', 'utf8').split('\0').map(s => s.trim()).filter(Boolean); } catch (e) {}
+    for (let i = toks.length - 1; i >= 0; i--) {
+      const t = toks[i];
+      if (!/^\/\S+\.log$/.test(t) || found.some(f => f.file === t)) continue;
+      try {
+        if (fs.statSync(t).isFile()) { fs.accessSync(t, fs.constants.R_OK); found.push({ file: t, hop: hop }); }
+      } catch (e) { /* 不存在或不可读：不是候选 */ }
+    }
+    let ppid = 0;
+    try {
+      const st = fs.readFileSync('/proc/' + cur + '/stat', 'utf8');
+      ppid = parseInt(st.slice(st.lastIndexOf(')') + 1).trim().split(/\s+/)[1], 10) || 0;
+    } catch (e) { break; }
+    if (!ppid || ppid === cur) break;
+    cur = ppid;
+  }
+  return found;
+}
 function pickScriptModelLogFile(inst, sm) {
   if (!inst) return null;
   const memo = (global.__scriptLogPick = global.__scriptLogPick || new Map());
   const memoKey = (inst.pid || 0) + ':' + (inst.port || 0);
   const hit = memo.get(memoKey);
   if (hit && Date.now() - hit.at < 5000) return hit.file;
+  // ①′ 权威：祖先链 argv 里的日志（自动跟随栈切换 / FN_LOG 改名）；同层取最近写入的
+  try {
+    const anc = ancestorLogFiles(inst.pid);
+    if (anc.length) {
+      const mt = (f) => { try { return fs.statSync(f).mtimeMs; } catch (e) { return 0; } };
+      anc.sort((a, b) => a.hop - b.hop || mt(b.file) - mt(a.file));
+      if (mt(anc[0].file) > 0) {
+        memo.set(memoKey, { file: anc[0].file, at: Date.now() });
+        return anc[0].file;
+      }
+    }
+  } catch (e) { /* 退回候选打分 */ }
   const cands = [];
   if (inst.port) cands.push(path.join(__dirname, 'vllm-flash-next-' + inst.port + '.log'));
   if (sm && sm.log) cands.push(sm.log);
@@ -8286,8 +8370,10 @@ const server = http.createServer(async (req, res) => {
               }
               const plan = scriptModelLaunchPlan(smStart, data);
               try {
-                const envPrefix = smStart.inner ? `INNER=${smStart.inner} ` : '';
-                const child = require('child_process').spawn('bash', ['-c', `${envPrefix}setsid bash ${smStart.script} >> ${smStart.log} 2>&1 < /dev/null & echo $!`], {
+                const startScript = resolveStartScript(smStart);
+                // INNER 只对旧栈 wrapper 有意义；解析到新栈时绝不带旧 inner 覆盖（见 resolveStartScript 注）
+                const envPrefix = (startScript === smStart.script && smStart.inner) ? `INNER=${smStart.inner} ` : '';
+                const child = require('child_process').spawn('bash', ['-c', `${envPrefix}setsid bash ${startScript} >> ${smStart.log} 2>&1 < /dev/null & echo $!`], {
                   detached: true,
                   stdio: ['ignore', 'pipe', 'ignore'],
                   env: Object.assign({}, process.env, plan.env),
@@ -8461,17 +8547,27 @@ const server = http.createServer(async (req, res) => {
             // 走宿主侧停止脚本（内部按 --port 匹配后 sudo kill，不误杀其他实例）。
             const smStop = stopPort ? scriptModelForPort(stopPort) : null;
             if (smStop) {
+              const stopPath = resolveStopScript(smStop);
+              if (!stopPath || !fs.existsSync(stopPath)) {
+                // 09-26：脚本不存在时过去会静默"success"（bash 报错也被吞），按钮点了没任何动静
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '停止脚本不存在：' + (stopPath || '(未注册)') }));
+                return;
+              }
               let out = '';
               try {
                 // 09-20：execSync(90s) 阻塞事件循环 → 异步 execFile
-                out = await execFileAsync('bash', [smStop.stopScript, String(smStop.port)], { encoding: 'utf8', timeout: 90000, maxBuffer: 4 * 1024 * 1024 });
+                // 09-26：超时 90s→240s——新栈停止脚本自身要等 90s 优雅退出 + 最多 120s 显存归零轮询
+                out = await execFileAsync('bash', [stopPath, String(smStop.port)], { encoding: 'utf8', timeout: 240000, maxBuffer: 4 * 1024 * 1024 });
               } catch (e) { out = String((e && e.stdout || '') + (e && e.stderr || '') || (e && e.message) || e); }
               Object.keys(VLLM_MODEL_PORTS).forEach(k => { if (VLLM_MODEL_PORTS[k] === smStop.port) delete VLLM_MODEL_PORTS[k]; });
               global.__GPU_INSTANCES.delete(smStop.port);
               const stillAlive = scriptModelInstance(smStop);
-              console.log(`[script-model] stop ${smStop.key} port ${smStop.port}${stillAlive ? ' (WARN: 仍有残留 pid=' + stillAlive.pid + ')' : ' (已彻底停止)'}`);
+              console.log(`[script-model] stop ${smStop.key} port ${smStop.port}${stillAlive ? ' (WARN: 仍有残留 pid=' + stillAlive.pid + ')' : ' (已彻底停止)'} via ${stopPath}`);
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: true, script: true, port: smStop.port, output: String(out).trim().slice(-400) }));
+              res.end(JSON.stringify({ success: !stillAlive, script: true, port: smStop.port, stoppedModel: smStop.key,
+                error: stillAlive ? '已执行停止脚本但仍有残留进程（pid=' + stillAlive.pid + '），详见输出' : undefined,
+                output: String(out).trim().slice(-400) }));
               return;
             }
             // PD 配对：停止其中一个端口时，连带停止配对实例并清理 PD 两步转发路由
@@ -8793,6 +8889,10 @@ const server = http.createServer(async (req, res) => {
       // the main thread forever). For very large logs read only the last 5MB.
       let content;
       let windowed = false;
+      let byteBase = 0;   // content[0] 在整份文件里的绝对字节位置（窗口化读取时非 0）
+      let winBuf = null;  // 原始字节窗口：把「清空标记」的绝对字节偏移精确换算成字符下标用
+      let winSkip = 0;    // 窗口首部丢掉的半行字节数（byteBase 已含它）
+      let fileSize = 0;   // 本次读取时整份文件的字节大小（判断标记点是否已在 EOF 之后）
       {
         const fst = fs.statSync(logFile);
         if (!fst.isFile()) {
@@ -8804,14 +8904,19 @@ const server = http.createServer(async (req, res) => {
         const fd = fs.openSync(logFile, 'r');
         try {
           const sz = fs.fstatSync(fd).size;
+          fileSize = sz;
           if (sz <= MAX_READ) {
-            content = fs.readFileSync(fd, 'utf8');
+            winBuf = fs.readFileSync(fd);
+            content = winBuf.toString('utf8');
           } else {
             windowed = true;
             const buf = Buffer.alloc(MAX_READ);
             const n = fs.readSync(fd, buf, 0, MAX_READ, sz - MAX_READ);
             const nl = buf.indexOf(0x0a, 0, n);
-            content = buf.toString('utf8', nl >= 0 ? nl + 1 : 0, n);
+            winSkip = nl >= 0 ? nl + 1 : 0;
+            byteBase = (sz - MAX_READ) + winSkip;
+            winBuf = buf;
+            content = buf.toString('utf8', winSkip, n);
           }
         } finally { fs.closeSync(fd); }
       }
@@ -8842,14 +8947,26 @@ const server = http.createServer(async (req, res) => {
         t.offset = content.length;
       }
       let marker = 0;
+      let cleared = false;
       try {
         const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
         if (st && st.filePath === logFile) {
-          marker = Math.max(0, Math.min(st.byteOffset || 0, content.length));
-          // The log file may have been rotated/replaced (e.g. vLLM restarted
-          // with a fresh log): a clear offset larger than the current file
-          // means the marker points past EOF — show everything instead.
-          if (marker >= content.length && content.length > 0) marker = 0;
+          // 09-26：state 里存的是「整份文件」的绝对字节偏移（清空时记下的 size）。旧代码把它
+          // 直接当窗口/字符串下标用，两处错：① 大文件尾部窗口读取时原点不同；② UTF-8 多字节
+          // 行导致「字节数 ≠ 字符数」——中文日志里偏移一路前移，标记点跑到 EOF 之后被整份显示，
+          // 表现为「清空日志按了没反应」（实测 1.7MB 中文日志即中招）。
+          // 现在用原始窗口字节精确换算成字符下标，再吸附到行首，避免切在半行上。
+          const abs = Math.max(0, st.byteOffset || 0);
+          if (abs > fileSize) {
+            marker = 0;   // 日志被轮转/换文件：标记点已在 EOF 之后 → 全部显示
+          } else if (abs > byteBase && winBuf) {
+            const endByte = Math.min(winBuf.length, winSkip + (abs - byteBase));
+            let m = winBuf.toString('utf8', winSkip, endByte).length;
+            const nlM = content.indexOf('\n', m);
+            m = nlM === -1 ? content.length : nlM + 1;
+            marker = Math.min(m, content.length);
+            cleared = true;
+          }
         }
       } catch (e) {}
       const nowTs = Date.now();
@@ -8876,7 +8993,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         logs: tail, totalLines: out.length, file: logFile,
-        mtime_ms: fsMod, stale_min: staleMin,
+        mtime_ms: fsMod, stale_min: staleMin, cleared: cleared,
       }));
     } catch (e) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -9038,10 +9155,13 @@ const server = http.createServer(async (req, res) => {
   async function qsStopScript(smKey, port) {
     const sm = (smKey && SCRIPT_MODELS[smKey]) ? Object.assign({ key: smKey }, SCRIPT_MODELS[smKey]) : scriptModelForPort(port);
     if (!sm || !sm.stopScript) return '未注册停止脚本';
+    const stopPath = resolveStopScript(sm);
+    if (!stopPath || !fs.existsSync(stopPath)) return '停止脚本不存在：' + (stopPath || '(未注册)');
     let out = '';
     try {
       // 09-20：execSync(180s) 会冻结事件循环（停止期间整个控制台无响应），改异步 execFile
-      out = await execFileAsync('bash', [sm.stopScript, String(port)], { encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024 });
+      // 09-26：栈感知（resolveStopScript）+ 超时 240s，覆盖新栈脚本 90s 优雅退出 + 120s 显存轮询
+      out = await execFileAsync('bash', [stopPath, String(port)], { encoding: 'utf8', timeout: 240000, maxBuffer: 4 * 1024 * 1024 });
     } catch (e) { out = String((e && e.stdout || '') + (e && e.stderr || '') || (e && e.message) || e); }
     Object.keys(VLLM_MODEL_PORTS).forEach(k => { if (VLLM_MODEL_PORTS[k] === port) delete VLLM_MODEL_PORTS[k]; });
     try { global.__GPU_INSTANCES.delete(port); } catch (e) {}
@@ -9086,12 +9206,16 @@ const server = http.createServer(async (req, res) => {
         const inst0 = scriptModelInstance(sm);
         if (inst0) { done({ success: false, alreadyRunning: true, error: `已在运行（端口 ${inst0.port}，PID ${inst0.pid}）` }); return; }
         const plan = scriptModelLaunchPlan(sm, preset.params || {});
-        const envPrefix = sm.inner ? `INNER=${sm.inner} ` : '';
+        const startScript = resolveStartScript(sm);
+        // INNER 只对旧栈 wrapper 有意义；新栈 wrapper 的 INNER 缺省即自家 inner
+        const envPrefix = (startScript === sm.script && sm.inner) ? `INNER=${sm.inner} ` : '';
         // 上次启动落盘的 FN_* 若不清掉，本次「没写到的变量」会继承旧值（sudo 会清环境，
         // chroot 内的 inner 只能靠这个文件）。09-15 实跑就被残留的 FN_SPEC=none 影响过。
-        const envFile = preset.envFile || ((sm.script || '').match(/w4a16/) ? '/home/ll/deploy/flash-next-launch-w4a16.env' : '');
+        // 09-26：清哪个 env 文件跟解析后的栈走——新栈的 launch.env 在 vllm-0300/ 下。
+        const envFile = preset.envFile || (startScript.match(/0300/) ? '/home/ll/deploy/vllm-0300/launch.env'
+                        : ((sm.script || '').match(/w4a16/) ? '/home/ll/deploy/flash-next-launch-w4a16.env' : ''));
         if (envFile) { try { fs.writeFileSync(envFile, ''); } catch (e) {} }
-        const child = require('child_process').spawn('bash', ['-c', `${envPrefix}setsid bash ${sm.script} >> ${sm.log} 2>&1 < /dev/null & echo $!`], {
+        const child = require('child_process').spawn('bash', ['-c', `${envPrefix}setsid bash ${startScript} >> ${sm.log} 2>&1 < /dev/null & echo $!`], {
           detached: true,
           stdio: ['ignore', 'pipe', 'ignore'],
           env: Object.assign({}, process.env, plan.env),

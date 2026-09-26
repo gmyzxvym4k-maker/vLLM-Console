@@ -98,6 +98,12 @@ h2{font-size:15px;margin-bottom:8px}
 .cmpDelta{font-family:var(--mono)}
 #liveCard{display:none}
 .cur-line{font-size:12.5px;color:var(--tx);margin-top:6px;font-family:var(--mono)}
+/* 09-29 配置快照 */
+.env-pre{white-space:pre-wrap;word-break:break-all;font-size:11px;line-height:1.5;background:var(--panel2);border:1px solid var(--bd);border-radius:8px;padding:8px;max-height:220px;overflow:auto;font-family:var(--mono)}
+details{margin:8px 0}
+details summary{cursor:pointer;color:var(--tx2);font-size:12px}
+.envdiff td{background:rgba(239,68,68,.07)}
+#envNote{margin-left:8px;color:var(--tx2)}
 </style></head><body>
 <header><h1><span class="logo">⚡</span> Bench Console</h1><span class="small">LLM 推理基准测试台 v2.2.1（内嵌移植） · 实时监控 / 分段总结 / 历史 A/B 对比</span></header>
 <div class="sub">三种测试模式各自独立 · 实时流速监控 + 分段总结 + 最终汇总 · 结果落盘 bench-results/</div>
@@ -153,7 +159,7 @@ h2{font-size:15px;margin-bottom:8px}
     <div id="evLog"></div>
   </div>
   <div class="card" id="runCard">
-    <div class="stage"><h3 style="margin:0">测试进度</h3><span class="pill" id="pill">空闲</span><span class="small" id="stageNote"></span></div>
+    <div class="stage"><h3 style="margin:0">测试进度</h3><span class="pill" id="pill">空闲</span><span class="small" id="stageNote"></span><span class="small" id="envNote"></span></div>
     <div class="pbar"><i id="pbar"></i></div>
     <div class="small" id="progTx"></div>
     <div id="lastSumm"></div>
@@ -192,6 +198,7 @@ h2{font-size:15px;margin-bottom:8px}
         <div id="cmpSecS" style="display:none"><div class="dCap" id="cmpCapS">逐类型 decode tok/s 对比</div><div class="chartbox"><canvas id="chCmpS"></canvas></div></div>
         <div id="cmpSecC" style="display:none"><div class="dCap">并发聚合 tok/s 对比</div><div class="chartbox"><canvas id="chCmpC"></canvas></div></div>
         <div id="cmpSecP" style="display:none"><div class="dCap">预填充 tok/s 对比</div><div class="chartbox"><canvas id="chCmpP"></canvas></div></div>
+        <div id="cmpSecE" style="display:none"><div class="dCap" id="cmpCapE">配置差异（vLLM/模型配置快照，红底=两侧不一致）</div><div style="overflow:auto;max-height:320px;margin-top:6px"><table id="tbCmpEnv"></table></div></div>
         <div style="overflow:auto;max-height:420px;margin-top:10px"><table id="tbCmp"></table></div>
       </div>
     </div>
@@ -347,6 +354,7 @@ function applyState(s){
   pill.className='pill '+(running?'run':(s.status==='done'?'done':(s.status==='error'||s.status==='aborted'?'err':'')));
   pill.textContent={init:'初始化',running:'运行中',done:'完成',error:'出错',aborted:'已停止'}[s.status]||'空闲';
   document.getElementById('stageNote').textContent=(s.mode?('['+({single:'单流',conc:'并发',prefill:'预填充'}[s.mode])+'] '):'')+(s.stageNote||'')+(s.iso?(' · '+s.iso):'');
+  var _en=document.getElementById('envNote');if(_en)_en.textContent=s.env?('　'+envBrief(s.env)):''; // 09-29 配置快照摘要
   var pct=0,tx='';
   if(s.progress&&s.progress.total){
     var p=s.progress;pct=Math.round(100*(p.cur-1+(p.rep/Math.max(p.reps,1)))/p.total);
@@ -556,7 +564,7 @@ function loadHist(){
     var html='<tr><th>时间</th><th>标签</th><th>模式</th><th>服务</th><th>类型</th><th>轮</th><th>decode均值</th><th>TTFT ms</th><th>接受率</th><th>并发峰值</th><th>pf峰值</th><th></th></tr>';
     list.forEach(function(x,i){
       var peakTx=x.concPeak?('<b>'+x.concPeak.agg+'</b> c='+x.concPeak.c):'—';
-      html+='<tr data-i="'+i+'"><td>'+fmtLocal(x.timestamp)+'</td><td>'+x.tag+'</td><td class="small">'+(MN[x.mode]||x.mode||'—')+'</td><td class="small">'+(x.service||'—')+'</td><td class="num">'+(x.types||'—')+'</td><td class="num">'+(x.reps||'—')+'</td><td class="num"><b>'+(x.singleMean||'—')+'</b></td><td class="num">'+(x.singleTtft||'—')+'</td><td class="num">'+(x.singleAccept!=null?x.singleAccept+'%':'—')+'</td><td class="num small">'+peakTx+'</td><td class="num small">'+(x.pfPeak||'—')+'</td><td><button class="dbtn" data-file="'+x.file+'">详情</button></td></tr>';
+      html+='<tr data-i="'+i+'"><td>'+fmtLocal(x.timestamp)+'</td><td>'+x.tag+(x.hasEnv?' <span title="该记录带配置快照" style="color:var(--ac)">⚙</span>':'')+'</td><td class="small">'+(MN[x.mode]||x.mode||'—')+'</td><td class="small">'+(x.service||'—')+'</td><td class="num">'+(x.types||'—')+'</td><td class="num">'+(x.reps||'—')+'</td><td class="num"><b>'+(x.singleMean||'—')+'</b></td><td class="num">'+(x.singleTtft||'—')+'</td><td class="num">'+(x.singleAccept!=null?x.singleAccept+'%':'—')+'</td><td class="num small">'+peakTx+'</td><td class="num small">'+(x.pfPeak||'—')+'</td><td><button class="dbtn" data-file="'+x.file+'">详情</button></td></tr>';
     });
     t.innerHTML=html;
     t.querySelectorAll('tr[data-i]').forEach(function(tr){
@@ -661,10 +669,112 @@ function doCompare(list){
     document.getElementById('cmpStats').innerHTML=tiles.length?tiles.join(''):'<div class="small" style="color:var(--tx2)">两次记录无共同可对比指标</div>';
     if(!html)html='<tr><td>两次记录没有可对比的共同部分（模式或参数不同）</td></tr>';
     document.getElementById('tbCmp').innerHTML=html;
+    // 09-29 配置差异：展平两份配置快照逐键比对，红底=不一致
+    var secE=document.getElementById('cmpSecE');
+    if(A.env||B.env){
+      secE.style.display='';
+      var fa=envFlat(A),fb=envFlat(B),keys={},ediff=[],esame=0;
+      Object.keys(fa).forEach(function(k){keys[k]=1});Object.keys(fb).forEach(function(k){keys[k]=1});
+      Object.keys(keys).sort().forEach(function(k){
+        var va=fa[k],vb=fb[k];
+        if(String(va)===String(vb)){esame++;return;}
+        ediff.push([k,va,vb]);
+      });
+      var eh='<tr><th>项</th><th>A</th><th>B</th></tr>';
+      ediff.forEach(function(r){
+        eh+='<tr class="envdiff"><td class="small">'+esc(r[0])+'</td><td class="small" style="text-align:left;font-family:var(--mono)">'+(r[1]==null||r[1]===''?'—':esc(String(r[1]).slice(0,400)))+'</td><td class="small" style="text-align:left;font-family:var(--mono)">'+(r[2]==null||r[2]===''?'—':esc(String(r[2]).slice(0,400)))+'</td></tr>';
+      });
+      if(!ediff.length)eh+='<tr><td colspan="3">✅ 配置一致（比对 '+esame+' 项）</td></tr>';
+      else eh+='<tr><td colspan="3" class="small">共差异 '+ediff.length+' 项 · 一致 '+esame+' 项'+((A.env&&B.env)?'':('（'+(A.env?'B':'A')+'无快照，按缺失计）'))+'</td></tr>';
+      document.getElementById('tbCmpEnv').innerHTML=eh;
+    }else secE.style.display='none';
     document.getElementById('cmpWrap').scrollIntoView({behavior:'smooth',block:'nearest'});
   });
 }
 // ---------- 历史详情 ----------
+// ---------- 配置快照（09-29）：每次测试开始时服务端抓取的 vLLM/模型配置展示 ----------
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function kvTbl(pairs){
+  if(!pairs.length)return '<span class="small">无数据</span>';
+  var s='<div style="overflow:auto;max-height:300px;border:1px solid var(--bd);border-radius:9px"><table><tr><th style="width:26%">项</th><th>值</th></tr>';
+  pairs.forEach(function(kv){s+='<tr><td class="small">'+esc(kv[0])+'</td><td class="small" style="text-align:left;font-family:var(--mono)">'+esc(kv[1])+'</td></tr>'});
+  return s+'</table></div>';
+}
+function envBrief(e){
+  if(!e)return '';
+  if(e.error)return '⚙️ 快照采集失败';
+  var p=e.engineParams||{},b=[];
+  if(e.vllmVersion)b.push('vLLM '+e.vllmVersion);
+  if(p.runtime)b.push(p.runtime);
+  if(p.tensor_parallel_size)b.push('TP'+p.tensor_parallel_size);
+  if(p.pipeline_parallel_size>1)b.push('PP'+p.pipeline_parallel_size);
+  if(p.max_model_len)b.push('ctx '+p.max_model_len);
+  if(p.block_size)b.push('block '+p.block_size);
+  if(p.max_num_seqs)b.push('seqs '+p.max_num_seqs);
+  if(p.speculative_config&&p.speculative_config.num_speculative_tokens!=null)b.push('MTP×'+p.speculative_config.num_speculative_tokens);
+  if(e.gpu&&e.gpu.cards&&e.gpu.cards[0]&&e.gpu.cards[0].powerLimitW)b.push(e.gpu.cards[0].powerLimitW+'W');
+  return '⚙️ '+(b.join(' · ')||'已采集');
+}
+function envSectionHtml(e){
+  if(!e)return '<div class="dSec"><h4>⚙️ 配置快照</h4><div class="small">该记录早于快照功能上线（2026-09-29），无配置数据。</div></div>';
+  if(e.error)return '<div class="dSec"><h4>⚙️ 配置快照</h4><div class="small">采集失败：'+esc(e.error)+'</div></div>';
+  var p=e.engineParams||{};
+  var html='<div class="dSec"><h4>⚙️ 配置快照 <span class="small" style="font-weight:400">测试开始时采集'+(e.capturedAt?(' · '+fmtLocal(e.capturedAt,true)):'')+'</span></h4>';
+  html+=dTiles([[e.vllmVersion||'—','vLLM 版本'],[p.runtime||(e.engine&&e.engine.runtime)||'—','runtime'],
+    [(p.tensor_parallel_size||'—')+(p.pipeline_parallel_size>1?(' / PP'+p.pipeline_parallel_size):''),'并行'],
+    [p.max_model_len||'—','max_model_len'],[p.block_size||'—','block size'],[p.max_num_seqs||'—','max_num_seqs'],
+    [p.speculative_config?('MTP×'+(p.speculative_config.num_speculative_tokens!=null?p.speculative_config.num_speculative_tokens:'?')):'无','投机解码'],
+    [p.gpu_memory_utilization!=null?p.gpu_memory_utilization:'—','显存利用率']]);
+  var EPK=['runtime','port','tensor_parallel_size','pipeline_parallel_size','max_model_len','gpu_memory_utilization','max_num_seqs','block_size','attention_backend','enable_chunked_prefill','enable_prefix_caching','kv_cache_quant','temperature','top_p','top_k','min_p','repetition_penalty','thinking','thinkingEffort','dflashMethod','dsparkMethod'];
+  var ep=[];
+  EPK.forEach(function(k){if(p[k]!=null&&p[k]!==false)ep.push(['引擎.'+k,(typeof p[k]==='object')?JSON.stringify(p[k]):String(p[k])]);});
+  if(p.dflash)ep.push(['引擎.dflash','是'+(p.dflashMethod?('（'+p.dflashMethod+'）'):'')]);
+  if(p.dspark)ep.push(['引擎.dspark','是'+(p.dsparkMethod?('（'+p.dsparkMethod+'）'):'')]);
+  if(p.speculative_config)ep.push(['引擎.speculative_config',JSON.stringify(p.speculative_config)]);
+  if(ep.length)html+='<div class="dCap">vLLM 引擎参数（按 /proc/&lt;pid&gt;/cmdline 真实命令行解析，显示值即真值）</div>'+kvTbl(ep);
+  if(e.engine&&e.engine.argv)html+='<details><summary>引擎命令行（pid '+(e.engine.pid||'?')+'，'+esc(e.engine.runtime||'')+'）</summary><div class="env-pre">'+esc(e.engine.argv.join(' '))+'</div></details>';
+  if(e.launchEnv){var le=Object.keys(e.launchEnv).sort().map(function(k){return [k,e.launchEnv[k]]});
+    html+='<details open><summary>启动 env 文件（start wrapper 每次启动落盘 = 弹窗下发参数，'+le.length+' 项）</summary>'+kvTbl(le)+'</details>';}
+  var mc=e.modelConfig||{};
+  if(e.modelPath)html+='<div class="dCap">模型目录：<span style="font-family:var(--mono)">'+esc(e.modelPath)+'</span></div>';
+  var MK=['model_type','architectures','num_hidden_layers','hidden_size','intermediate_size','num_attention_heads','num_key_value_heads','num_experts','num_experts_per_tok','shared_expert_intermediate_size','max_position_embeddings','vocab_size','torch_dtype','tie_word_embeddings'];
+  var mp=[];
+  MK.forEach(function(k){if(mc[k]!=null)mp.push([k,Array.isArray(mc[k])?mc[k].join(', '):String(mc[k])]);});
+  if(mc.rope_scaling)mp.push(['rope_scaling',JSON.stringify(mc.rope_scaling)]);
+  if(mc.quantization_config)mp.push(['quantization_config',JSON.stringify(mc.quantization_config)]);
+  var gc=e.generationConfig||{};
+  Object.keys(gc).sort().forEach(function(k){mp.push(['Generation.'+k,(typeof gc[k]==='object')?JSON.stringify(gc[k]):String(gc[k])]);});
+  if(mp.length)html+='<div class="dCap">模型配置（config.json 关键字段 ＋ generation_config.json）</div>'+kvTbl(mp);
+  if(e.modelConfig)html+='<details><summary>完整 config.json（'+Object.keys(e.modelConfig).length+' 个顶层键）</summary><div class="env-pre">'+esc(JSON.stringify(e.modelConfig,null,1).slice(0,30000))+'</div></details>';
+  if(e.httpModels&&e.httpModels.length)html+='<div class="dCap">/v1/models：'+esc(e.httpModels.map(function(m){return m.id+(m.root?('（'+m.root+'）'):'')}).join('； '))+'</div>';
+  if(e.gpu&&e.gpu.cards&&e.gpu.cards.length)html+='<div class="dCap">GPU：'+esc(e.gpu.cards.map(function(c){return c.name+' · 功耗上限 '+(c.powerLimitW!=null?c.powerLimitW+'W':'—')+(c.vbios?(' · vbios '+c.vbios):'')}).join(' ＋ ')+(e.gpu.driver?(' · 驱动 '+e.gpu.driver):''))+'</div>';
+  html+='</div>';
+  return html;
+}
+// 配置快照展平成一层键值（测试参数/引擎/启动 env/模型/GPU），供 A/B 差异表用
+function envFlat(rec){
+  var m={},e=rec.env||{},p=rec.params||{};
+  m['测试.模式']=rec.mode||'';m['测试.模型名']=rec.model||'';
+  m['测试.测试集']=p.suite;m['测试.轮数']=p.reps;m['测试.max_tokens']=p.maxTokens;
+  m['测试.并发档']=(p.concLevels||[]).join(',');
+  m['测试.静置s']=p.settle;m['测试.轮间静置s']=p.repSettle;
+  m['测试.轮次独立']=(p.roundIso===false)?'关':'开';
+  if(!e||e.error)return m;
+  m['vLLM.版本']=e.vllmVersion||'';
+  if(e.engine){m['引擎.runtime']=e.engine.runtime||'';m['引擎.命令行']=(e.engine.argv||[]).join(' ');}
+  var ep=e.engineParams||{};
+  Object.keys(ep).forEach(function(k){var v=ep[k];if(v&&typeof v==='object')v=JSON.stringify(v);m['引擎.'+k]=(v==null)?'':String(v);});
+  var le=e.launchEnv||{};
+  Object.keys(le).sort().forEach(function(k){m['启动.'+k]=le[k];});
+  var mc=e.modelConfig||{};
+  ['model_type','architectures','num_hidden_layers','hidden_size','intermediate_size','num_attention_heads','num_key_value_heads','num_experts','max_position_embeddings','torch_dtype'].forEach(function(k){if(mc[k]!=null)m['模型.'+k]=Array.isArray(mc[k])?mc[k].join(','):String(mc[k]);});
+  if(mc.rope_scaling)m['模型.rope_scaling']=JSON.stringify(mc.rope_scaling);
+  if(mc.quantization_config)m['模型.quantization_config']=JSON.stringify(mc.quantization_config);
+  var gc=e.generationConfig||{};
+  Object.keys(gc).sort().forEach(function(k){m['生成.'+k]=(typeof gc[k]==='object')?JSON.stringify(gc[k]):String(gc[k]);});
+  if(e.gpu&&e.gpu.cards)m['GPU']=e.gpu.cards.map(function(c){return c.name+'@'+(c.powerLimitW!=null?c.powerLimitW+'W':'?')}).join(' + ');
+  return m;
+}
 function med(a){if(!a.length)return null;a=a.slice().sort(function(x,y){return x-y});return a.length%2?a[(a.length-1)/2]:(a[a.length/2-1]+a[a.length/2])/2}
 // 服务端 timestamp 存 UTC ISO（toISOString 带 Z），直接截字符串显示的是 UTC 时间（比北京早 8 小时）。
 // fmtLocal：转浏览器本地时区。full=true → YYYY-MM-DD HH:mm:ss；缺省 → MM-DD HH:mm。解析失败退回原截断。
@@ -729,6 +839,7 @@ function openDetail(file){
         html+='<tr><td>'+fmtK(k)+'</td><td class="num">'+(r.meanPromptTokens||'—')+'</td><td class="num">'+(r.meanTtft||'—')+'</td><td class="num"><b>'+(r.meanPtps||'—')+'</b></td><td class="num small">'+r.reps.map(function(x){return x.ptps||'—'}).join(' / ')+'</td></tr>';});
       html+='</table></div>';
     }
+    html+=envSectionHtml(j.env); // 09-29 配置快照（vLLM/模型配置，测试开始时采集）
     if(j.events&&j.events.length){
       html+='<div class="dSec"><h4>分段总结（'+j.events.length+' 条）</h4><div style="max-height:240px;overflow:auto;border:1px solid var(--bd);border-radius:9px;background:var(--panel2)">';
       j.events.slice().reverse().forEach(function(e){html+='<div class="ev '+e.kind+'"><span class="tm">'+(e.ts||'')+'</span><span class="tt">'+e.title+'</span><span class="tx">'+(e.text||'')+'</span></div>'});

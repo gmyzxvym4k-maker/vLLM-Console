@@ -341,6 +341,7 @@ function parseServerParams(cmdline, runtime, port) {
     // vllm 参数
     else if (a === '--tensor-parallel-size') params.tensor_parallel_size = parseInt(next()) || 1;
     else if (a === '--pipeline-parallel-size' || a === '--pp' || a === '--pp-size') params.pipeline_parallel_size = parseInt(next()) || 1;
+    else if (a === '--max-model-len' || a === '--context-length') params.max_model_len = parseInt(next()) || null;
     else if (a === '--gpu-memory-utilization') params.gpu_memory_utilization = parseFloat(next()) || 0.9;
     else if (a === '--max-num-seqs') params.max_num_seqs = parseInt(next()) || 4;
     else if (a === '--block-size') params.block_size = parseInt(next()) || 32;
@@ -365,7 +366,7 @@ function parseServerParams(cmdline, runtime, port) {
       } catch (e) { params.speculative_config = null; }
     }
     else if (a === '--default-chat-template-kwargs') {
-      try { const ck = JSON.parse(next()); params.thinking = ck.enable_thinking !== false; params.thinkingEffort = ck.reasoning_effort || 'medium'; } catch (e) {}
+      try { const ck = JSON.parse(next()); params.thinking = ck.enable_thinking !== false; params.thinkingEffort = ck.reasoning_effort || 'xhigh'; } catch (e) {}
     }
     else if (a === '--override-generation-config') {
       try { const g = JSON.parse(next()); params.temperature = g.temperature; params.top_p = g.top_p; params.top_k = g.top_k; params.min_p = g.min_p; params.repetition_penalty = g.repetition_penalty; } catch (e) {}
@@ -524,10 +525,10 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
     maxModelLen: 262144, gpuMemUtil: 0.95, maxNumSeqs: 4, maxBatchedTokens: 8192,
     blockSize: 1616, temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
     presencePenalty: 0.1, repetitionPenalty: 1.05, pp: 2, mtpTokens: 4,
-    // [kvoff-sync 09-23] 生产真值：二级缓存开 96GiB（c5a 修复后命中已通）；
+    // [kvoff-off 0929] 生产真值：二级缓存关（A/B 定案 21h 零外部命中，省 107GB pinned）；
     // PLE=INT8+heap（匿名堆 49.2GB，不受 pinned 挤压页缓存影响，disk 模式与
     // 大 pinned 层共存有缺页拖垮 decode 的结构性风险，见 09-19 事故模式）。
-    kvoff: '1', kvOffGiB: 96, pleInt8: '1', pleLoc: 'heap',
+    kvoff: '0', kvOffGiB: 96, pleInt8: '1', pleLoc: 'heap',
   },
   bannedArgs: ['--mamba-ssm-cache-dtype', '--mamba-cache-mode', '--language-model-only',
                '--enable-prompt-tokens-details', '--safetensors-load-strategy',
@@ -797,14 +798,14 @@ function scriptModelLaunchPlan(sm, d) {
   if (d.cpuOffloadGb) env.FN_CPU_OFFLOAD_GB = String(d.cpuOffloadGb);
   const kv = String(d.kvCacheQuant || 'auto');
   if (kv && kv !== 'auto' && kv !== 'bfloat16') env.FN_KV_DTYPE = kv;
-  // [kvoff-toggle 09-22] CPU KV 二级缓存：inner 脚本按 FN_KVOFF(缺省开)/FN_KVOFF_BYTES 决定。
-  // 弹窗显式传 '0'/'1'；旧快启预设无 kvoff 字段 → 落到开启（与 inner 缺省一致，行为不漂移）。
-  if (String(d.kvoff) === '0') {
-    env.FN_KVOFF = '0';
-  } else {
+  // [kvoff-toggle 09-22][kvoff-off 0929] CPU KV 二级缓存：inner 脚本按 FN_KVOFF(缺省关)/FN_KVOFF_BYTES 决定。
+  // 弹窗显式传 '0'/'1'；字段缺失 → 关闭（与 inner 缺省 :-0 一致；0929 A/B 定案后翻转）。
+  if (String(d.kvoff) === '1') {
     env.FN_KVOFF = '1';
     const koG = int(d.kvoffGiB, 96);
     if (koG > 0) env.FN_KVOFF_BYTES = String(koG * 1073741824);
+  } else {
+    env.FN_KVOFF = '0';
   }
   // [ple-field 0923] PLE n-gram 表加载精度：inner 缺省=1（INT8 磁盘驻留 47.7GiB，可回收页缓存）；
   // 弹窗显式传 '0' → BF16 原生 95.4GiB（匿名堆不可回收）。旧快启预设无本字段 → 落 '1'，
@@ -7295,6 +7296,14 @@ const BENCH = (function () {
         await sleep(2000);
       }
       if (!healthy) throw new Error('服务未就绪（health 检查未通过）');
+      // 1.5 配置快照（09-29）：测试一开始抓 vLLM/模型配置，随结果落盘供后续比对
+      state.stage = 'snapshot';
+      state.stageNote = '采集配置快照…';
+      try { state.env = await captureEnv(s, model); } catch (e) { state.env = { error: String(e.message || e) }; }
+      try {
+        const brief = envBriefText(state.env);
+        addEvent(state, 'type', '📸 配置快照', (brief || '已采集（字段不全或服务远程）') + ' → 结果 JSON.env，历史详情/对比可看');
+      } catch (e) {}
       // 2. load prompts（单流/并发需要；预填充不需要）
       let prompts = [];
       if (mode !== 'prefill') {
@@ -7494,6 +7503,7 @@ const BENCH = (function () {
         single: state.single, conc: state.conc, prefill: state.prefill,
         summary: state.summary, final: state.final, events: state.events,
         order: state.order,
+        env: state.env || null, // 09-29 配置快照：vLLM 引擎/模型/启动 env/GPU，比对用
       };
       fs.writeFileSync(path.join(RESULT_DIR, file), JSON.stringify(record, null, 1));
       state.status = 'done';
@@ -7523,6 +7533,122 @@ const BENCH = (function () {
         }
       }
     }
+  }
+
+  // ---------- 配置快照（09-29）：每次测试开始抓 vLLM/模型配置，随结果落 bench-results 供后续比对 ----------
+  // 数据源（单项失败只缺该项，绝不影响测试本身）：
+  //   ① /v1/models + /metrics 原始文本（任意服务 HTTP 可达，含远程）→ 模型名 / vllm:info 版本号
+  //   ② /proc/<pid>/cmdline（仅本机受管实例）→ 引擎真实 argv + parseServerParams 结构化参数
+  //   ③ 模型目录 config.json / generation_config.json（宿主可见路径，与 model-params 采样兜底同源）
+  //   ④ flash-next 启动 env 文件（start wrapper 每次启动落盘 = 弹窗参数权威源，09-26 铁律）
+  //   ⑤ GPU 规格/功耗上限：只读 global.__gpuStatic 缓存，绝不现场调 nvidia-smi（09-20 铁律）
+  function parseEnvFile(txt) {
+    const out = {};
+    for (const line of String(txt).split('\n')) {
+      const t = line.trim();
+      if (!t || t.startsWith('#')) continue;
+      const i = t.indexOf('=');
+      if (i < 1) continue;
+      let v = t.slice(i + 1);
+      // start wrapper 用 printf %q 写值：还原 \" \$ \' \\ 转义与 $'...' 包裹
+      if (/^\$'/.test(v)) v = v.slice(2, -1);
+      v = v.replace(/\\(["'$\\])/g, '$1');
+      out[t.slice(0, i)] = v;
+    }
+    return out;
+  }
+  function modelPathFromArgv(argv) {
+    for (let i = 0; i < argv.length; i++) {
+      if ((argv[i] === '--model' || argv[i] === '--model-path') && argv[i + 1]) return argv[i + 1];
+      if (argv[i] === 'serve' && argv[i + 1] && !String(argv[i + 1]).startsWith('-')) return argv[i + 1];
+    }
+    return null;
+  }
+  function readJsonCap(file, capBytes) {
+    try {
+      const st = fs.statSync(file);
+      if (!st.isFile() || st.size > (capBytes || 512 * 1024)) return null;
+      return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (e) { return null; }
+  }
+  async function captureEnv(sid, model) {
+    const env = { capturedAt: new Date().toISOString(), model: model || null };
+    const x = svcOf(sid);
+    // ① /v1/models
+    try {
+      const r = await fetchWithTimeout(baseUrl(sid) + '/v1/models', 3000, svcKey(sid));
+      if (r.ok) {
+        const jj = await r.json();
+        env.httpModels = (jj.data || []).map((m) => ({ id: m.id, root: m.root || null }));
+      }
+    } catch (e) {}
+    // ② /metrics 原始文本 → vllm:info 版本标签（旧版 vLLM 无该指标则缺省）
+    try {
+      const r = await fetchWithTimeout(baseUrl(sid) + '/metrics', 4000, svcKey(sid));
+      if (r.ok) {
+        const mi = (await r.text()).match(/^vllm:info\{([^}]*)\}/m);
+        if (mi) {
+          for (const kv of mi[1].matchAll(/(\w+)="([^"]*)"/g)) {
+            if (kv[1] === 'version') env.vllmVersion = kv[2];
+            else if (kv[1] === 'model_name') env.metricsModelName = kv[2];
+          }
+        }
+      }
+    } catch (e) {}
+    // ③④ 本机受管实例：引擎进程 cmdline + 模型目录 + 启动 env 文件
+    if (x && String(x.id) === 'local' && x.port) {
+      const pid = findVllmPidByPort(x.port);
+      if (pid) {
+        try {
+          const argv = fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8').split('\0').filter(Boolean);
+          const runtime = /sglang/.test(argv.join(' ')) ? 'sglang' : 'vllm';
+          env.engine = { pid, runtime, argv };
+          try { env.engineParams = parseServerParams(argv, runtime, x.port); } catch (e) {}
+          const mp = modelPathFromArgv(argv) || modelPathForPort(x.port);
+          if (mp) {
+            env.modelPath = mp;
+            const cfg = readJsonCap(mp + '/config.json');
+            if (cfg) env.modelConfig = cfg;
+            const gc = readJsonCap(mp + '/generation_config.json');
+            if (gc) env.generationConfig = gc;
+          }
+          // flash-next 脚本链路：env 文件是该引擎弹窗参数的权威落盘（其它实例无此文件）
+          if (/flash[-_]?next/i.test(argv.join(' ')) || /flash[-_]?next/i.test(mp || '')) {
+            try {
+              const ef = path.join(__dirname, 'flash-next-w4a16-launch.env');
+              if (fs.existsSync(ef)) env.launchEnv = parseEnvFile(fs.readFileSync(ef, 'utf8'));
+            } catch (e) {}
+          }
+        } catch (e) { env.engineError = String(e.message || e); }
+      } else env.engineError = '未找到引擎进程（远程服务，或进程刚退出）';
+    }
+    // ⑤ GPU 规格/功耗上限（全局缓存，无子进程调用）
+    try {
+      const st = global.__gpuStatic;
+      if (st && st.supported) {
+        env.gpu = {
+          driver: st.driver_version || null,
+          cards: st.gpus.map((g) => ({ index: g.index, name: g.name, vbios: g.vbios || null, powerLimitW: g.power_limit != null ? g.power_limit : null })),
+        };
+      }
+    } catch (e) {}
+    return env;
+  }
+  // 事件流一行摘要（详情页/事件流都有迹可循，不用点开快照卡）
+  function envBriefText(e) {
+    if (!e) return '';
+    const p = e.engineParams || {};
+    const bits = [];
+    if (e.vllmVersion) bits.push('vLLM ' + e.vllmVersion);
+    if (p.runtime) bits.push(p.runtime);
+    if (p.tensor_parallel_size) bits.push('TP' + p.tensor_parallel_size);
+    if (p.pipeline_parallel_size > 1) bits.push('PP' + p.pipeline_parallel_size);
+    if (p.max_model_len) bits.push('ctx ' + p.max_model_len);
+    if (p.block_size) bits.push('block ' + p.block_size);
+    if (p.max_num_seqs) bits.push('seqs ' + p.max_num_seqs);
+    if (p.speculative_config && p.speculative_config.num_speculative_tokens != null) bits.push('MTP×' + p.speculative_config.num_speculative_tokens);
+    if (e.gpu && e.gpu.cards && e.gpu.cards[0] && e.gpu.cards[0].powerLimitW) bits.push(e.gpu.cards[0].powerLimitW + 'W');
+    return bits.join(' · ');
   }
 
   // ---------- API（pathname 前缀 /v1/internal/bench） ----------
@@ -7579,6 +7705,12 @@ const BENCH = (function () {
       delete st.abort;
       delete st.params;
       delete st.runAc;
+      // 1s 轮询瘦身：整份 config.json 只随结果文件/详情接口给，轮询只留摘要所需字段
+      if (st.env) {
+        const { modelConfig, generationConfig, ...lite } = st.env;
+        if (modelConfig || generationConfig) lite.hasFullModelConfig = true;
+        st.env = lite;
+      }
       return json(res, 200, st);
     }
     if (sub === '/stop' && req.method === 'POST') {
@@ -7605,6 +7737,7 @@ const BENCH = (function () {
           list.push({
             file: f, tag: j.tag, mode: j.mode || 'full', timestamp: j.timestamp,
             service: j.service && j.service.name, model: j.model,
+            hasEnv: !!(j.env && !j.env.error), // 09-29：该记录是否带配置快照
             reps: (j.params && j.params.reps) || null, types: singleIds.length || null,
             singleMean,
             singleTtft: tArr.length ? Math.round(mean(tArr)) : null,

@@ -7830,7 +7830,7 @@ process.on('uncaughtException', (e) => { try { console.error('[uncaughtException
 // 见 ops/install-cpu-ctl-127.sh）。全部为运行时软控制 sysfs，重启回 BIOS/内核默认。
 // 本机 22 同构核、BIOS 关超线程、无 HWP → 上游的小核簇/超线程/EPP 动作已删，
 // 新增睿频开关（intel_pstate/no_turbo）。
-// 接口: GET  /v1/internal/cpuctl      状态 JSON（1.5s TTL 缓存 + 单飞，防轮询叠发）
+// 接口: GET  /v1/internal/cpuctl      状态 JSON（0.5s TTL 缓存 + 单飞，防轮询叠发）
 //       POST /v1/internal/cpuctl/cmd  action 白名单（走既有 /v1/internal/ POST 口令拦截）
 // 铁律遵守：execFile + 自身 timeout，绝不 execSync——sysfs/脚本卡住不许拖垮事件循环。
 const CPU_CTL = process.env.CPU_CTL || '/usr/local/bin/cpu-ctl';
@@ -7853,11 +7853,12 @@ function cpuCtlRun(args, timeoutMs) {
   });
 }
 
-// 状态短缓存：UI 5s 轮询 + 每次命令后补拉，叠发 execFile（内含 sudo 提权 + python）会排队拖慢。
+// 状态短缓存：UI 1s 轮询（多标签页会叠发），TTL 0.5s + 单飞去重，execFile（内含 sudo 提权 + python）
+// 同刻只跑一份；TTL 必须小于前端轮询间隔，否则数字看着不刷新。
 let __cpuStateCache = null; // { t, state }
 let __cpuStateFly = null;   // 在途 Promise
 function cpuCtlStatus(force) {
-  if (!force && __cpuStateCache && Date.now() - __cpuStateCache.t < 1500) {
+  if (!force && __cpuStateCache && Date.now() - __cpuStateCache.t < 500) {
     return Promise.resolve({ ok: true, state: __cpuStateCache.state });
   }
   if (__cpuStateFly) return __cpuStateFly;

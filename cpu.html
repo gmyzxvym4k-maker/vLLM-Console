@@ -149,7 +149,7 @@ input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(99,102
 let cpuTimer = null, cpuCmdBusy = false, cpuTileSig = '', cpuOptSig = '';
 
 function safeRun(fn) { try { fn(); } catch (e) { console.error('cpu render:', e); } }
-function startCpuPolling() { if (!cpuTimer) cpuTimer = setInterval(() => { if (!document.hidden) loadCpuCtl(); }, 3000); }
+function startCpuPolling() { if (!cpuTimer) cpuTimer = setInterval(() => { if (!document.hidden) loadCpuCtl(); }, 1000); }
 function stopCpuPolling() { if (cpuTimer) { clearInterval(cpuTimer); cpuTimer = null; } }
 function cpuGHz(khz) { return khz ? (khz / 1000000).toFixed(2) : '–'; }
 function tempColor(t) { return t == null ? 'var(--tx3)' : t >= 80 ? 'var(--bad)' : t >= 65 ? 'var(--warn)' : 'var(--ok)'; }

@@ -7825,6 +7825,115 @@ function installGzip(req, res) {
 process.on('unhandledRejection', (e) => { try { console.error('[unhandledRejection]', (e && e.stack) || e); } catch (_) {} });
 process.on('uncaughtException', (e) => { try { console.error('[uncaughtException]', (e && e.stack) || e); } catch (_) {} });
 
+// ---------------- 5) CPU 控制（移植自 bench-console/cpu-control，通用化适配） ----------------
+// 调 /usr/local/bin/cpu-ctl（脚本随本仓库部署；非 root 时自提权，需 sudoers.d 白名单，
+// 见 ops/install-cpu-ctl-127.sh）。全部为运行时软控制 sysfs，重启回 BIOS/内核默认。
+// 接口: GET  /v1/internal/cpuctl      状态 JSON（1.5s TTL 缓存 + 单飞，防轮询叠发）
+//       POST /v1/internal/cpuctl/cmd  action 白名单（走既有 /v1/internal/ POST 口令拦截）
+// 铁律遵守：execFile + 自身 timeout，绝不 execSync——sysfs/脚本卡住不许拖垮事件循环。
+const CPU_CTL = process.env.CPU_CTL || '/usr/local/bin/cpu-ctl';
+const CPU_FREQ_RE = /^\d+(\.\d+)?\s*[GgMm]?$/;          // 4G / 3800M / 5300000
+const CPU_SPEC_RE = /^(all|p|e|[0-9][0-9,\-]{0,31})$/;  // all|p|e|0-7,16
+const CPU_VAL_RE  = /^[a-z_]{1,40}$/;                    // governor / EPP 值
+
+function cpuCtlRun(args, timeoutMs) {
+  return new Promise((resolve) => {
+    require('child_process').execFile(CPU_CTL, args.map(String), { timeout: timeoutMs || 30000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        const out = String(stdout || '').trim();
+        const errText = String(stderr || '').trim();
+        resolve({
+          ok: !err,
+          output: out || errText || (err ? String(err.message || err) : '(无输出)'),
+          killed: !!(err && err.killed),
+        });
+      });
+  });
+}
+
+// 状态短缓存：UI 5s 轮询 + 每次命令后补拉，叠发 execFile（内含 sudo 提权 + python）会排队拖慢。
+let __cpuStateCache = null; // { t, state }
+let __cpuStateFly = null;   // 在途 Promise
+function cpuCtlStatus(force) {
+  if (!force && __cpuStateCache && Date.now() - __cpuStateCache.t < 1500) {
+    return Promise.resolve({ ok: true, state: __cpuStateCache.state });
+  }
+  if (__cpuStateFly) return __cpuStateFly;
+  __cpuStateFly = cpuCtlRun(['status', '--json'], 20000).then((r) => {
+    __cpuStateFly = null;
+    try {
+      const state = JSON.parse(r.output);
+      __cpuStateCache = { t: Date.now(), state };
+      return { ok: true, state };
+    } catch (e) {
+      return { ok: false, error: 'cpu-ctl status 输出无法解析：' + String(r.output).slice(0, 200) };
+    }
+  }).catch((e) => { __cpuStateFly = null; return { ok: false, error: String((e && e.message) || e) }; });
+  return __cpuStateFly;
+}
+
+// action 白名单 → cpu-ctl 参数（返回 null = 非法；杜绝任意命令注入）
+function cpuCtlAction(body) {
+  const a = String(body.action || '');
+  const spec = (s) => (CPU_SPEC_RE.test(String(s || 'all')) ? String(s || 'all') : null);
+  switch (a) {
+    case 'freq_max': case 'freq_min': {
+      const f = String(body.freq || '').trim();
+      if (!CPU_FREQ_RE.test(f) || !spec(body.spec)) return null;
+      return { args: ['freq', a === 'freq_max' ? 'max' : 'min', f, spec(body.spec)], timeout: 25000 };
+    }
+    case 'freq_reset': return { args: ['freq', 'reset'], timeout: 25000 };
+    case 'gov': case 'epp': {
+      if (!CPU_VAL_RE.test(String(body.val || '')) || !spec(body.spec)) return null;
+      return { args: [a, body.val, spec(body.spec)], timeout: 25000 };
+    }
+    case 'ecore_on':  return { args: ['ecore', 'on'],  timeout: 30000 };
+    case 'ecore_off': return { args: ['ecore', 'off'], timeout: 30000 };
+    case 'core_on': case 'core_off': {
+      const n = body.cpu;
+      if (!/^\d{1,3}$/.test(String(n))) return null;
+      return { args: ['core', a === 'core_on' ? 'on' : 'off', String(n)], timeout: 30000 };
+    }
+    case 'all_on': return { args: ['core', 'all-on'], timeout: 90000 };
+    case 'ht_off': return { args: ['ht', 'off'], timeout: 30000 };
+    case 'ht_on':  return { args: ['ht', 'on'],  timeout: 30000 };
+    case 'bench': {
+      const s = parseInt(body.secs, 10);
+      if (!isFinite(s) || s < 1 || s > 30) return null;
+      return { args: ['bench', String(s)], timeout: s * 20000 + 180000, noState: true };
+    }
+    default: return null;
+  }
+}
+
+function cpuCtlReadBody(req) {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 65536) req.destroy(); });
+    req.on('end', () => { try { resolve(JSON.parse(body || '{}')); } catch (_) { resolve(null); } });
+    req.on('error', () => resolve(null));
+  });
+}
+
+async function cpuCtlHandle(req, res, urlObj) {
+  const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  const sub = urlObj.pathname.slice('/v1/internal/cpuctl'.length);
+  if (req.method === 'GET' && sub === '') {
+    return reply(200, await cpuCtlStatus());
+  }
+  if (req.method === 'POST' && sub === '/cmd') {
+    const body = await cpuCtlReadBody(req);
+    if (!body) return reply(400, { ok: false, msg: '请求体不是合法 JSON' });
+    const act = cpuCtlAction(body);
+    if (!act) return reply(400, { ok: false, msg: '非法参数或不在白名单内' });
+    const r = await cpuCtlRun(act.args, act.timeout);
+    if (act.noState) return reply(200, { ok: r.ok, msg: r.output, killed: r.killed });
+    const st = await cpuCtlStatus(true); // 命令改过状态，强制绕缓存补拉
+    return reply(200, { ok: r.ok, msg: r.output, state: st.ok ? st.state : null, error: st.ok ? null : st.error });
+  }
+  return reply(404, { ok: false, msg: 'cpuctl: 未知路由' });
+}
+
 const server = http.createServer(async (req, res) => {
 
   let urlObj;
@@ -7842,7 +7951,7 @@ const server = http.createServer(async (req, res) => {
   const pathname = urlObj.pathname;
 
   // 09-20：内部 API/页面/静态资源启用 gzip；代理路径（chat/completions 流式）绝不压缩
-  if (pathname === '/' || pathname === '/index.html' || pathname === '/m' || pathname === '/mobile.html' || pathname === '/bench.html'
+  if (pathname === '/' || pathname === '/index.html' || pathname === '/m' || pathname === '/mobile.html' || pathname === '/bench.html' || pathname === '/cpu.html'
       || pathname.startsWith('/static/') || pathname.startsWith('/v1/internal/')) {
     installGzip(req, res);
   }
@@ -7864,6 +7973,13 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/v1/internal/bench' || pathname.startsWith('/v1/internal/bench/')) {
     return BENCH.handleApi(req, res, urlObj).catch((e) => {
       try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: String((e && e.message) || e) })); } catch (_) {}
+    });
+  }
+
+  // === CPU 控制 API（移植自 bench-console/cpu-control，见 CPU CTL 模块头注释）===
+  if (pathname === '/v1/internal/cpuctl' || pathname.startsWith('/v1/internal/cpuctl/')) {
+    return cpuCtlHandle(req, res, urlObj).catch((e) => {
+      try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}
     });
   }
 
@@ -11002,6 +11118,22 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       res.writeHead(404);
       res.end('bench.html not found');
+    }
+    return;
+  }
+
+  // === Serve CPU control UI（移植 bench-console/cpu-control：「CPU 控制」标签的内嵌页）===
+  if (pathname === '/cpu.html' || pathname === '/cpu') {
+    const cpuPath = path.join(__dirname, 'cpu.html');
+    try {
+      const content = fs.readFileSync(cpuPath, 'utf8');
+      const etag = 'W/"' + Buffer.byteLength(content) + '-' + fs.statSync(cpuPath).mtimeMs.toString(36) + '"';
+      if (req.headers['if-none-match'] === etag) { res.writeHead(304); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', 'ETag': etag });
+      res.end(content);
+    } catch (e) {
+      res.writeHead(404);
+      res.end('cpu.html not found');
     }
     return;
   }

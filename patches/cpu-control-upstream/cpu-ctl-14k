@@ -1,0 +1,384 @@
+#!/usr/bin/env bash
+# cpu-ctl-14k — msi i5-14600K 专用 CPU 控制台（单文件，dsh-console「硬件控制」页调用）
+# 拓扑事实（2026-09-26 实测）:
+#   6 个 P 核在线 = cpu0,2,4,6,8,10 (core_id 0,4,8,12,16,20, 单核 5.3GHz)
+#   小核 E 簇 = cpu12-19 (单核 4.0GHz)，内核 present，被 offline-ecores.service 开机下线 → 运行时可上/下线
+#   超线程: 内核 cmdline nosmt → SMT 兄弟 1,3,5,7,9,11 present 但离线，运行时**不能**上线（需改 GRUB 重启）
+#   cpufreq = intel_pstate active, governors performance/powersave, 0.8~5.3GHz
+# 用法: cpu-ctl-14k <命令>  (非 root 自动提权)   cpu-ctl-14k help 查看全部
+set -uo pipefail
+
+CPU=/sys/devices/system/cpu
+STATE=/var/lib/cpu-ctl-14k
+GRUB=/etc/default/grub
+
+[[ $EUID -ne 0 ]] && exec sudo bash "$0" "$@"
+
+mkdir -p "$STATE"
+
+# ---------- 基础 ----------
+present_list() { ls -d "$CPU"/cpu[0-9]* 2>/dev/null | grep -oE '[0-9]+$' | sort -n; }
+is_online() { local n=$1; local f="$CPU/cpu$n/online"; [[ ! -e $f ]] || [[ $(cat "$f" 2>/dev/null) = 1 ]]; }
+online_str() { cat "$CPU/online" 2>/dev/null || echo "?"; }
+set_online() { local n=$1 v=$2; local f="$CPU/cpu$n/online"; [[ -e $f ]] && echo "$v" > "$f"; }
+cpu_model() { grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//'; }
+has_nosmt() { grep -qw nosmt /proc/cmdline; }
+
+# P/E 分类: 读得到 cpuinfo_max_freq 的按频率分（最高档=P，低 >=500MHz 的=E）；
+# 离线读不到的: E 簇已知缓存 $STATE/ecores（首次在线时写入），否则回落 i5-14600K 固定 12-19
+ecore_list() {
+  if [[ -s $STATE/ecores ]]; then cat "$STATE/ecores"; else echo "12 13 14 15 16 17 18 19"; fi
+}
+learn_ecores() {  # 在线核里凡 max_freq 比最高档低 >=500MHz 的记为 E；与已有缓存并集合并（只增不减，防止只有部分 E 核在线时缓存被覆盖残缺）
+  local top=0 c m existing=""
+  for c in $(present_list); do
+    is_online "$c" || continue
+    m=$(cat "$CPU/cpu$c/cpufreq/cpuinfo_max_freq" 2>/dev/null) || continue
+    (( m > top )) && top=$m
+  done
+  (( top > 0 )) || return 0
+  [[ -s $STATE/ecores ]] && existing=$(cat "$STATE/ecores")
+  for c in $(present_list); do
+    is_online "$c" || continue
+    m=$(cat "$CPU/cpu$c/cpufreq/cpuinfo_max_freq" 2>/dev/null) || continue
+    if (( top - m >= 500000 )); then
+      grep -qw "$c" <<<"$existing" 2>/dev/null || existing="$existing $c"
+    fi
+  done
+  echo $existing | tr ' ' '\n' | sort -n | tr '\n' ' ' | sed 's/ $//' > "$STATE/ecores"
+  return 0
+}
+
+# 规格展开: all | p | e | 0-7,16 单个数字 -> cpu 序列
+expand_spec() {
+  local spec=$1 a b part
+  case "$spec" in
+    all) present_list ;;
+    p)   for c in $(present_list); do grep -qw "$c" <(ecore_list) || echo "$c"; done ;;
+    e)   ecore_list ;;
+    *)   local IFS=,
+         for part in $spec; do
+           if [[ $part = *-* ]]; then a=${part%-*}; b=${part#*-}; seq "$a" "$b"; else echo "$part"; fi
+         done ;;
+  esac
+}
+
+parse_freq() {
+  local v=$1
+  case "$v" in
+    *[Gg]) awk "BEGIN{printf \"%d\", ${v%[Gg]}*1000000}" ;;
+    *[Mm]) awk "BEGIN{printf \"%d\", ${v%[Mm]}*1000}" ;;
+    ''|*[!0-9]*) echo "错误: 无法解析频率 '$v'" >&2; return 1 ;;
+    *) echo "$v" ;;
+  esac
+}
+fmt_khz() { awk "BEGIN{printf \"%.2f GHz\", $1/1000000}"; }
+
+# ---------- status --json ----------
+do_status_json() {
+  learn_ecores
+  python3 - "$STATE" <<'PYEOF'
+import json, os, sys
+state = sys.argv[1]
+CPU = '/sys/devices/system/cpu'
+def rd(p, default=None):
+    try:
+        with open(p) as f: return f.read().strip()
+    except OSError: return default
+present = sorted(int(x[3:]) for x in os.listdir(CPU) if x.startswith('cpu') and x[3:].isdigit())
+ecores = set()
+try:
+    with open(os.path.join(state, 'ecores')) as f:
+        ecores = set(int(x) for x in f.read().split())
+except OSError: pass
+nosmt = 'nosmt' in rd('/proc/cmdline', '')
+smt_control = rd(f'{CPU}/smt/control') or 'missing'
+# 兜底: 20 逻辑槽位(6P*2SMT+8E) 且 E 簇没缓存 → i5-14600K 固定 12-19
+if not ecores and present and present[-1] == 19:
+    ecores = set(range(12, 20))
+cores = []
+top = 0
+online_cpus = []
+for c in present:
+    if not os.path.exists(f'{CPU}/cpu{c}/online') or rd(f'{CPU}/cpu{c}/online') == '1':
+        online_cpus.append(c)
+# 最高档频率（在线核中取最大）
+for c in online_cpus:
+    m = rd(f'{CPU}/cpu{c}/cpufreq/cpuinfo_max_freq')
+    if m: top = max(top, int(m))
+for c in present:
+    onv = rd(f'{CPU}/cpu{c}/online')
+    online = (onv is None) or (onv == '1')   # 无 online 文件 = 恒在线（cpu0）
+    typ = 'E' if c in ecores else 'P'
+    sib = None
+    sl = rd(f'{CPU}/cpu{c}/topology/thread_siblings_list')
+    if sl and ',' in sl:
+        parts = [int(x) for x in sl.split(',')]
+        sib = [x for x in parts if x != c]
+    if sib is None and nosmt:
+        # nosmt 下读不到 topology: 偶数=主线程, 兄弟=±1（14600K P 核 0,2,..10）
+        if c < 12:
+            sib = [c + 1] if c % 2 == 0 else [c - 1]
+    d = {'cpu': c, 'type': typ, 'online': online, 'siblings': sib}
+    if online:
+        cf = f'{CPU}/cpu{c}/cpufreq'
+        d['cur'] = int(rd(f'{cf}/scaling_cur_freq', 0) or 0)
+        d['min'] = int(rd(f'{cf}/scaling_min_freq', 0) or 0)
+        d['max'] = int(rd(f'{cf}/scaling_max_freq', 0) or 0)
+        d['hwMin'] = int(rd(f'{cf}/cpuinfo_min_freq', 0) or 0)
+        d['hwMax'] = int(rd(f'{cf}/cpuinfo_max_freq', 0) or 0)
+        d['governor'] = rd(f'{cf}/scaling_governor')
+        d['epp'] = rd(f'{cf}/energy_performance_preference')
+        d['eppAvail'] = (rd(f'{cf}/energy_performance_available_preferences') or '').split()
+        d['govAvail'] = (rd(f'{cf}/scaling_available_governors') or '').split()
+    cores.append(d)
+out = {
+    'model': (rd('/proc/cpuinfo') or ''),
+    'nosmt': nosmt,
+    'smtControl': smt_control,
+    'present': present,
+    'onlineStr': rd(f'{CPU}/online'),
+    'onlineCount': len(online_cpus),
+    'cores': cores,
+    'ecores': sorted(ecores),
+    'minFreqTotal': 800000, 'maxFreqTotal': top,
+}
+# model name
+for line in (rd('/proc/cpuinfo') or '').splitlines():
+    if line.startswith('model name'):
+        out['model'] = line.split(':', 1)[1].strip(); break
+print(json.dumps(out, ensure_ascii=False))
+PYEOF
+}
+
+# ---------- 频率 ----------
+do_freq() {
+  local sub=${1:-show} arg=${2:-} spec=${3:-all} kHz c f orig cur_max ok=0 fail=0
+  case "$sub" in
+    show) do_status_json >/dev/null  # 顺带 learn
+      printf "%-7s %-10s %-10s %-10s %s\n" "cpu" "当前" "下限" "上限"
+      for c in $(present_list); do
+        is_online "$c" || { printf "%-7s %s\n" "cpu$c" "(下线)"; continue; }
+        f="$CPU/cpu$c/cpufreq"
+        printf "%-7s %-10s %-10s %-10s\n" "cpu$c" "$(cat $f/scaling_cur_freq 2>/dev/null)" "$(cat $f/scaling_min_freq 2>/dev/null)" "$(cat $f/scaling_max_freq 2>/dev/null)"
+      done ;;
+    max|min)
+      [[ -z $arg ]] && { echo "用法: cpu-ctl-14k freq $sub <4G|3800M|kHz> [all|p|e|0-19]" >&2; return 1; }
+      kHz=$(parse_freq "$arg") || return 1
+      for c in $(expand_spec "${spec:-all}"); do
+        is_online "$c" || continue
+        f="$CPU/cpu$c/cpufreq"
+        kind=max; [[ $sub = min ]] && kind=min
+        orig="$STATE/orig_${kind}_$c"
+        [[ -e $orig ]] || cat "$f/scaling_${kind}_freq" > "$orig" 2>/dev/null
+        if [[ $sub = min ]]; then
+          cur_max=$(cat "$f/scaling_max_freq" 2>/dev/null)
+          if [[ -n $cur_max && $kHz -gt $cur_max ]]; then
+            echo "cpu$c: 拒绝 —— 下限高于当前上限 $cur_max kHz" >&2; fail=$((fail+1)); continue
+          fi
+        fi
+        if echo "$kHz" > "$f/scaling_${kind}_freq" 2>/dev/null; then
+          echo "cpu$c ${kind} -> $(fmt_khz "$kHz")"
+          ok=$((ok+1))
+        else
+          echo "cpu$c: 写入失败（内核拒绝）" >&2; fail=$((fail+1))
+        fi
+      done
+      echo "完成: 成功 $ok, 失败 $fail" ;;
+    reset)
+      local found=0 tgt
+      for f in "$STATE"/orig_max_* "$STATE"/orig_min_*; do
+        [[ -e $f ]] || continue
+        c=${f##*_}; kind=${f##*/orig_}; kind=${kind%%_*}
+        is_online "$c" || continue
+        tgt="$CPU/cpu$c/cpufreq/scaling_${kind}_freq"
+        cat "$f" > "$tgt" 2>/dev/null && rm -f "$f" && echo "cpu$c ${kind} 恢复 -> $(cat "$tgt" 2>/dev/null) kHz" && found=1
+      done
+      [[ $found = 0 ]] && echo "没有需要恢复的原始频率（或对应核离线）"
+      return 0 ;;
+    *) echo "用法: cpu-ctl-14k freq <show|max|min|reset>" >&2; return 1 ;;
+  esac
+}
+
+# ---------- governor / EPP ----------
+do_gov() {  # gov performance [spec] / epp balance_performance [spec]
+  local what=${1:-} val=${2:-} spec=${3:-all} c
+  [[ $what != gov && $what != epp ]] && { echo "用法: cpu-ctl-14k gov <performance|powersave> [spec] | epp <值> [spec]" >&2; return 1; }
+  [[ -z $val ]] && { echo "缺少值" >&2; return 1; }
+  local ok=0 fail=0
+  for c in $(expand_spec "${spec:-all}"); do
+    is_online "$c" || continue
+    if echo "$val" > "$CPU/cpu$c/cpufreq/scaling_$([[ $what = gov ]] && echo governor || echo energy_performance_preference)" 2>/dev/null; then
+      ok=$((ok+1)); else fail=$((fail+1)); echo "cpu$c 写入失败" >&2
+    fi
+  done
+  echo "$what -> $val: 成功 $ok, 失败 $fail"
+}
+
+# ---------- 小核 / 单核 ----------
+do_ecore() {
+  local action=${1:-list} c v on=0 off=0
+  case "$action" in
+    list) echo "E 簇: $(ecore_list)"; for c in $(ecore_list); do is_online "$c" && on=$((on+1)) || off=$((off+1)); done; echo "在线 $on / 离线 $off" ;;
+    on|off)
+      v=0; [[ $action = on ]] && v=1
+      for c in $(ecore_list); do
+        set_online "$c" "$v" && echo "cpu$c -> $([[ $v = 1 ]] && echo 上线 || echo 下线)" || echo "cpu$c 失败" >&2
+      done
+      echo "当前在线: $(online_str)" ;;
+    *) echo "用法: cpu-ctl-14k ecore <list|on|off>" >&2; return 1 ;;
+  esac
+}
+
+do_core() {
+  local action=${1:-} n=${2:-} c on_cnt=0
+  case "$action" in
+    on|off)
+      [[ -z $n || ! $n =~ ^[0-9]+$ ]] && { echo "用法: cpu-ctl-14k core <on|off> <编号>" >&2; return 1; }
+      [[ -e $CPU/cpu$n/online || $n = 0 ]] || { echo "cpu$n 不存在" >&2; return 1; }
+      if [[ $action = off ]]; then
+        [[ -e $CPU/cpu$n/online ]] || { echo "cpu$n 无法下线（无 online 文件）" >&2; return 1; }
+        for c in $(present_list); do is_online "$c" && on_cnt=$((on_cnt+1)); done
+        (( on_cnt - 1 >= 2 )) || { echo "拒绝: 下线后在线核少于 2 个" >&2; return 1; }
+        set_online "$n" 0 && echo "cpu$n -> 下线" || echo "cpu$n 下线失败" >&2
+      else
+        set_online "$n" 1 && echo "cpu$n -> 上线" || echo "cpu$n 上线失败" >&2
+      fi
+      echo "当前在线: $(online_str)" ;;
+    *) echo "用法: cpu-ctl-14k core <on|off> <编号>" >&2; return 1 ;;
+  esac
+}
+
+# ---------- 超线程（运行时直切，无需重启）----------
+# 走 /sys/devices/system/cpu/smt/control（on/off/forceoff/notsupported）。
+# 实测：off→on 立即上线全部 SMT 兄弟（online 0-11），on→off 秒回 6 核。本机 nosmt 内核参数
+# 只是把开机初值设为 off，control 文件仍可写 —— 不需要动 GRUB。
+SMT_CTL=$CPU/smt/control
+
+do_ht() {
+  local action=${1:-status} cur
+  cur=$(cat "$SMT_CTL" 2>/dev/null || echo missing)
+  case "$action" in
+    status)
+      case "$cur" in
+        on)  echo "超线程: 开启（smt/control=on）  当前在线: $(online_str)" ;;
+        off) echo "超线程: 关闭（smt/control=off，运行时可直接开启）  当前在线: $(online_str)" ;;
+        forceoff) echo "超线程: 被 BIOS/内核强制关闭（forceoff），运行时无法开启" ;;
+        notsupported) echo "此内核不支持 SMT 控制" ;;
+        *) echo "smt/control 不可读（$cur）" ;;
+      esac ;;
+    on)
+      [[ $cur = on ]] && { echo "已经是开启状态"; return 0; }
+      [[ $cur = on || $cur = off ]] || { echo "smt/control=$cur，无法运行时开启" >&2; return 1; }
+      echo on > "$SMT_CTL" && echo "超线程已开启；当前在线: $(online_str)" || { echo "写入失败" >&2; return 1; } ;;
+    off)
+      [[ $cur = off ]] && { echo "已经是关闭状态"; return 0; }
+      [[ $cur = on || $cur = off ]] || { echo "smt/control=$cur，无法运行时关闭" >&2; return 1; }
+      echo off > "$SMT_CTL" && echo "超线程已关闭；当前在线: $(online_str)" || { echo "写入失败" >&2; return 1; } ;;
+    *) do_ht status ;;
+  esac
+}
+
+
+# ---------- 性能测试 ----------
+do_bench() {
+  local secs=${1:-4} c out iter fmax
+  command -v taskset >/dev/null || { echo "缺少 taskset" >&2; return 1; }
+  learn_ecores
+  echo "体质检测: 每在线主线程单线程满载 ${secs}s × 3 轮取中位 …"
+  printf "%-7s %-14s %-10s %s\n" "cpu" "体质分(中位)" "峰值频率" "类型"
+  local best=0 bestcpu=""
+  for c in $(present_list); do
+    is_online "$c" || continue
+    # 只测策略主线程（在线且为其 cpufreq 组内编号最小者）
+    local rel
+    rel=$(cat "$CPU/cpu$c/cpufreq/affected_cpus" 2>/dev/null) || continue
+    [[ ${rel%% *} = "$c" ]] || continue
+    local typ="P"; grep -qw "$c" <(ecore_list) && typ="E"
+    out=$(taskset -c "$c" python3 - "$secs" "$c" <<'PYEOF' 2>/dev/null
+import sys, time
+dur = float(sys.argv[1]); cpuid = sys.argv[2]
+scores = []; fmax = 0
+for _r in range(3):
+    n = 0; t0 = time.time()
+    while time.time() - t0 < dur:
+        for _i in range(20000): n += 1
+        try:
+            v = int(open(f'/sys/devices/system/cpu/cpu{cpuid}/cpufreq/scaling_cur_freq').read())
+            if v > fmax: fmax = v
+        except OSError: pass
+    scores.append(n)
+scores.sort()
+print(scores[1], fmax)
+PYEOF
+)
+    iter=${out%% *}; fmax=${out##* }
+    if [[ ! $iter =~ ^[0-9]+$ ]]; then
+      printf "%-7s %-14s %-10s %s\n" "cpu$c" "失败" "-" "$typ"; continue
+    fi
+    (( iter > best )) && { best=$iter; bestcpu=$c; }
+    printf "%-7s %-14s %-10s %s\n" "cpu$c" "$iter" "$(fmt_khz "$fmax")" "$typ"
+  done
+  # 多核分: 全部在线主线程并行满载 secs 秒，逐核分数落临时文件求和
+  echo
+  echo "多核性能: 全部在线主线程并行满载 ${secs}s …"
+  local mains=() c2 rel tmpd total=0
+  for c in $(present_list); do
+    is_online "$c" || continue
+    rel=$(cat "$CPU/cpu$c/cpufreq/affected_cpus" 2>/dev/null) || continue
+    [[ ${rel%% *} = "$c" ]] && mains+=("$c")
+  done
+  tmpd=$(mktemp -d)
+  for c2 in "${mains[@]}"; do
+    ( taskset -c "$c2" python3 - "$secs" "$tmpd/mult_$c2" <<'PYEOF' 2>/dev/null
+import sys, time
+dur = float(sys.argv[1]); path = sys.argv[2]
+n = 0; t0 = time.time()
+while time.time() - t0 < dur:
+    for _i in range(20000): n += 1
+with open(path, 'w') as f: f.write(str(n))
+PYEOF
+) &
+  done
+  wait
+  for f in "$tmpd"/mult_*; do
+    [[ -s $f ]] && total=$(( total + $(cat "$f") ))
+  done
+  rm -rf "$tmpd"
+  echo "多核总分(各主线程并行迭代数求和): $total"
+  echo ">> 单核体质最佳: cpu$bestcpu (体质分 $best)"
+  echo "(提示: core off <编号> 可下线不想要的核; ecore off 一键下小核)"
+}
+
+# ---------- 入口 ----------
+case "${1:-}" in
+  status)
+    [[ ${2:-} = --json ]] && do_status_json || do_freq show ;;
+  freq)   shift; do_freq "$@" ;;
+  gov)    shift; do_gov gov "$@" ;;
+  epp)    shift; do_gov epp "$@" ;;
+  ecore)  shift; do_ecore "$@" ;;
+  core)   shift; do_core "$@" ;;
+  ht)     shift; do_ht "$@" ;;
+  bench)  shift; do_bench "$@" ;;
+  ""|help|-h|--help)
+    cat <<'EOF'
+cpu-ctl-14k — i5-14600K CPU 控制台（运行时软控制，重启回 BIOS 默认）
+
+  cpu-ctl-14k status --json        总览 JSON（dsh-console 用）
+  cpu-ctl-14k freq max 4G [spec]   限最高频率  spec: all|p|e|0-7,16
+  cpu-ctl-14k freq min 800M [spec] 锁最低频率（任意下限）
+  cpu-ctl-14k freq reset           恢复改动前的原始上/下限
+  cpu-ctl-14k gov performance      调速器（performance/powersave）
+  cpu-ctl-14k epp balance_performance  能效偏好
+  cpu-ctl-14k ecore off|on|list    一键下/上小核（cpu12-19）
+  cpu-ctl-14k core off|on <n>      单个逻辑核下/上线
+  cpu-ctl-14k ht on|off|status     超线程运行时直切（smt/control，立即生效无需重启）
+  cpu-ctl-14k bench [秒]           性能测试: 逐核单线程体质 ×3 轮 + 多核并行
+
+拓扑事实: 6 P 核在线(0,2,4,6,8,10)；小核 12-19 可运行时上/下线；
+超线程经 /sys/devices/system/cpu/smt/control 运行时直切（实测 on→12 线程、off→6 核，立即生效）。
+EOF
+    ;;
+  *) echo "未知命令: $1" >&2; exit 1 ;;
+esac

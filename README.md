@@ -30,6 +30,7 @@
 | **最近完成请求** | 逐请求真实 tok/s 表格。数据源双轨：vLLM 侧由 `dsh-logger-pkg` 插件写 `request-traces.jsonl`；SGLang 侧直接解析其日志与 metrics |
 | **硬件监视** | GPU 实时（利用率/显存/功耗/温度，异步采样+熔断保护）、PCIe 拓扑、CPU 详情、内存带宽（perf 可选）、磁盘 SMART/IO 走势 |
 | **基准测试** | 移植自 [bench-console v2.2.1](https://github.com/polyuij42-del/bench-console)（MIT）：单流解码（13/6 类提示词）· 并发档位扫描 · 预填充 TTFT，三种模式各自独立，测试期间 1s 实时折线，结果落盘 `bench-results/` 可 A/B 对比。UI 为独立页 `/bench.html`，主界面 iframe 懒加载 |
+| **CPU 控制** | 移植自 [bench-console/cpu-control](https://github.com/polyuij42-del/bench-console/tree/main/cpu-control)（MIT，已通用化适配同构 Xeon）：逐核上/下线（点瓦片）、任意上/下限锁频（首次改动自动记忆原始值，可一键恢复）、调速器、超线程运行时直切（`smt/control`）、一键恢复全部被下线核、逐核体质+多核并行性能测试。全部为运行时写 sysfs 的软控制，**重启回 BIOS/内核默认**。后端 `cpu-ctl` 脚本走 sudoers 固定路径白名单提权（`ops/install-cpu-ctl-127.sh`），API 挂 `/v1/internal/cpuctl*`（POST 受控制台口令拦截），UI 为独立页 `/cpu.html`，主界面 iframe 懒加载 |
 | **计费/能耗** | 按 token 计费台账（`billing-config.json`）、RAPL 功耗采样与电费估算（`energy-config.json`） |
 | **日志查看** | 网页内 tail vLLM/SGLang 启动日志，支持关键字过滤 |
 | **移动视图** | `/mobile.html` 精简只读面板 |
@@ -98,9 +99,11 @@ loginctl enable-linger $USER   # 无登录会话也常驻
 **仓库根目录 = 部署目录**（线上 `/home/ll/deploy` 的镜像）。server.js 用 `path.join(__dirname, ...)` 读同级运行时文件（`quickstart-presets.json`、`billing-config.json`、`console-auth.json`、`prompts/`、`bench-services.json`…），**请勿挪动这些文件的位置**，否则要同步改 server.js 常量。
 
 ```
-├── server.js                  # 控制台主体（约 9900 行：HTTP 服务 + 进程发现 + 指标解析 + 硬件采样 + bench 引擎）
+├── server.js                  # 控制台主体（约 9900 行：HTTP 服务 + 进程发现 + 指标解析 + 硬件采样 + bench 引擎 + cpuctl 接口）
 ├── index.html                 # 主控制台页（内联 JS，每次请求实时读盘+ETag，改完刷新即生效）
 ├── bench.html                 # 基准测试页（iframe 嵌入主界面「基准测试」标签）
+├── cpu.html                   # CPU 控制页（iframe 嵌入「CPU 控制」标签，后端调 cpu-ctl）
+├── cpu-ctl                    # CPU 运行时控制脚本（装到 /usr/local/bin，ops/install-cpu-ctl-127.sh 幂等安装+sudoers 白名单）
 ├── mobile.html                # 移动端只读视图
 ├── static/                    # 预编译 tailwind CSS、本地字体、Chart.js（全部本地托管，无 CDN 硬依赖）
 ├── prompts/                   # bench 提示词库（prompts13.json / prompts6.json，随便改）

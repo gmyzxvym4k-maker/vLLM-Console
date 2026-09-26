@@ -722,6 +722,7 @@
             <div class="nav-tab" onclick="switchTab('storage')">硬件监视</div>
             <div class="nav-tab" onclick="switchTab('usage')">用量统计</div>
             <div class="nav-tab" onclick="switchTab('bench')">基准测试</div>
+            <div class="nav-tab" onclick="switchTab('cpuctl')">CPU 控制</div>
         </div>
     </nav>
 
@@ -1712,6 +1713,18 @@
             <iframe id="benchFrame" title="Bench Console" style="width:100%;height:calc(100vh - 200px);min-height:640px;border:1px solid var(--border);border-radius:14px;background:var(--bg-card)"></iframe>
         </div>
 
+        <!-- ==================== CPU 控制（移植 bench-console/cpu-control · 独立页 /cpu.html） ==================== -->
+        <div id="tab-cpuctl" class="tab-content hidden">
+            <div class="dash-header">
+                <div class="dash-title">CPU 控制</div>
+                <div class="dash-meta">
+                    <span style="font-size:12px;color:var(--text-tertiary)">运行时软控制 sysfs · 逐核上/下线 / 锁频 / 调速器 / 超线程 / 性能测试 · 重启回默认</span>
+                    <button class="btn" onclick="reloadCpuFrame()">重载页面</button>
+                </div>
+            </div>
+            <iframe id="cpuFrame" title="CPU Control" style="width:100%;height:calc(100vh - 200px);min-height:640px;border:1px solid var(--border);border-radius:14px;background:var(--bg-card)"></iframe>
+        </div>
+
     </main>
 
     <footer style="border-top:1px solid var(--border);margin-top:40px;padding:20px 0;text-align:center;font-size:12px;color:var(--text-tertiary)">
@@ -1841,9 +1854,10 @@ function switchTab(tab) {
     document.getElementById('tab-' + tab).classList.remove('hidden');
     // Find and activate the correct tab
     const tabs = document.querySelectorAll('.nav-tab');
-    const map = { dashboard: 0, models: 1, energy: 2, storage: 3, usage: 4, bench: 5 };
+    const map = { dashboard: 0, models: 1, energy: 2, storage: 3, usage: 4, bench: 5, cpuctl: 6 };
     if (tabs[map[tab]]) tabs[map[tab]].classList.add('active');
     if (tab === 'bench') initBenchTab();
+    if (tab === 'cpuctl') initCpuTab();
     if (tab === 'dashboard' && isConnected) refreshDashboard();
     if (tab === 'models') { loadVllmLogs(); loadModels(); loadQuickStart(); if (autoRefreshLogs && !logRefreshInterval) logRefreshInterval = setInterval(loadVllmLogs, 2000); }
     if (tab === 'energy') startEnergyPolling();
@@ -1861,6 +1875,17 @@ function initBenchTab() {
 function reloadBenchFrame() {
     const f = document.getElementById('benchFrame');
     if (f) f.setAttribute('src', '/bench.html?r=' + Date.now());
+}
+
+// ====== CPU 控制标签（移植 bench-console/cpu-control，内嵌 /cpu.html，后端见 server.js CPU CTL 模块） ======
+// 懒加载口径同 bench：首次激活才拉页；页内 5s 轮询自带后台门控，来回切标签不重复起定时器。
+function initCpuTab() {
+    const f = document.getElementById('cpuFrame');
+    if (f && !f.getAttribute('src')) f.setAttribute('src', '/cpu.html');
+}
+function reloadCpuFrame() {
+    const f = document.getElementById('cpuFrame');
+    if (f) f.setAttribute('src', '/cpu.html?r=' + Date.now());
 }
 
 function updateTimestamp() {
@@ -3785,7 +3810,7 @@ function startConfigDefaults(modelName, suggestPort, suggestGpu) {
             mtp: smd.mtp === '1' ? '1' : '0', dflash: '0', dspark: '0', mtpTokens: smd.mtpTokens || 6,
             kvCacheQuant: 'auto', retention: '', runtime: 'vllm',
             // [kvoff-toggle 09-22][sync 09-23] 脚本化模型（Flash-Next W4A16）：二级缓存=生产现状（开，96GiB，c5a 后命中已通）
-            kvOff: '1', kvOffGiB: Number(smd.kvOffGiB) || 96,
+            kvOff: '0', kvOffGiB: Number(smd.kvOffGiB) || 96, // 0929 A/B 定案：缺省关
             // [ple-field 0923] PLE 表精度=生产现状（INT8 磁盘驻留；选 BF16 则下发 FN_PLE_INT8=0）
             pleInt8: '1',
             // [ple-loc 0923][sync 09-23] 生产=heap：大 pinned 二级层会挤压页缓存，disk 模式有 09-19 缺页拖垮 decode 的事故模式；heap 匿名堆免疫此压力

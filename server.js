@@ -1182,8 +1182,30 @@ function kvOffloadCapacityBytes(pid) {
     return b;
   } catch (err) { return 0; }
 }
+// [kvoff-mem 09-27] CPU KV 二级缓存的「物理驻留」真值：本机 /dev/shm 只被 vLLM
+// offload 使用（kvoff 共享区 mmap 建在 tmpfs 上，实测 68.9GB ≈ 配置 64GiB），
+// statfs 直读 tmpfs 已用字节——无需 root、不 spawn 子进程、口径即取即真。
+// 注意：这是整机 tmpfs 用量，多实例共享同一 /dev/shm 时不可按实例切分。
+function kvOffloadShmUsage() {
+  try {
+    const st = fs.statfsSync('/dev/shm');
+    const unit = st.bsize;
+    const total = st.blocks * unit;
+    const used = Math.max(0, (st.blocks - st.bavail) * unit);
+    return {
+      used_gb: +(used / 1073741824).toFixed(2),
+      total_gb: +(total / 1073741824).toFixed(1),
+      used_pct: total > 0 ? +(used / total * 100).toFixed(1) : 0,
+    };
+  } catch (e) { return null; }
+}
 // 汇总各 vLLM 实例的 CPU KV 二级缓存状态（数据来自 ticker 每秒 /metrics 采样）。
-// 返回 [{port, gpu, gpus, model, capacity_gb, fill_gb, fill_pct, stored_gb, loaded_gb}]。
+// [kvoff-live 09-27] 常驻口径：**每个受管实例都出条目**（含未启用项），前端才能把
+// 「二级缓存·CPU」卡常驻显示；此前未启用 / 引擎刚起还没采到指标时条目为空 →
+// 前端 kv_offload_ports=[] → 整卡 display:none 消失。
+// 返回 [{port, gpu, gpus, model, enabled, metric_kind, capacity_gb, fill_gb, fill_pct,
+//        write_pct, read_pct, stored_gb, loaded_gb, ext_tokens, load_count, store_count,
+//        queries, hits, hit_rate}]。
 function kvOffloadPortsInfo() {
   const out = [];
   try {
@@ -1191,25 +1213,35 @@ function kvOffloadPortsInfo() {
     for (const inst of listVllmInstances()) {
       const tk = global.__tokTickers && global.__tokTickers.get(inst.port);
       const kv = tk && tk.kvOffload;
-      if (!kv) continue;
       const capBytes = kvOffloadCapacityBytes(inst.pid);
       out.push({
         port: inst.port,
         gpu: inst.gpu,
         gpus: inst.gpus || (inst.gpu != null ? [inst.gpu] : []),
         model: inst.servedName || inst.modelPath || '',
+        // 已启用判据：/metrics 已出现 kv_offload 指标，或 cmdline 已配 cpu_bytes_to_use
+        // （引擎加载窗口内指标尚未暴露，但配置已定 → 前端显示「已启用 · 等待指标」）
+        enabled: !!(kv || capBytes),
         // [kvoff-0300 0930] fill=旧栈真实驻留占比；usage=新栈「被在飞传输钉住」占比
-        metric_kind: kv.metricKind || 'fill',
+        metric_kind: kv ? (kv.metricKind || 'fill') : null,
         capacity_gb: capBytes ? +(capBytes / gib).toFixed(2) : null,
         // usage 口径换算成 GiB 会冒充驻留量 → 只有 fill 口径才给 fill_gb
-        fill_gb: (capBytes && kv.metricKind !== 'usage') ? +(kv.fillPerc * capBytes / gib).toFixed(2) : null,
-        fill_pct: +(kv.fillPerc * 100).toFixed(1),
-        stored_gb: +(kv.storedBytes / gib).toFixed(2),
-        loaded_gb: +(kv.loadedBytes / gib).toFixed(2),
+        fill_gb: (capBytes && kv && kv.metricKind !== 'usage') ? +(kv.fillPerc * capBytes / gib).toFixed(2) : null,
+        fill_pct: kv ? +(kv.fillPerc * 100).toFixed(1) : 0,
+        // 新栈另有写/读两侧的在飞占比（write=GPU→CPU 传输中，read=CPU→GPU 回载中）
+        write_pct: (kv && kv.writePerc != null) ? +(kv.writePerc * 100).toFixed(1) : null,
+        read_pct: (kv && kv.readPerc != null) ? +(kv.readPerc * 100).toFixed(1) : null,
+        stored_gb: kv ? +(kv.storedBytes / gib).toFixed(2) : 0,
+        loaded_gb: kv ? +(kv.loadedBytes / gib).toFixed(2) : 0,
         // [kvoff-hit 09-22] 命中真值（自实例启动累计）：回载 token / 回载与写入次数
-        ext_tokens: Math.round(kv.extTokens || 0),
-        load_count: Math.round(kv.loadCount || 0),
-        store_count: Math.round(kv.storeCount || 0),
+        ext_tokens: kv ? Math.round(kv.extTokens || 0) : 0,
+        load_count: kv ? Math.round(kv.loadCount || 0) : 0,
+        store_count: kv ? Math.round(kv.storeCount || 0) : 0,
+        // [kvoff-live 09-27] OffloadingConnector 二级缓存查询/命中（external_prefix_cache_*）：
+        // 与 ext_tokens 互补——前者看「查了多少次、命中几次」，后者看「免重算 token 量」。
+        queries: kv ? Math.round(kv.queries || 0) : 0,
+        hits: kv ? Math.round(kv.hits || 0) : 0,
+        hit_rate: (kv && kv.queries > 0) ? +(kv.hits / kv.queries * 100).toFixed(1) : null,
       });
     }
   } catch (e) {}
@@ -1293,6 +1325,12 @@ function samplePortMetrics(port) {
               tk.kvOffload = {
                 metricKind: fillKey ? 'fill' : 'usage',
                 fillPerc: (fillKey ? m[fillKey] : m[usageKey]) || 0,
+                // [kvoff-live 09-27] 新栈写/读两侧在飞占比 + 二级缓存查询/命中计数
+                // （旧栈无这些族 → 0，前端按 null 处理不当真值显示）
+                writePerc: plain('vllm:kv_offload_cpu_cache_write_usage_perc'),
+                readPerc: plain('vllm:kv_offload_cpu_cache_read_usage_perc'),
+                queries: counterTotal(m, 'vllm:external_prefix_cache_queries_total'),
+                hits: counterTotal(m, 'vllm:external_prefix_cache_hits_total'),
                 storedBytes: pick('vllm:kv_offload_store_bytes_total', 'vllm:kv_offload_total_bytes_total', 'GPU_to_CPU'),
                 loadedBytes: pick('vllm:kv_offload_load_bytes_total', 'vllm:kv_offload_total_bytes_total', 'CPU_to_GPU'),
                 // [kvoff-hit 09-22] 命中真值：connector 回载的 prompt token（免重算部分，
@@ -9596,6 +9634,8 @@ const server = http.createServer(async (req, res) => {
             sg.cache_per_port = perPortCacheStats();
             // [kvoff-display 09-22] SGLang 主分支同样输出（18420 这类 vLLM 从实例也要显示）
             sg.kv_offload_ports = kvOffloadPortsInfo();
+            // [kvoff-live 09-27] 二级缓存物理驻留（/dev/shm tmpfs 已用），随 stats 常驻下发
+            sg.kv_offload_mem = kvOffloadShmUsage();
             // 0命中占比（vLLM+SGLang 双源，09-01 修复：此前仅 vLLM 分支调用，SGLang 主实例下恒缺失）
             try { const _zh = zeroHitStats(); if (_zh) sg.zero_hit = _zh; } catch (e) {}
             try {
@@ -9765,8 +9805,10 @@ const server = http.createServer(async (req, res) => {
 
           // 每 GPU 累计缓存命中率（各实例 ticker 累计计数器，独立于重置基线）
           result.cache_per_port = perPortCacheStats();
-          // [kvoff-display 09-22] 各 vLLM 实例 CPU KV 二级缓存状态（未开启的实例无条目）
+          // [kvoff-display 09-22] 各 vLLM 实例 CPU KV 二级缓存状态（含未启用条目，前端常驻显示）
           result.kv_offload_ports = kvOffloadPortsInfo();
+          // [kvoff-live 09-27] 二级缓存物理驻留（/dev/shm tmpfs 已用）
+          result.kv_offload_mem = kvOffloadShmUsage();
 
           // ====== Performance Benchmark Metrics (since last reset) ======
           // pp TPS：优先用 ticker 每秒实测的「未缓存预填充吞吐」（vLLM 每迭代

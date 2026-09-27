@@ -947,7 +947,7 @@
                     <div class="metric-item-hint" id="cacheDetails">--</div>
                     <div class="metric-item-value" id="cacheUsage" style="color:var(--green)">--</div>
                 </div>
-                <div class="metric-item" id="kvOffCard" style="display:none" title="CPU KV 二级缓存（vLLM OffloadingConnector）：旧栈（kvfill 补丁）=驻留 KV 量 / 内存档容量；官方 0.30.0 新栈无驻留 gauge，主值=已启用的内存档容量、小字为在飞钉住比例与累计写入/回载（数据源 vllm:kv_offload_*）">
+                <div class="metric-item" id="kvOffCard" title="CPU KV 二级缓存（vLLM OffloadingConnector）：旧栈（kvfill 补丁）=驻留 KV 量 / 内存档容量；官方 0.30.0 新栈无驻留 gauge，主值=内存档物理驻留（/dev/shm 实测）/ 容量，小字为在飞钉住比例、二级缓存查询命中与累计写入/回载（数据源 vllm:kv_offload_* + vllm:external_prefix_cache_*）。此卡常驻：引擎未运行或未配置二级缓存时显示对应状态">
                     <div class="metric-item-label" style="color:#22d3ee">二级缓存·CPU</div>
                     <div class="metric-item-hint" id="kvOffHint">--</div>
                     <div class="metric-item-value" id="kvOffValue" style="color:#22d3ee">--</div>
@@ -1817,7 +1817,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20260927-r2'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20260927-r3'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -2597,7 +2597,22 @@ async function _doRefreshDashboard() {
     // Stats
     try {
         const s = await apiFetch('/v1/internal/stats');
-        if (!s || Object.keys(s).length === 0) return; // 09-22：上游不可达时后端返回 {}，视为无数据跳过（避免用空对象刷掉卡片）
+        if (!s || Object.keys(s).length === 0) {
+            // 09-22：上游不可达时后端返回 {}，视为无数据跳过（避免用空对象刷掉卡片）。
+            // [kvoff-live 09-27] 但「二级缓存·CPU」卡要求常驻：这一窗口（引擎未运行 /
+            // 冷启动加载中）必须显式切成离线态，否则整轮跳过 → 卡片停在上一次的数字，
+            // 看上去像卡住了。文案与下方渲染块的离线分支保持一致，改一处要改两处。
+            try {
+                const _oc = document.getElementById('kvOffCard');
+                const _ov = document.getElementById('kvOffValue');
+                const _oh = document.getElementById('kvOffHint');
+                if (_oc) _oc.style.display = '';
+                if (_ov) _ov.innerHTML = '<span style="opacity:.6">--</span>';
+                if (_oh) _oh.textContent = '引擎未运行 / 加载中';
+                if (_oc) _oc.title = '未探测到 vLLM 实例（引擎未运行或冷启动加载中）\n加载完成后本卡会常驻显示内存档容量、物理驻留与二级缓存查询/命中';
+            } catch (e) {}
+            return;
+        }
         _modelInfoInstances = s.instances;
         renderModelInfo();
         try { updateHdrFromStats(s); } catch (e) {}
@@ -2676,46 +2691,81 @@ async function _doRefreshDashboard() {
         // 与「缓存命中」卡的 GPU 前缀命中（local_cache_hit）互补、不重叠。
         // [kvoff-0300 0930] 两栈口径：metric_kind=fill（旧栈自研镜像+kvfill 补丁）
         // 才有真实驻留占比 → 主值「驻留/容量」；metric_kind=usage（官方 0.30.0 新栈）
-        // 只有「被在飞传输钉住」的比例（官方文档口径）→ 主值改为「容量」，
-        // 钉住比例退到小字，避免把 pinned 误读成缓存塞满。
+        // 只有「被在飞传输钉住」的比例（官方文档口径）→ 钉住比例退到小字，
+        // 避免把 pinned 误读成缓存塞满。
+        // [kvoff-live 09-27] 常驻三态（用户要求本卡常驻，不再因无数据整卡消失）：
+        // 已启用（有 kv_offload 指标或 cmdline 已配容量）→ 数值；有实例但没配内存档 →
+        // 灰字「未启用」；一个实例都没探到（引擎未运行 / 冷启动加载中）→ 灰字「--」。
+        // 新栈无「驻留量」gauge，故单实例时主值取 /dev/shm 实测物理驻留
+        // （kv_offload_mem，本机 tmpfs 只有 vLLM offload 在用），口径写进 tooltip。
         {
             const _koCard = document.getElementById('kvOffCard');
             if (_koCard) {
-                const _koPorts = (s.kv_offload_ports || []).filter(p => p && (p.capacity_gb || p.metric_kind));
+                const _koAll = Array.isArray(s.kv_offload_ports) ? s.kv_offload_ports.filter(Boolean) : [];
+                const _koPorts = _koAll.filter(p => p.enabled || p.capacity_gb || p.metric_kind);
+                const _koMem = s.kv_offload_mem || null;
                 const _koVal = document.getElementById('kvOffValue');
                 const _koHint = document.getElementById('kvOffHint');
+                // 常驻：始终占位显示，不因无数据隐藏
+                _koCard.style.display = '';
+                const _koFmt = (n) => (typeof billingTokenFmt === 'function' ? billingTokenFmt(n) : Number(n).toLocaleString());
                 if (_koPorts.length) {
-                    _koCard.style.display = '';
                     const _isFill = _koPorts.every(p => (p.metric_kind || 'fill') === 'fill');
                     const _cap = _koPorts.reduce((n, p) => n + (p.capacity_gb || 0), 0);
                     const _fill = _koPorts.reduce((n, p) => n + (p.fill_gb || 0), 0);
                     const _sto = _koPorts.reduce((n, p) => n + (p.stored_gb || 0), 0);
                     const _loa = _koPorts.reduce((n, p) => n + (p.loaded_gb || 0), 0);
                     const _ext = _koPorts.reduce((n, p) => n + (p.ext_tokens || 0), 0);
-                    const _lc = _koPorts.reduce((n, p) => n + (p.load_count || 0), 0);
                     const _sc = _koPorts.reduce((n, p) => n + (p.store_count || 0), 0);
+                    const _qry = _koPorts.reduce((n, p) => n + (p.queries || 0), 0);
+                    const _hit = _koPorts.reduce((n, p) => n + (p.hits || 0), 0);
                     const _capTxt = _cap > 0 ? (_cap >= 1 ? _cap.toFixed(0) : _cap.toFixed(1)) : '--';
                     const _pct = _isFill
                         ? (_cap > 0 ? (_fill / _cap * 100).toFixed(0) : '--')
                         : (_koPorts.reduce((n, p) => n + (p.fill_pct || 0), 0) / _koPorts.length).toFixed(0);
-                    if (_koVal) _koVal.innerHTML = _isFill
-                        ? _fill.toFixed(1) + '<span class="metric-item-unit">/' + _capTxt + ' GiB</span>'
-                        : (_cap > 0 ? _capTxt + '<span class="metric-item-unit"> GiB · 已启用</span>'
-                                    : '已启用<span class="metric-item-unit"> 容量未知</span>');
-                    if (_koHint) _koHint.textContent = (_isFill ? '驻留 ' : '钉住 ') + _pct + '% · 命中 ' + (typeof billingTokenFmt === 'function' ? billingTokenFmt(_ext) : _ext.toLocaleString()) + ' tok · 存 ' + _sto.toFixed(0) + '/载 ' + _loa.toFixed(1) + ' GiB';
-                    if (_koCard) _koCard.title = _koPorts.map(p => {
+                    // 新栈驻留真值：单实例时 /dev/shm 已用量即该实例内存档占用（多实例时不可切分，退回容量口径）
+                    const _memG = (!_isFill && _koPorts.length === 1 && _koMem && _koMem.used_gb > 0.05) ? _koMem.used_gb : null;
+                    // 主值已用 /dev/shm 实测驻留时，小字的百分比是「在飞钉住」而非驻留，标签必须区分
+                    const _rTag = _isFill ? '驻留' : (_memG != null ? '在飞' : '钉住');
+                    if (_koVal) {
+                        if (_isFill) _koVal.innerHTML = _fill.toFixed(1) + '<span class="metric-item-unit">/' + _capTxt + ' GiB</span>';
+                        else if (_memG != null && _cap > 0) _koVal.innerHTML = _memG.toFixed(1) + '<span class="metric-item-unit">/' + _capTxt + ' GiB</span>';
+                        else if (_cap > 0) _koVal.innerHTML = _capTxt + '<span class="metric-item-unit"> GiB · 已启用</span>';
+                        else _koVal.innerHTML = '已启用<span class="metric-item-unit"> 容量未知</span>';
+                    }
+                    if (_koHint) {
+                        const _hp = [_rTag + ' ' + _pct + '%'];
+                        if (_qry > 0) _hp.push('查 ' + _koFmt(_qry) + '/中 ' + _koFmt(_hit));
+                        else if (_ext > 0) _hp.push('命中 ' + _koFmt(_ext) + ' tok');
+                        _hp.push('存 ' + _sto.toFixed(1) + ' GiB');
+                        _koHint.textContent = _hp.join(' · ');
+                    }
+                    _koCard.title = _koPorts.map(p => {
                         const _k = p.metric_kind || 'fill';
                         const _stat = _k === 'fill'
                             ? '驻留 ' + (p.fill_gb || 0).toFixed(1) + '/' + (p.capacity_gb || 0).toFixed(0) + ' GiB（' + (p.fill_pct || 0).toFixed(1) + '%）'
                             : '容量 ' + (p.capacity_gb || 0).toFixed(0) + ' GiB · 在飞钉住 ' + (p.fill_pct || 0).toFixed(1) + '%（钉住≠驻留量）';
-                        return ('GPU' + (p.gpus && p.gpus.length > 1 ? p.gpus.join('+') : (p.gpu != null ? p.gpu : '?'))) + ' :' + (p.model || p.port) +
+                        return ('GPU' + (p.gpus && p.gpus.length > 1 ? p.gpus.join('+') : (p.gpu != null ? p.gpu : '?'))) + ' :' + (p.model || p.port || '?') +
                             ' ' + _stat +
+                            ' 二级缓存查询 ' + (p.queries || 0).toLocaleString() + ' 次 / 命中 ' + (p.hits || 0).toLocaleString() + ' 次' +
+                            (p.hit_rate != null ? '（' + p.hit_rate + '%）' : '') +
                             ' 回载命中 ' + (p.ext_tokens || 0).toLocaleString() + ' tok / ' + (p.load_count || 0) + ' 次' +
                             ' 累计存 ' + (p.stored_gb || 0).toFixed(1) + ' GiB / ' + (p.store_count || 0) + ' 次';
-                    }).join('\n') + '\n命中=CPU→GPU 回载免重算的 prompt token（与 GPU 前缀缓存命中互补）\n存=GPU→CPU 累计写入（含被驱逐的重复写入）；次=传输任务数'
-                        + (_isFill ? '' : '\n钉住=上游 cpu_cache_usage_perc 口径：被在飞传输占住的 CPU 档比例，非已存数据量（本栈无驻留 gauge）');
+                    }).join('\n')
+                        + (_memG != null ? '\n驻留主值 = /dev/shm（tmpfs）实测已用 ' + _koMem.used_gb.toFixed(1) + ' GiB / ' + _koMem.total_gb + ' GiB（本机 tmpfs 仅 vLLM offload 使用，单实例口径）' : '')
+                        + '\n命中=CPU→GPU 回载免重算的 prompt token（与 GPU 前缀缓存命中互补）\n存=GPU→CPU 累计写入（含被驱逐的重复写入）；次=传输任务数'
+                        + (_isFill ? '' : '\n钉住=上游 cpu_cache_usage_perc 口径：被在飞传输占住的 CPU 档比例，非已存数据量（本栈无驻留 gauge，主值改用 /dev/shm 实测）');
+                } else if (_koAll.length) {
+                    // 有受管实例但引擎没配内存档 → 常驻灰态，明确「未启用」而不是让卡消失
+                    if (_koVal) _koVal.innerHTML = '<span style="opacity:.65">未启用</span>';
+                    if (_koHint) _koHint.textContent = '未配置内存档';
+                    _koCard.title = _koAll.map(p => ('GPU' + (p.gpus && p.gpus.length > 1 ? p.gpus.join('+') : (p.gpu != null ? p.gpu : '?'))) + ' :' + (p.model || p.port || '?'))
+                        .join('\n') + '\n该实例未启用 CPU KV 二级缓存（OffloadingConnector / --kv-transfer-config 未配置）\n在「模型启动」页可开启「二级缓存（CPU KV offload）」并设置容量';
                 } else {
-                    _koCard.style.display = 'none';
+                    // 一个受管实例都没探到：引擎未运行或冷启动加载中（启动期间进程尚未就绪）
+                    if (_koVal) _koVal.innerHTML = '<span style="opacity:.6">--</span>';
+                    if (_koHint) _koHint.textContent = '引擎未运行 / 加载中';
+                    _koCard.title = '未探测到 vLLM 实例（引擎未运行或冷启动加载中）\n加载完成后本卡会常驻显示内存档容量、物理驻留与二级缓存查询/命中';
                 }
             }
         }

@@ -529,8 +529,12 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   note: '\u5bb9\u5668\u955c\u50cf PP2 \u811a\u672c\u542f\u52a8\uff08W4A16-AutoRound\uff0c\u5b98\u65b9\u624b\u518c \u00a74\uff09\uff0c\u52a0\u8f7d\u7ea6 3~9 \u5206\u949f',
   base: {
     maxModelLen: 262144, gpuMemUtil: 0.95, maxNumSeqs: 4, maxBatchedTokens: 8192,
-    blockSize: 1616, temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-    presencePenalty: 0.1, repetitionPenalty: 1.05, pp: 2, mtpTokens: 4,
+    // [gen-default 0927] 采样基准按用户定档改为 t1.0 / p0.95 / k20 / minp0 / pp0 / rp1.0。
+    // base 同时是「弹窗默认值」与「是否下发 FN_GENCFG 的比较基准」，因此两套栈的 inner
+    // GENCFG_DEFAULT 必须与此逐字段一致（flash-next-w4a16-inner.sh / vllm-0300/bin/flash-next-0300-inner.sh），
+    // 否则会出现「弹窗显示 ≠ 引擎 cmdline 真值」。
+    blockSize: 1616, temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+    presencePenalty: 0, repetitionPenalty: 1.0, pp: 2, mtpTokens: 4,
     // [kvoff-off 0929] 生产真值：二级缓存关（A/B 定案 21h 零外部命中，省 107GB pinned）；
     // PLE=INT8+heap（匿名堆 49.2GB，不受 pinned 挤压页缓存影响，disk 模式与
     // 大 pinned 层共存有缺页拖垮 decode 的结构性风险，见 09-19 事故模式）。
@@ -651,7 +655,8 @@ function scriptModelDefaults(sm) {
     maxSeqs: b.maxNumSeqs, gpuMemUtil: b.gpuMemUtil, maxBatchedTokens: b.maxBatchedTokens,
     blockSize: b.blockSize, temperature: b.temperature, topP: b.topP, topK: b.topK,
     minP: b.minP, presencePenalty: b.presencePenalty, repetitionPenalty: b.repetitionPenalty,
-    thinking: '1', thinkingEffort: 'medium', kvCacheQuant: 'auto', retention: '',
+    // [gen-default 0927] 思考深度缺省 xhigh（启动页默认；脚本模型经 FN_CHATKWARGS 真下发到引擎）
+    thinking: '1', thinkingEffort: 'xhigh', kvCacheQuant: 'auto', retention: '',
     // [mtp-default 0923] 投机缺省=生产现状：W4A16 档 MTP4 实测稳定（09-19：接受长度 2.84、
     // decode 111 tok/s、无乱码；block-size 1616 下合法档 1~4 与 9~12，5~8 启动即崩），
     // 故弹窗默认选中「MTP」并带出生产档位 mtpTokens（base=4）。NVFP4 档保持关闭：
@@ -864,8 +869,25 @@ function scriptModelLaunchPlan(sm, d) {
     gen.min_p === b.minP && gen.presence_penalty === b.presencePenalty &&
     gen.repetition_penalty === b.repetitionPenalty;
   if (!genSame) env.FN_GENCFG = JSON.stringify(gen);
-  // 思考模式：'1'（默认）= 不传（用模型模板默认）；'0' = 显式关闭
-  if (String(d.thinking) === '0') env.FN_CHATKWARGS = JSON.stringify({ enable_thinking: false });
+  // [gen-default 0927] 思考模式下发 reasoning_effort。此前 thinking='1' 什么都不传 →
+  // 弹窗「思考深度」对脚本化模型静默失效（旧栈 inner 也不消费 FN_CHATKWARGS，已一并补）。
+  // Flash-Next 的 chat_template.jinja 只接受 xhigh / medium / low（模板缺省=xhigh，见该文件
+  // 47~50 行），传别的值会在推理时 raise_exception ⇒ 白名单外一律不下发该键并给出警告。
+  const effortIn = String(d.thinkingEffort || '').trim().toLowerCase();
+  if (String(d.thinking) === '0') {
+    env.FN_CHATKWARGS = JSON.stringify({ enable_thinking: false });
+  } else {
+    const kw = { enable_thinking: true, preserve_thinking: true };
+    if (effortIn === '' || effortIn === 'xhigh') {
+      kw.reasoning_effort = 'xhigh';   // 启动页默认；与模板缺省同值，显式写出保证「显示即真值」
+    } else if (effortIn === 'medium' || effortIn === 'low') {
+      kw.reasoning_effort = effortIn;
+    } else {
+      warnings.push(`思考深度「${effortIn}」不是 Flash-Next 模板支持的档位（仅 xhigh / medium / low），`
+        + '本次不下发 reasoning_effort，引擎按模板缺省 xhigh 运行。');
+    }
+    env.FN_CHATKWARGS = JSON.stringify(kw);
+  }
   // 投机：MTP 可用但本镜像 PP2 下不稳；DFlash/DSpark 无对应草稿 ckpt
   if (String(d.mtp) === '1') {
     const n = int(d.mtpTokens, b.mtpTokens || 6);
@@ -1176,8 +1198,11 @@ function kvOffloadPortsInfo() {
         gpu: inst.gpu,
         gpus: inst.gpus || (inst.gpu != null ? [inst.gpu] : []),
         model: inst.servedName || inst.modelPath || '',
+        // [kvoff-0300 0930] fill=旧栈真实驻留占比；usage=新栈「被在飞传输钉住」占比
+        metric_kind: kv.metricKind || 'fill',
         capacity_gb: capBytes ? +(capBytes / gib).toFixed(2) : null,
-        fill_gb: capBytes ? +(kv.fillPerc * capBytes / gib).toFixed(2) : null,
+        // usage 口径换算成 GiB 会冒充驻留量 → 只有 fill 口径才给 fill_gb
+        fill_gb: (capBytes && kv.metricKind !== 'usage') ? +(kv.fillPerc * capBytes / gib).toFixed(2) : null,
         fill_pct: +(kv.fillPerc * 100).toFixed(1),
         stored_gb: +(kv.storedBytes / gib).toFixed(2),
         loaded_gb: +(kv.loadedBytes / gib).toFixed(2),
@@ -1245,22 +1270,37 @@ function samplePortMetrics(port) {
           : uncachedTotal;
         tk.lastCacheCached = cacheCached;
         tk.lastCacheUncached = cacheUncached;
-        // [kvoff-display 09-22] CPU KV 二级缓存（vLLM OffloadingConnector 才有这些指标；
-        // fill_perc 由本地 kvfill 补丁暴露=内存档已用比例，usage_perc 是钉住传输比例，不用）。
+        // [kvoff-display 09-22] CPU KV 二级缓存（vLLM OffloadingConnector 才有这些指标）。
+        // [kvoff-0300 0930] 双栈兼容：官方 0.30.0 新栈只暴露上游原生
+        // cpu_cache_usage_perc（官方文档口径=「被在飞传输钉住」的比例，**不是**驻留占比），
+        // 且写入/回载序列变成无标签单值（store_bytes_total / load_size_count）；
+        // 旧栈（自研镜像 + kvfill 补丁）才是 cpu_cache_fill_perc（真实驻留占比）
+        // + 带 transfer_type 标签的 total_bytes_total / size_count。
+        // 两栈任一 gauge 在 = 二级缓存已启用，口径差异用 metricKind 透传给前端，
+        // 绝不把 usage 当驻留显示（否则会把「100% 被钉住」误读成「缓存塞满」）。
         tk.kvOffload = null;
         if (ns !== 'sglang') {
           try {
             const fillKey = Object.keys(m).find(k => k.startsWith('vllm:kv_offload_cpu_cache_fill_perc|'));
-            if (fillKey) {
+            const usageKey = Object.keys(m).find(k => k.startsWith('vllm:kv_offload_cpu_cache_usage_perc|'));
+            if (fillKey || usageKey) {
+              // 无标签单值序列（新栈）优先，回落带 transfer_type 标签的旧栈序列
+              const plain = (name) => {
+                for (const k of Object.keys(m)) { if (k === name || k.startsWith(name + '|')) return m[k] || 0; }
+                return 0;
+              };
+              const pick = (newName, oldName, tt) => plain(newName) || counterByLabel(m, oldName, 'transfer_type', tt);
               tk.kvOffload = {
-                fillPerc: m[fillKey] || 0,
-                storedBytes: counterByLabel(m, 'vllm:kv_offload_total_bytes_total', 'transfer_type', 'GPU_to_CPU'),
-                loadedBytes: counterByLabel(m, 'vllm:kv_offload_total_bytes_total', 'transfer_type', 'CPU_to_GPU'),
+                metricKind: fillKey ? 'fill' : 'usage',
+                fillPerc: (fillKey ? m[fillKey] : m[usageKey]) || 0,
+                storedBytes: pick('vllm:kv_offload_store_bytes_total', 'vllm:kv_offload_total_bytes_total', 'GPU_to_CPU'),
+                loadedBytes: pick('vllm:kv_offload_load_bytes_total', 'vllm:kv_offload_total_bytes_total', 'CPU_to_GPU'),
                 // [kvoff-hit 09-22] 命中真值：connector 回载的 prompt token（免重算部分，
-                // source=external_kv_transfer）+ 回载/写入次数（histogram _count 序列）
+                // source=external_kv_transfer）+ 回载/写入次数（新栈 _size_count 无标签、
+                // 旧栈 _size_count 带 transfer_type）
                 extTokens: counterBySource(m, 'vllm:prompt_tokens_by_source_total', 'external_kv_transfer'),
-                loadCount: counterByLabel(m, 'vllm:kv_offload_size_count', 'transfer_type', 'CPU_to_GPU'),
-                storeCount: counterByLabel(m, 'vllm:kv_offload_size_count', 'transfer_type', 'GPU_to_CPU'),
+                loadCount: pick('vllm:kv_offload_load_size_count', 'vllm:kv_offload_size_count', 'CPU_to_GPU'),
+                storeCount: pick('vllm:kv_offload_store_size_count', 'vllm:kv_offload_size_count', 'GPU_to_CPU'),
               };
             }
           } catch (e) {}
@@ -5487,7 +5527,8 @@ async function startVllmModel(modelName, params, callback) {
   // reasoning_effort：允许 low/medium/high/xhigh 及手动输入（字母/数字/下划线/连字符，最长 32）
   // 例如 qwen3.8-27b 支持 xhigh；非法/空值回落 medium
   const rawEffort = String(thinkingEffort || '').trim();
-  const effort = /^[a-zA-Z0-9_-]{1,32}$/.test(rawEffort) ? rawEffort : 'medium';
+  // [gen-default 0927] 空值=未填 → 用启动页默认 xhigh；填了但非法 → 保守回落 medium（不静默变最深档）
+  const effort = rawEffort === '' ? 'xhigh' : (/^[a-zA-Z0-9_-]{1,32}$/.test(rawEffort) ? rawEffort : 'medium');
   // MTP speculative steps: clamp to 1-8, default 3
   const mtpN = Math.min(8, Math.max(1, parseInt(mtpTokens) || 5));
   // 启用显卡数量：从 gpuId 起连续取 N 张卡，N>1 时启用多卡张量并行
@@ -6033,7 +6074,8 @@ async function startSglangModel(modelName, params, callback) {
   const { port, gpuId, gpuCount, parallelMode, gpuMemUtil, servedName, mtpTokens, kvCacheQuant, thinking, thinkingEffort } = params;
   // reasoning_effort：允许 low/medium/high/xhigh 及手动输入
   const rawEffort = String(thinkingEffort || '').trim();
-  const effort = /^[a-zA-Z0-9_-]{1,32}$/.test(rawEffort) ? rawEffort : 'medium';
+  // [gen-default 0927] 空值=未填 → 用启动页默认 xhigh；填了但非法 → 保守回落 medium（不静默变最深档）
+  const effort = rawEffort === '' ? 'xhigh' : (/^[a-zA-Z0-9_-]{1,32}$/.test(rawEffort) ? rawEffort : 'medium');
   const VENV = SGLANG_VENV;
 
   if (!fs.existsSync(path.join(VENV, 'bin', 'python'))) {
@@ -8103,13 +8145,67 @@ const server = http.createServer(async (req, res) => {
         if (filled) p.sampling_source = 'generation_config';
       } catch (e) {}
     }
-    // [ple-display 0923] PLE n-gram 表精度与驻留位置（Flash-Next 脚本化模型专属）。
-    // 数据源=inner 启动时打进日志的 [FN-PLE-*] 标记行：引擎进程属 root（chroot），
-    // /proc/<pid>/environ 读不了、cmdline 也不含该信息，日志是唯一可靠判据；
-    // 取文件尾部 2MB 窗口内最后一次命中 = 最近一次启动的模式（10s TTL 缓存，
-    // 前端 500ms 轮询不至于反复读 6MB 日志）。三种判据：
-    //   INT8 磁盘驻留(mmap 可回收) / INT8 内存驻留(匿名堆 48.3GiB, VLLM_PLE_INT8_MEMORY=1) /
-    //   BF16 磁盘驻留(mmap 零堆) / BF16 内存驻留(匿名堆 95.4GiB，含旧文案"回退 BF16 匿名堆")。
+    // [ple-display 0923→0930] PLE n-gram 表精度与驻留位置（Flash-Next 专属，两套栈都判）。
+    // 数据源=日志里的加载判据行，**绝不回读弹窗/FN_* 请求值**：官方 0.30.0 新栈没有
+    // INT8 与磁盘加载器（inner 只 export VLLM_PLE_CPU_OFFLOAD=1 ⇒ BF16 锁页一档），
+    // 旧栈的 FN_PLE_INT8/FN_PLE_LOC 在新栈是 NOOP（见 flash-next-0300-inner.sh NOOP_NOTE），
+    // 只有日志是"显示即真值"。引擎进程属 root（旧栈 chroot / 新栈 sudo），
+    // /proc/<pid>/environ 读不了、cmdline 也不含该信息。反向扫尾 64MB，最近一条判据行赢
+    // （= 本次启动的形态；重启进行中时新 echo 晚于上次引擎行，同样赢）。10s TTL 缓存，
+    // 前端 500ms 轮询不至于反复读日志。
+    // 精度：bf16 / int8 / fp16 / fp8；驻留四态：
+    //   disk   = mmap 页缓存（可回收）
+    //   heap   = 匿名堆（不可回收）
+    //   pinned = 锁页主机内存（cuMemHostRegister，不可回收且不可换出）← 0.30.0 新栈唯一档
+    //   gpu    = 显存驻留（VLLM_PLE_CPU_OFFLOAD=0，本机必 OOM，仅口径完备）
+    const pleGib = (line) => { const m = /(\d+(?:\.\d+)?)\s*GiB/.exec(line); return m ? parseFloat(m[1]) : null; };
+    const pleDtype = (s) => {
+      const x = String(s || '').toLowerCase();
+      if (/bfloat16|bf16/.test(x)) return 'bf16';
+      if (/float16|fp16|half/.test(x)) return 'fp16';
+      if (/int8/.test(x)) return 'int8';
+      if (/float8|fp8/.test(x)) return 'fp8';
+      return x.replace(/^torch\./, '') || null;
+    };
+    // 单行判据 → {dtype, loc, gib}；非判据行返回 null。顺序=信息量：引擎实建张量行
+    // 最权威（含自校验回落后的真实形态），其次分配行，最后 inner echo（启动意图，
+    // 覆盖"正在加载、引擎行还没写出来"的窗口）。
+    function matchPleLine(line) {
+      // —— 新栈（官方 vLLM 0.30.0 + rt-patch）——
+      // ① 引擎权威行：Initialized PLE embedding ... weight_dtype=torch.bfloat16,
+      //    weight_device=cpu, pinned=True   （ngram_embedding.py）
+      if (line.indexOf('Initialized PLE embedding') >= 0) {
+        const dt = pleDtype((/weight_dtype=([A-Za-z0-9_.]+)/.exec(line) || [])[1]);
+        const dev = (/weight_device=([A-Za-z0-9_.]+)/.exec(line) || [])[1] || 'cpu';
+        const loc = /^(cuda|gpu)/.test(dev) ? 'gpu' : (/pinned=True/.test(line) ? 'pinned' : 'heap');
+        return { dtype: dt || 'bf16', loc, gib: pleGib(line) };
+      }
+      // ② 分配行：[rt-patch] PLE pinned alloc: 95.368 GiB registered in 2 chunk(s)。
+      //    必须含 registered——">60 GiB tables go through chunked" 那条是能力提示行，不是实建。
+      if (line.indexOf('PLE pinned alloc:') >= 0 && line.indexOf('registered') >= 0) {
+        return { dtype: 'bf16', loc: 'pinned', gib: pleGib(line) };
+      }
+      // ③ 新栈 inner echo：[FN-0300] PLE 表：官方 BF16 锁页（pinned CPU 95.4 GiB…）
+      if (line.indexOf('[FN-0300] PLE') >= 0) {
+        return { dtype: 'bf16', loc: line.indexOf('显存') >= 0 ? 'gpu' : 'pinned', gib: pleGib(line) };
+      }
+      // —— 旧栈（自研镜像的 INT8 / 磁盘驻留加载器）——
+      if (line.indexOf('[FN-PLE-') < 0) return null;
+      // 引擎真值行（晚于 inner echo，反向先命中）
+      if (line.indexOf('[FN-PLE-INT8]') >= 0 && line.indexOf('n-gram table attached') >= 0) {
+        return { dtype: 'int8', loc: line.indexOf('anonymous heap') >= 0 ? 'heap' : 'disk', gib: pleGib(line) };
+      }
+      if (line.indexOf('[FN-PLE-INT8MEM]') >= 0) return { dtype: 'int8', loc: 'heap', gib: pleGib(line) };
+      if (line.indexOf('[FN-PLE-DISK]') >= 0 && line.indexOf('n-gram table attached') >= 0) {
+        return { dtype: pleDtype((/dtype=([A-Za-z0-9_.]+)/.exec(line) || [])[1]) || 'bf16', loc: 'disk', gib: pleGib(line) };
+      }
+      // inner echo 行（BF16 内存驻留无引擎挂载行，靠它判定；旧文案"回退 BF16 匿名堆"同归 heap）
+      if (line.indexOf('INT8 磁盘驻留') >= 0) return { dtype: 'int8', loc: 'disk', gib: pleGib(line) };
+      if (line.indexOf('INT8 内存驻留') >= 0) return { dtype: 'int8', loc: 'heap', gib: pleGib(line) };
+      if (line.indexOf('BF16 磁盘驻留') >= 0) return { dtype: 'bf16', loc: 'disk', gib: pleGib(line) };
+      if (line.indexOf('内存驻留') >= 0 || line.indexOf('匿名堆') >= 0) return { dtype: 'bf16', loc: 'heap', gib: pleGib(line) };
+      return null;
+    }
     function readPleStatusCached(logPath) {
       if (!logPath) return null;
       if (!global.__pleStatusCache) global.__pleStatusCache = new Map();
@@ -8132,16 +8228,17 @@ const server = http.createServer(async (req, res) => {
           const parts = (buf.toString('utf8') + carry).split('\n');
           carry = parts.shift() || '';                // 块首残句，并入下一（更早）块
           for (let i = parts.length - 1; i >= 0; i--) {
-            const line = parts[i];
-            if (line.indexOf('[FN-PLE-') < 0) continue;
-            // 引擎真值行（晚于 inner echo，反向先命中；含自校验回落后的实际形态）
-            if (line.indexOf('[FN-PLE-INT8]') >= 0 && line.indexOf('n-gram table attached') >= 0) { ple = { dtype: 'int8', loc: line.indexOf('anonymous heap') >= 0 ? 'heap' : 'disk' }; break scan; }
-            if (line.indexOf('[FN-PLE-DISK]') >= 0 && line.indexOf('n-gram table attached') >= 0) { ple = { dtype: 'bf16', loc: 'disk' }; break scan; }
-            // inner echo 行（heap 模式无引擎挂载行，靠它判定；旧文案"回退 BF16 匿名堆"同归 heap）
-            if (line.indexOf('INT8 磁盘驻留') >= 0) { ple = { dtype: 'int8', loc: 'disk' }; break scan; }
-            if (line.indexOf('INT8 内存驻留') >= 0) { ple = { dtype: 'int8', loc: 'heap' }; break scan; }
-            if (line.indexOf('BF16 磁盘驻留') >= 0) { ple = { dtype: 'bf16', loc: 'disk' }; break scan; }
-            if (line.indexOf('内存驻留') >= 0 || line.indexOf('匿名堆') >= 0) { ple = { dtype: 'bf16', loc: 'heap' }; break scan; }
+            const m = matchPleLine(parts[i]);
+            if (!m) continue;
+            if (!ple) {                               // 最新一条=主判据（定 dtype/loc）
+              ple = m;
+              if (ple.gib != null) break scan;        // 大小齐了，收工
+              continue;
+            }
+            // 主判据只缺大小（新栈①行不带 GiB）：往回第一条补上即可，
+            // 再往回就是上一次启动，不再跨启动合并。
+            if (ple.gib == null && m.gib != null) ple.gib = m.gib;
+            break scan;
           }
           pos = start2;
         }
@@ -8477,8 +8574,8 @@ const server = http.createServer(async (req, res) => {
               // 思考模式：thinking=1(默认) -> enable_thinking=true + reasoning_effort=<effort>
               // thinking=0 -> enable_thinking=false（非思考）
               thinking: data.thinking !== undefined ? data.thinking : '1',
-              // 思考深度：low / medium(默认) / high
-              thinkingEffort: data.thinkingEffort || 'medium',
+              // 思考深度：low / medium / high / xhigh（缺省 xhigh，与启动页默认一致）
+              thinkingEffort: data.thinkingEffort || 'xhigh',
               // KV 缓存量化：auto / fp8 / int8 / fp8_kv
               kvCacheQuant: data.kvCacheQuant || 'auto',
               // 高级参数（vLLM 0.27.1 实测存在的 flag；空值/未勾选不追加，行为与旧版一致）

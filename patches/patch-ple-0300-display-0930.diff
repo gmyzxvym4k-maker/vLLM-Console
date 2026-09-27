@@ -1,0 +1,105 @@
+--- /tmp/console-live/server.js.new	2026-09-27 08:25:29
++++ server.js	2026-09-27 08:20:08
+@@ -8121,13 +8121,67 @@
+         if (filled) p.sampling_source = 'generation_config';
+       } catch (e) {}
+     }
+-    // [ple-display 0923] PLE n-gram 表精度与驻留位置（Flash-Next 脚本化模型专属）。
+-    // 数据源=inner 启动时打进日志的 [FN-PLE-*] 标记行：引擎进程属 root（chroot），
+-    // /proc/<pid>/environ 读不了、cmdline 也不含该信息，日志是唯一可靠判据；
+-    // 取文件尾部 2MB 窗口内最后一次命中 = 最近一次启动的模式（10s TTL 缓存，
+-    // 前端 500ms 轮询不至于反复读 6MB 日志）。三种判据：
+-    //   INT8 磁盘驻留(mmap 可回收) / INT8 内存驻留(匿名堆 48.3GiB, VLLM_PLE_INT8_MEMORY=1) /
+-    //   BF16 磁盘驻留(mmap 零堆) / BF16 内存驻留(匿名堆 95.4GiB，含旧文案"回退 BF16 匿名堆")。
++    // [ple-display 0923→0930] PLE n-gram 表精度与驻留位置（Flash-Next 专属，两套栈都判）。
++    // 数据源=日志里的加载判据行，**绝不回读弹窗/FN_* 请求值**：官方 0.30.0 新栈没有
++    // INT8 与磁盘加载器（inner 只 export VLLM_PLE_CPU_OFFLOAD=1 ⇒ BF16 锁页一档），
++    // 旧栈的 FN_PLE_INT8/FN_PLE_LOC 在新栈是 NOOP（见 flash-next-0300-inner.sh NOOP_NOTE），
++    // 只有日志是"显示即真值"。引擎进程属 root（旧栈 chroot / 新栈 sudo），
++    // /proc/<pid>/environ 读不了、cmdline 也不含该信息。反向扫尾 64MB，最近一条判据行赢
++    // （= 本次启动的形态；重启进行中时新 echo 晚于上次引擎行，同样赢）。10s TTL 缓存，
++    // 前端 500ms 轮询不至于反复读日志。
++    // 精度：bf16 / int8 / fp16 / fp8；驻留四态：
++    //   disk   = mmap 页缓存（可回收）
++    //   heap   = 匿名堆（不可回收）
++    //   pinned = 锁页主机内存（cuMemHostRegister，不可回收且不可换出）← 0.30.0 新栈唯一档
++    //   gpu    = 显存驻留（VLLM_PLE_CPU_OFFLOAD=0，本机必 OOM，仅口径完备）
++    const pleGib = (line) => { const m = /(\d+(?:\.\d+)?)\s*GiB/.exec(line); return m ? parseFloat(m[1]) : null; };
++    const pleDtype = (s) => {
++      const x = String(s || '').toLowerCase();
++      if (/bfloat16|bf16/.test(x)) return 'bf16';
++      if (/float16|fp16|half/.test(x)) return 'fp16';
++      if (/int8/.test(x)) return 'int8';
++      if (/float8|fp8/.test(x)) return 'fp8';
++      return x.replace(/^torch\./, '') || null;
++    };
++    // 单行判据 → {dtype, loc, gib}；非判据行返回 null。顺序=信息量：引擎实建张量行
++    // 最权威（含自校验回落后的真实形态），其次分配行，最后 inner echo（启动意图，
++    // 覆盖"正在加载、引擎行还没写出来"的窗口）。
++    function matchPleLine(line) {
++      // —— 新栈（官方 vLLM 0.30.0 + rt-patch）——
++      // ① 引擎权威行：Initialized PLE embedding ... weight_dtype=torch.bfloat16,
++      //    weight_device=cpu, pinned=True   （ngram_embedding.py）
++      if (line.indexOf('Initialized PLE embedding') >= 0) {
++        const dt = pleDtype((/weight_dtype=([A-Za-z0-9_.]+)/.exec(line) || [])[1]);
++        const dev = (/weight_device=([A-Za-z0-9_.]+)/.exec(line) || [])[1] || 'cpu';
++        const loc = /^(cuda|gpu)/.test(dev) ? 'gpu' : (/pinned=True/.test(line) ? 'pinned' : 'heap');
++        return { dtype: dt || 'bf16', loc, gib: pleGib(line) };
++      }
++      // ② 分配行：[rt-patch] PLE pinned alloc: 95.368 GiB registered in 2 chunk(s)。
++      //    必须含 registered——">60 GiB tables go through chunked" 那条是能力提示行，不是实建。
++      if (line.indexOf('PLE pinned alloc:') >= 0 && line.indexOf('registered') >= 0) {
++        return { dtype: 'bf16', loc: 'pinned', gib: pleGib(line) };
++      }
++      // ③ 新栈 inner echo：[FN-0300] PLE 表：官方 BF16 锁页（pinned CPU 95.4 GiB…）
++      if (line.indexOf('[FN-0300] PLE') >= 0) {
++        return { dtype: 'bf16', loc: line.indexOf('显存') >= 0 ? 'gpu' : 'pinned', gib: pleGib(line) };
++      }
++      // —— 旧栈（自研镜像的 INT8 / 磁盘驻留加载器）——
++      if (line.indexOf('[FN-PLE-') < 0) return null;
++      // 引擎真值行（晚于 inner echo，反向先命中）
++      if (line.indexOf('[FN-PLE-INT8]') >= 0 && line.indexOf('n-gram table attached') >= 0) {
++        return { dtype: 'int8', loc: line.indexOf('anonymous heap') >= 0 ? 'heap' : 'disk', gib: pleGib(line) };
++      }
++      if (line.indexOf('[FN-PLE-INT8MEM]') >= 0) return { dtype: 'int8', loc: 'heap', gib: pleGib(line) };
++      if (line.indexOf('[FN-PLE-DISK]') >= 0 && line.indexOf('n-gram table attached') >= 0) {
++        return { dtype: pleDtype((/dtype=([A-Za-z0-9_.]+)/.exec(line) || [])[1]) || 'bf16', loc: 'disk', gib: pleGib(line) };
++      }
++      // inner echo 行（BF16 内存驻留无引擎挂载行，靠它判定；旧文案"回退 BF16 匿名堆"同归 heap）
++      if (line.indexOf('INT8 磁盘驻留') >= 0) return { dtype: 'int8', loc: 'disk', gib: pleGib(line) };
++      if (line.indexOf('INT8 内存驻留') >= 0) return { dtype: 'int8', loc: 'heap', gib: pleGib(line) };
++      if (line.indexOf('BF16 磁盘驻留') >= 0) return { dtype: 'bf16', loc: 'disk', gib: pleGib(line) };
++      if (line.indexOf('内存驻留') >= 0 || line.indexOf('匿名堆') >= 0) return { dtype: 'bf16', loc: 'heap', gib: pleGib(line) };
++      return null;
++    }
+     function readPleStatusCached(logPath) {
+       if (!logPath) return null;
+       if (!global.__pleStatusCache) global.__pleStatusCache = new Map();
+@@ -8150,16 +8204,17 @@
+           const parts = (buf.toString('utf8') + carry).split('\n');
+           carry = parts.shift() || '';                // 块首残句，并入下一（更早）块
+           for (let i = parts.length - 1; i >= 0; i--) {
+-            const line = parts[i];
+-            if (line.indexOf('[FN-PLE-') < 0) continue;
+-            // 引擎真值行（晚于 inner echo，反向先命中；含自校验回落后的实际形态）
+-            if (line.indexOf('[FN-PLE-INT8]') >= 0 && line.indexOf('n-gram table attached') >= 0) { ple = { dtype: 'int8', loc: line.indexOf('anonymous heap') >= 0 ? 'heap' : 'disk' }; break scan; }
+-            if (line.indexOf('[FN-PLE-DISK]') >= 0 && line.indexOf('n-gram table attached') >= 0) { ple = { dtype: 'bf16', loc: 'disk' }; break scan; }
+-            // inner echo 行（heap 模式无引擎挂载行，靠它判定；旧文案"回退 BF16 匿名堆"同归 heap）
+-            if (line.indexOf('INT8 磁盘驻留') >= 0) { ple = { dtype: 'int8', loc: 'disk' }; break scan; }
+-            if (line.indexOf('INT8 内存驻留') >= 0) { ple = { dtype: 'int8', loc: 'heap' }; break scan; }
+-            if (line.indexOf('BF16 磁盘驻留') >= 0) { ple = { dtype: 'bf16', loc: 'disk' }; break scan; }
+-            if (line.indexOf('内存驻留') >= 0 || line.indexOf('匿名堆') >= 0) { ple = { dtype: 'bf16', loc: 'heap' }; break scan; }
++            const m = matchPleLine(parts[i]);
++            if (!m) continue;
++            if (!ple) {                               // 最新一条=主判据（定 dtype/loc）
++              ple = m;
++              if (ple.gib != null) break scan;        // 大小齐了，收工
++              continue;
++            }
++            // 主判据只缺大小（新栈①行不带 GiB）：往回第一条补上即可，
++            // 再往回就是上一次启动，不再跨启动合并。
++            if (ple.gib == null && m.gib != null) ple.gib = m.gib;
++            break scan;
+           }
+           pos = start2;
+         }

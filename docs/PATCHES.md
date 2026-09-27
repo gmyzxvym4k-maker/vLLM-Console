@@ -87,6 +87,37 @@
 
 - `kvoff1-0923` / `kvoffdefault-0923` / `kvoffsync-0923`：预设里 KV offload 开关与内层脚本缺省值三方同步（此前切档只改预设不改进程）。
 
+### 2026-09-27 · 引擎换官方 0.30.0 栈后的控制台显示失配（两张卡同时哑掉）
+
+引擎从自研镜像（v0.1.dev20073 + KVOFF/PLE 补丁）换成官方 0.30.0 + rt-patch 后，控制台两处「按旧栈写死」的判据同时失配，且**都不报错**：
+
+| 症状 | 根因 | 落点 |
+|---|---|---|
+| 仪表盘「二级缓存·CPU」整卡不显示 | 启用判据只认旧栈 kvfill 的 `vllm:kv_offload_cpu_cache_fill_perc`；新栈只有上游 `vllm:kv_offload_cpu_cache_usage_perc`，写/读序列改无标签（`store_bytes_total`/`load_bytes_total`/`store_size_count`/`load_size_count`） | [`patches/patch-kvoff-0300-metric-0930.py`](../patches/patch-kvoff-0300-metric-0930.py) |
+| 「运行参数」不显示 PLE 精度/驻留两行 | PLE 判据只认旧栈 `[FN-PLE-*]` 日志行；新栈是 `Initialized PLE embedding ... pinned=True` 与 `[rt-patch] PLE pinned alloc: ... registered`（容量靠后者补） | [`patches/patch-ple-0300-display-0930.diff`](../patches/patch-ple-0300-display-0930.diff) |
+
+- 两处都用 `metric_kind` / 四态 `loc` 把**口径差异透传到前端**：新栈 `usage_perc` 是「被在飞传输钉住」而非「已存数据占比」，新栈 `pinned`（锁页，不可回收不可换出）也不同于旧栈 `heap`（匿名堆）。
+- 部署：`server.js` 打补丁后 `node --check` + 重启 `dsh-console`（`KillMode=process`，引擎不受影响，实测 pid 未变）；`index.html` 直接替换、刷新即生效。备份 `server.js.bak-kvoff0300-0930`、`server.js.bak-ple0300-0927`、`index.html.bak-*-0927`。
+- 页面版本戳 → `20260927-r1`。
+
+### 2026-09-27 · 启动页采样/思考默认定档（t1 / p0.95 / k20 / minp0 / rp1 + 思考 xhigh）
+
+用户定档：模型启动页默认 `temperature 1`、`top_p 0.95`、`top_k 20`、`min_p 0`、`repetition 1`、`presence_penalty 0`、思考深度 `xhigh`。这条链上有**四处真源**，漏任一处就会出现「弹窗显示 ≠ 引擎 cmdline 真值」（09-18/09-21/09-26 三次同病）：
+
+| 落点 | 改动 |
+|---|---|
+| `index.html` | 普通模型弹窗 `def.temperature` 0.7→1、输入框 `value="1"`；思考深度输入框 `value="xhigh"`、两处提交回落 `\|\| 'medium'`→`\|\| 'xhigh'`；脚本模型分支改为跟随后端 `smd.thinkingEffort`；tooltip 同步 |
+| `server.js` `SCRIPT_MODELS['qwen3.8-flash-next-w4a16'].base` | 采样基准 0.6/0.1/1.05 → 1.0/0/1.0。`base` 双重身份：既是脚本模型弹窗默认值（`scriptModelDefaults()`），又是「与基准相同则不下发 `FN_GENCFG`」的比较基准 |
+| `server.js` 思考深度校验 | `startVllmModel`/`startSglangModel` 空值回落 medium→xhigh（填了但非法仍保守回落 medium，不静默变最深档）；`scriptModelDefaults` 缺省 xhigh |
+| `server.js` `scriptModelLaunchPlan()` | **新增下发**：`thinking=1` 时 `FN_CHATKWARGS={enable_thinking,preserve_thinking,reasoning_effort}`。此前只有「关思考」才下发该键 → 弹窗「思考深度」对脚本化模型一直是摆设 |
+| 两套 inner 脚本 | `GENCFG_DEFAULT` 改定档值；旧栈（chroot）`flash-next-w4a16-inner.sh` 补上消费 `FN_CHATKWARGS`（新栈 `vllm-0300/bin/flash-next-0300-inner.sh` 本就支持） |
+
+- 补丁：[`patches/gendefault-0927.py`](../patches/gendefault-0927.py) —— 幂等、`--check` 预演、自动备份 `*.bak-gendefault-0927`、原子替换保权限，改完 `bash -n` 自检。
+- 档位依据：模型 `chat_template.jinja:47-50` 写的是 `reasoning_effort|default('xhigh')`，且**只接受 xhigh / medium / low**，其它值 `raise_exception`。所以「不下发」与「下发 xhigh」行为等价，显式下发只为运行参数卡显示即真值；白名单外的值 plan 层直接不下发并给警告。
+- 历史提醒：`0.6 / 0.1 / 1.05` 是 09-21 为治**循环复读**拍的板（09-19 实验：presence 给高了显著伤 MTP 接受率）。本次按用户要求回到模型原始档，若复读复发，回滚 = 恢复两份 `*.bak-gendefault-0927` + `git revert` 本次提交。
+- 生效范围：**下一次启动**。在跑的 18420 引擎未被重启，运行参数卡仍显示 0.6/0.1/1.05（那是引擎 cmdline 真值，不是显示 bug）。
+- 页面版本戳 → `20260927-r2`。
+
 ---
 
 ## B. `patches/` 目录逐个说明（对外部系统的补丁）
@@ -106,6 +137,9 @@
 | `patch-kvoffload-c3e-0923.py` | 09-23 | scheduler.py | 探针收口：`_sliding_window_lookup` 逐键结果扫描（实锤 idx=60/55 孤立 HIT → 存储端是稀疏键）。 |
 | `patch-kvoffload-c4-0923.py` | 09-23 | scheduler.py | **c4 真修 v2（最小改动）**：滑动窗口组在 GDN 对齐模式下，存储端每分段只留尾部检查点（稀疏键），而查找端 eagle 把 required_window 抬到 sw+1 并要求连续命中——稀疏键永远凑不出连续 2 → grp2 hit=0。修正查找端的连续性要求与窗口宽度。 |
 | `patch-kvoff-c5a.py` | 09-23 | scheduler.py | **根因修复**：解除 offloading 查找侧 eagle `+1/-1` 双罚。 |
+| `patch-kvoff-0300-metric-0930.py` | 09-27 | 控制台 server.js | 二级缓存卡双栈指标兼容（新栈 usage_perc + 无标签 store/load 序列），幂等/备份/`node --check`（见 A 类 09-27）。 |
+| `patch-ple-0300-display-0930.diff` | 09-27 | 控制台 server.js | PLE 精度/驻留双栈日志判据 + 驻留四态（disk/heap/pinned/gpu）；统一 diff，`patch -i ... /home/ll/deploy/server.js` 应用（见 A 类 09-27）。 |
+| `gendefault-0927.py` | 09-27 | 两套 inner 脚本 | 启动缺省定档：`GENCFG_DEFAULT` → t1.0/p0.95/k20/minp0/pp0/rp1.0，并让旧栈 inner 消费 `FN_CHATKWARGS`（见 A 类 09-27）。幂等 + `--check` + 自动备份 + `bash -n`。 |
 
 方法论备注（值得抄作业）：
 

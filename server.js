@@ -3876,19 +3876,21 @@ function lsIngestLine(r) {
   // 用本地接收时刻替换（样本时刻只影响窗口分母，替换后仍单调可用）
   const nowS = Date.now() / 1000;
   // 时钟偏差/链路延迟可观测（同机恒 ~tail+轮询延迟，正常 <1.5s；跨主机误配时
-  // skew/guardN 会说话）。口径：只算年龄 <3s 的进度行（排除完成行与首读回放的
-  // 积压），EWMA 滑动（历史累计均值会被启动回放锁死，失去哨兵意义）。
+  // skew/guardN 会说话）。口径：只算年龄 <3s 的进度行，EWMA 滑动。
   if (!r.f && Math.abs(t - nowS) < 3) {
     const d = Math.abs(t - nowS);
     m.skewEw = m.skewEw === null ? d : m.skewEw + 0.25 * (d - m.skewEw);
   }
-  if (Math.abs(t - nowS) > 600) m.guardN++;
-  const ts = Math.abs(t - nowS) > 600 ? nowS : t;
+  // 异常时钟/积压行（偏差>600s）：整行丢弃。旧版"替换为接收时刻"会制造
+  // 同一瞬间的假样本（回放场景撑爆 guard 计数、伪造 avg 尖峰的源头）。
+  if (Math.abs(t - nowS) > 600) { m.guardN++; return; }
+  const ts = t;
   let st = m.byRid.get(r.rid);
   if (!st) {
     st = {
       rid: r.rid, arrival: Number(r.a) || ts, g: 0, firstT: null,
       samples: [], done: false, doneAt: 0, lastLineT: ts, lastWall: Date.now(),
+      obsT: ts, g0: 0, // 观测基线：首见时 g 已>0（中途接管）→ avg 只算接管后的增量
     };
     m.byRid.set(r.rid, st);
   }
@@ -3898,7 +3900,10 @@ function lsIngestLine(r) {
   if (r.f) { st.done = true; st.doneAt = ts; }
   const g = Number(r.g) || 0;
   // gauge 只增不减；回退 = 引擎重启后 rid 复用（同 sid 内不会），忽略
-  if (g >= st.g) st.g = g;
+  if (g >= st.g) {
+    if (st.g === 0 && g > 0 && !r.pf && st.firstT === null) st.g0 = g; // 中途首见：基线抬到观测值
+    st.g = g;
+  }
   if (r.pf && st.firstT === null) st.firstT = ts; // 首 token 步
   if (st.g > 0 || r.f) {
     const last = st.samples[st.samples.length - 1];
@@ -3919,9 +3924,13 @@ function readLiveStream() {
   try {
     if (!S.lastStatAt || now - S.lastStatAt > 300) {
       const st = fs.statSync(LIVE_STREAM_PATH);
-      // 文件被 ring-trim 重写（变小）→ 偏移重置，只丢历史不丢当下
+      // 偏移策略：只跟随尾部，从不倒读历史（2026-09-28 修复"开局上千"根因之一）。
+      // 旧插件 ring-trim 是 truncate+全文件重写：轮询撞上清空窗口时 size 骤减，
+      // 若倒着读 2MB 会把几分钟历史行全量回放——时钟护栏把这些老 t 替换成
+      // "现在"，样本环被压扁到同一瞬间、st.g 直接顶到历史累计值 → avg 上千。
+      // 代价：trim/重启后 1~2s 内新绑定行滑窗暂缺（如实 --），换零伪造数值。
       if (S.byteOffset === undefined || st.size < S.byteOffset) {
-        S.byteOffset = Math.max(0, st.size - 2 * 1024 * 1024);
+        S.byteOffset = st.size;
         S.pending = '';
       }
       S.lastStat = st; S.lastStatAt = now;
@@ -4044,7 +4053,17 @@ function v3LastSec(st, nowMs) {
 // （avg_speed 分母自此精确）。
 function v3TouchRow(lv, st) {
   lv.tokens = st.g;
-  if (st.firstT) lv.decodeStart = Math.round(st.firstT * 1000);
+  if (st.firstT) {
+    lv.decodeStart = Math.round(st.firstT * 1000);
+    const den = (Date.now() - lv.decodeStart) / 1000;
+    lv.v3Avg = den >= 0.5 ? st.g / den : undefined; // 全程真均值（首token起算）
+  } else {
+    // 中途接管（pf 行未见，真实首token时刻未知）：全程均值退化为「接管后
+    // 观测窗均值」——增量/时长都有界，绝不再用引擎累计值除以观测零头秒。
+    lv.decodeStart = Math.round(st.obsT * 1000);
+    const den = (Date.now() / 1000 - st.obsT);
+    lv.v3Avg = den >= 0.5 ? Math.max(0, st.g - st.g0) / den : undefined;
+  }
   lv.v3seenAt = Date.now();
 }
 
@@ -4155,7 +4174,9 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
   const avgDecodeTime = reqDecodeCount > 0 ? (reqDecodeSum / reqDecodeCount) : 0;
 
   let totalSpeed = 0;
-  if (elapsedMs > 0 && genTokensTotal > lastGenTokensTotal) {
+  // 分母下限 300ms：主轮询 + 并发卡旁路 + 多标签页并存时 lastSnapshot.time
+  // 被交替推进，会撞出几十毫秒的碎窗，delta/碎窗 放大成上千假峰值（实测 4473）
+  if (elapsedMs >= 300 && genTokensTotal > lastGenTokensTotal) {
     const delta = genTokensTotal - lastGenTokensTotal;
     totalSpeed = (delta / elapsedMs) * 1000;
   }
@@ -5169,7 +5190,11 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
         started_at: live.startedAt,
         elapsed_s: Math.round(liveElapsed),
         tok_last_sec: tokLastSec,
-        avg_speed: liveElapsed > 0.5 ? parseFloat((live.tokens / Math.max(avgDenom, 0.5)).toFixed(1)) : 0,
+        // v3 行：全程均值用 v3Avg（firstT 未知时自动退化为接管后窗口均值，
+        // 分子分母同窗）；非 v3 行沿用 tokens/decodeElapsed 原式。
+        avg_speed: (reqPhase === 'decode' && live.v3Avg !== undefined && live.v3Avg !== null)
+          ? parseFloat(live.v3Avg.toFixed(1))
+          : (liveElapsed > 0.5 ? parseFloat((live.tokens / Math.max(avgDenom, 0.5)).toFixed(1)) : 0),
         // 行级瞬时输出速度（09-15c）：绑定到代理 tee 流的行显示自己实测值，
         // 未绑定的 decode 行显示残差分摊值；前端既有契约优先显示此字段并标
         // 「近3s tok/s」，undefined 时回落 avg_speed 历史均值。

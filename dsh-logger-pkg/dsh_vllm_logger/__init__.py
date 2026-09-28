@@ -187,7 +187,11 @@ class DshRequestLogger(StatLoggerBase):  # type: ignore[misc]
         try:
             with open(self.stream_path, "a", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
-            self._trim(self.stream_path, 40000)
+            # keep_lines 必须使 保留字节 < MAX_BYTES，否则 trim 永远压不回阈值
+            # → 每次 stat 超限都全量重写（旧值 40000 行≈5MB>2MB，实测每 4~5s
+            # 同步重写 6MB，卡本进程事件循环 → SSE 周期抖动）。12000×~125B
+            # ≈1.5MB<2MB，60s+ 历史仍远超控制台 12s 测速窗。
+            self._trim(self.stream_path, 12000)
         except Exception:
             pass
 

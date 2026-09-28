@@ -2029,6 +2029,38 @@ function gqCellHead(taskId, label) {
     if (!chip && !right) return '';
     return '<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:2px">' + chip + right + '</div>';
 }
+// v3 口径显示单一真源：按 speed_src 分派 {label,tip,share,exact,has3s}。
+// 主卡/GPU 排队卡/未来任何渲染器都走这里，新增降级源只改一处。
+// share=真值不可得（实例吞吐按行分摊/估算）→ 标签必须带「分摊」、数值取整。
+function spdMeta(r) {
+    const src = String((r && r.speed_src) || '');
+    const has3s = !!(r && r.avg_speed_3s !== undefined && r.avg_speed_3s !== null);
+    const v3 = (src === 'v3' || src === 'v3-exact');
+    const share = (src === 'v2-hist' || src === 'residual' || src === 'share');
+    let label, tip;
+    if (v3) {
+        label = has3s ? '实时 tok/s·实测' : '全程均值 tok/s';
+        tip = src === 'v3-exact'
+            ? '引擎每步输出真值流·精确绑定（本请求自身样本滑窗差分，MTP 含投机接受；排队/停顿期如实不出数）'
+            : '引擎每步输出真值流·每请求实测（数值即该请求 rid 真值；行↔请求按到达时间配对，只影响标签归属不影响数值）';
+        if (!has3s) tip += '——滑窗未成熟（decode 起步约 1.5~2s），当前为全程精确实测均值';
+    } else if (share) {
+        label = has3s ? '实时 tok/s·分摊' : '全程均值 tok/s';
+        tip = '估算：实例生成吞吐 ÷ 并发输出行数（该实例无每请求实时数据源，各输出行同值，非个体实测）';
+    } else if (src === 'v2-exact' || src === 'v2-nearest' || src === 'v2-eng') {
+        label = has3s ? '实时 tok/s·实测' : '全程均值 tok/s';
+        tip = src === 'v2-eng' ? '引擎每请求实时实测（调度器流式上报 computed 增量，按到达时间匹配）'
+            : src === 'v2-exact' ? '引擎每请求实测·精确绑定（decode 时间滑窗）'
+            : '引擎每请求实测·时间匹配（decode 时间滑窗）';
+    } else if (src === 'engine' || src === 'tee') {
+        label = has3s ? '近3s tok/s' : '全程均值 tok/s';
+        tip = src === 'engine' ? '引擎每请求实时实测（近3s滑窗）' : '代理流每请求实测（近3s滑窗）';
+    } else {
+        label = has3s ? '近3s tok/s' : '全程均值 tok/s';
+        tip = '瞬时估算（实例吞吐按行分摊，无每请求实测数据源）';
+    }
+    return { label: label, tip: tip, share: share, exact: v3, has3s: has3s };
+}
 function buildGpuQueueSegs(inst) {
     const segs = [];
     const reqs = inst.active_requests || [];
@@ -2037,7 +2069,7 @@ function buildGpuQueueSegs(inst) {
         if (r.phase === 'decode') {
             const has3s = r.avg_speed_3s !== undefined && r.avg_speed_3s !== null;
             const tps = has3s ? parseFloat(r.avg_speed_3s) : (parseFloat(r.avg_speed) || 0);
-            segs.push({ type: 'decode', taskId: r.taskId || null, tps, out: parseInt(r.tokens_generated) || 0, realtime: has3s, arr });
+            segs.push({ type: 'decode', taskId: r.taskId || null, tps, out: parseInt(r.tokens_generated) || 0, realtime: has3s, arr, src: r.speed_src || '' });
         } else {
             segs.push({
                 type: 'prefill',
@@ -2152,7 +2184,7 @@ function gpuQueueRowHtml(inst) {
         return block(GQ_SEG_W, 'decode',
             headRow(s.taskId, '输出中', 'decode') +
             '<div style="text-align:center"><span style="font-size:16px;font-weight:800;color:' + cMain('decode') + ';font-variant-numeric:tabular-nums">' + (s.tps > 0 ? s.tps.toFixed(1) : '--') + '</span>' +
-            '<span style="font-size:10px;font-weight:400;color:' + cSub('decode') + ';margin-left:3px">' + (s.realtime ? '实时 tok/s' : 'tok/s') + '</span></div>' +
+            '<span style="font-size:10px;font-weight:400;color:' + cSub('decode') + ';margin-left:3px" title="' + spdMeta({ speed_src: s.src, avg_speed_3s: s.realtime ? s.tps : undefined, avg_speed: s.tps }).tip + '">' + (s.realtime ? '实时 tok/s' + (spdMeta({ speed_src: s.src }).share ? '·分摊' : '') : 'tok/s') + '</span></div>' +
             (s.out ? '<div style="font-size:10px;color:' + cSub('decode') + ';text-align:center">' + fmt(s.out) + ' tok 已输出</div>' : ''));
     };
 
@@ -2306,7 +2338,9 @@ async function renderConcurrentCard(s) {
                     if (!h) { h = []; window.__tpsHist.set(k, h); }
                     const last = h[h.length - 1];
                     if (!last || _now - last.t > 400) h.push({ t: _now, v: tps });
-                    if (h.length > 30) h.splice(0, h.length - 30);
+                    // 时间窗真裁剪（回前台大时距不再虚报「近 Ns」）；点数只作上限保险
+                    while (h.length > 2 && _now - h[0].t > 15000) h.shift();
+                    if (h.length > 40) h.splice(0, h.length - 40);
                 }
             }
             // 清理已消失的 key（保留 30s 防闪烁）
@@ -2349,7 +2383,7 @@ async function renderConcurrentCard(s) {
             const lastIdx = N - 1;
             const lx = P + (lastIdx / (N - 1)) * (100 - 2 * P);
             const ly = H - P - ((last.v - min) / (max - min || 1)) * (H - 2 * P);
-            return '<svg style="width:100%;height:' + H + 'px;display:block" viewBox="0 0 100 ' + H + '" preserveAspectRatio="none" title="近 ' + Math.round(h.length * 0.5) + 's tok/s 走势（500ms 采样，窗口 15s）">' +
+            return '<svg style="width:100%;height:' + H + 'px;display:block" viewBox="0 0 100 ' + H + '" preserveAspectRatio="none" title="近 ' + Math.max(1, Math.round((h[h.length - 1].t - h[0].t) / 1000)) + 's tok/s 走势（~500ms 采样，窗口 15s）">' +
                 '<polygon points="' + areaPts + '" fill="' + color + '" opacity="0.12"/>' +
                 '<polyline points="' + ptsStr + '" fill="none" stroke="' + color + '" stroke-width="1.5" opacity="0.9" vector-effect="non-scaling-stroke"/>' +
                 '<circle cx="' + lx.toFixed(1) + '" cy="' + ly.toFixed(1) + '" r="1.5" fill="' + color + '"/></svg>';
@@ -2388,81 +2422,6 @@ async function renderConcurrentCard(s) {
                     </div>
                 </div>`;
             };
-        const renderReqRow = (req, i, lv) => {
-                const speed = parseFloat(req.speed) || 0;
-                const prefill = parseFloat(req.prefill_tps) || 0;
-                const isDecode = req.phase === 'decode';
-                // 预填充进度（uncached 口径，不含缓存命中）
-                const ppTotal = parseInt(req.prefill_total_uncached) || 0;
-                const ppDone = parseInt(req.prefill_done_uncached) || 0;
-                const ppPct = ppTotal > 0 ? Math.min(100, Math.max(0, Math.round(ppDone / ppTotal * 100))) : 0;
-
-                if (isDecode) {
-                    // 首token已输出 → 输出中
-                    // 显示实时生成速度（绿色大）+ 预填充速度（橙色小，固定值）
-                    // 大数字「实际均值」：sglang 行优先用 3 秒滑动窗口均值（avg_speed_3s），
-                    // vllm 行无该字段则回落全程均值（原行为不变）
-                    const has3s = req.avg_speed_3s !== undefined && req.avg_speed_3s !== null;
-                    const actual = has3s ? parseFloat(req.avg_speed_3s) : (parseFloat(req.avg_speed) || 0);
-                    const lastSec = parseInt(req.tok_last_sec) || 0;
-                    const ppExact = !!req.prefill_exact;
-                    // 预填充耗时：引擎实测（完成时刻 − 引擎到达时刻，并发≤2 时排队≈0）
-                    const ppDur = (parseFloat(req.prefill_s) || 0) > 0 ? parseFloat(req.prefill_s).toFixed(1) + 's' : '--';
-                    const meta = `${gpuChip(req)}${esc(req.id || ('REQ-' + (i + 1)))} · ${esc(req.ip || '—')} · ${req.elapsed_s !== undefined ? req.elapsed_s + 's' : ''} · ${(req.tokens_generated || 0).toLocaleString()} tok · 上一秒 ${lastSec || '--'} (共享)${ppDur !== '--' ? ' · 预填充 ' + ppDur : ''}`;
-                    return `<div class="req-item req-decode">
-                        <div class="flex items-center gap-3" style="flex-shrink:0">
-                            <div class="req-num">${(req.id || '').replace('REQ-', '') || (i + 1)}</div>
-                            <div>
-                                <div style="font-size:13px;font-weight:600;color:var(--green)">输出中</div>
-                                <div style="font-size:11px;color:var(--text-tertiary);margin-top:2px">${meta}</div>
-                            </div>
-                        </div>
-                        ${liveMidHtml(lv, 'decode')}
-                        <div class="flex items-center gap-2" style="flex-shrink:0">
-                            <div style="text-align:right">
-                                <span style="font-size:26px;font-weight:800;color:var(--green);font-variant-numeric:tabular-nums">${actual > 0 ? actual.toFixed(1) : '--'}</span>
-                                <span style="font-size:11px;color:var(--text-tertiary);margin-left:4px">${has3s ? '实时 tok/s·实测' : 'tok/s 全程均值'}</span>
-                            </div>
-                            <div style="width:1px;height:32px;background:var(--border)"></div>
-                            <div style="text-align:right" title="${ppExact ? '该请求完成预填充时的引擎实测值（不含缓存命中）' : '估算：最近一次完成预填充的实测速度' + (ppTotal > 0 ? '，总需为历史均值' : '')}">
-                                <div style="font-size:11px;color:var(--text-tertiary)">预填充 <span style="opacity:.65">(不含缓存命中)</span>${ppExact ? ' <span style="color:var(--green)">实测</span>' : ''}</div>
-                                <div><span style="font-size:14px;font-weight:700;color:var(--orange)">${prefill.toFixed(0)}</span><span style="font-size:11px;color:var(--text-tertiary);margin-left:2px">pp tok/s</span>${ppTotal > 0 ? ` · <span style="font-size:12px;font-weight:600;color:var(--orange)">${ppTotal.toLocaleString()}</span><span style="font-size:11px;color:var(--text-tertiary)">tok</span>` : ''}</div>
-                            </div>
-                        </div>
-                    </div>`;
-                }
-
-                // 首token未输出 → 预填充中
-                // 只显示预填充速度，不显示生成速度（此时为0）
-                const ppExact = !!req.prefill_exact;
-                const metaP = `${gpuChip(req)}${esc(req.id || ('REQ-' + (i + 1)))} · ${esc(req.ip || '—')} · ${req.elapsed_s !== undefined ? req.elapsed_s + 's' : ''}`;
-                const ppTip = ppExact
-                    ? '引擎实测（不含缓存命中）：进度 = 实际计算量（已处理 − 缓存命中）；总需 = prompt − 缓存命中'
-                    : '估算：速度 = 最近完成预填充的实测值或实时聚合分摊；进度 = 耗时 × 速度';
-                return `<div class="req-item req-prefill" title="${ppTip}">
-                    <div class="flex items-center gap-3" style="flex-shrink:0">
-                        <div class="req-num">${(req.id || '').replace('REQ-', '') || (i + 1)}</div>
-                        <div>
-                            <div style="font-size:13px;font-weight:600;color:var(--orange)">预填充中${ppExact ? ' <span style="font-size:10px;color:var(--green);font-weight:500">实测</span>' : ''}</div>
-                            <div style="font-size:11px;color:var(--text-tertiary)">${metaP} · 等待首token...</div>
-                        </div>
-                    </div>
-                    ${liveMidHtml(lv, 'prefill')}
-                    <div class="flex items-center gap-4" style="flex-shrink:0">
-                        <div style="width:160px">
-                            <div style="font-size:11px;color:var(--text-tertiary)">预填充 <span style="opacity:.65">(不含缓存命中)</span></div>
-                            <div style="display:flex;align-items:baseline;gap:4px;margin-top:2px">
-                                <span style="font-size:13px;font-weight:700;color:var(--orange);font-variant-numeric:tabular-nums">${ppTotal > 0 ? ppDone.toLocaleString() : '--'}</span>
-                                <span style="font-size:11px;color:var(--text-tertiary)">/ ${ppTotal > 0 ? ppTotal.toLocaleString() : '--'} tok${ppTotal > 0 && ppDone < ppTotal && !ppExact ? ' (估)' : ''}</span>
-                            </div>
-                            <div style="height:5px;background:rgba(255,255,255,.08);border-radius:3px;margin:4px 0;overflow:hidden">
-                                <div style="height:100%;width:${ppPct}%;background:var(--orange);border-radius:3px;transition:width .5s"></div>
-                            </div>
-                            <div><span style="font-size:15px;font-weight:800;color:var(--orange);font-variant-numeric:tabular-nums">${prefill > 0 ? prefill.toFixed(1) : '--'}</span><span style="font-size:11px;color:var(--text-tertiary);margin-left:2px">tok/s</span></div>
-                        </div>
-                    </div>
-                </div>`;
-        };
 
         if (totalActive === 0 && totalRunning > 0) {
             // 兜底：Running 有值但明细未捕获（请求刚进 decode 的窗口期）
@@ -2498,7 +2457,7 @@ async function renderConcurrentCard(s) {
                     // 元信息行
                     let meta = [idStr, ipStr, elapsed, (ppTotal > 0 ? ppTotal.toLocaleString() + ' tok 待算' : null)].filter(Boolean).join(' · ');
                     if (isDecode) {
-                        meta = [idStr, ipStr, elapsed, outTok + ' tok 已输出', lastSec > 0 ? '上一秒 ' + lastSec : null, ppDur ? '预填充 ' + ppDur : null].filter(Boolean).join(' · ');
+                        meta = [idStr, ipStr, elapsed, outTok + ' tok 已输出', lastSec > 0 ? '上一秒 ' + lastSec + (spdMeta(r).exact ? '' : ' (摊)') : null, ppDur ? '预填充 ' + ppDur : null].filter(Boolean).join(' · ');
                     }
                     // 主体
                     let body;
@@ -2511,7 +2470,7 @@ async function renderConcurrentCard(s) {
                             '</div>' +
                             '<div style="flex:1;min-width:0">' + tpsSpark(r.taskId || r.id, 'var(--green)', 'decode') + '</div>' +
                             '<div style="text-align:right;flex-shrink:0">' +
-                            '<div><span style="font-size:18px;font-weight:800;color:var(--green);font-variant-numeric:tabular-nums">' + (decodeTps > 0 ? decodeTps.toFixed(1) : '--') + '</span><span style="font-size:10px;color:var(--text-tertiary);margin-left:3px" title="' + (r.speed_src === 'v3-exact' ? '引擎每步输出真值流·精确绑定（本请求自身样本滑窗差分，MTP 含投机接受；排队/停顿期如实不出数）' : r.speed_src === 'v3' ? '引擎每步输出真值流·每请求实测（数值即该 rid 真值；行↔请求按到达时间配对，只影响标签归属不影响数值）' : r.speed_src === 'residual' ? '该请求无每请求实测数据，值为并发各行按引擎总吞吐均摊（估算）' : r.speed_src === 'v2-exact' ? '引擎每请求实测·精确绑定（decode 时间滑窗）' : r.speed_src === 'v2-nearest' ? '引擎每请求实测·时间匹配（decode 时间滑窗）' : r.speed_src === 'v2-eng' ? '引擎每请求实时实测（调度器流式上报 computed 增量，按到达时间匹配）' : r.speed_src === 'v2-hist' ? '引擎实测·守恒分摊（实例生成吞吐 ÷ 引擎测得并发数，各输出行同值）' : r.speed_src === 'engine' ? '引擎每请求实时实测（近3s滑窗）' : r.speed_src === 'tee' ? '代理流每请求实测（近3s滑窗）' : '代理流每请求实测') + '">' + (has3s ? (String(r.speed_src || '').indexOf('v3') === 0 ? '实时 tok/s·实测' : String(r.speed_src || '').indexOf('v2-') === 0 ? (r.speed_src === 'v2-hist' ? '实时 tok/s·分摊' : '实时 tok/s·实测') : r.speed_src === 'residual' ? '实时 tok/s·均摊' : '近3s tok/s') : '全程均值 tok/s') + '</span></div>' +
+                            '<div><span style="font-size:18px;font-weight:800;color:var(--green);font-variant-numeric:tabular-nums">' + (decodeTps > 0 ? decodeTps.toFixed(spdMeta(r).share ? 0 : 1) : '--') + '</span><span style="font-size:10px;color:var(--text-tertiary);margin-left:3px" title="' + spdMeta(r).tip + '">' + spdMeta(r).label + '</span></div>' +
                             (prefillTps > 0 ? '<div style="font-size:10px;color:var(--text-tertiary);margin-top:1px">预填充 <span style="color:var(--orange);font-weight:600">' + prefillTps.toFixed(0) + '</span> tok/s' + (ppExact ? ' <span style="color:var(--green)">实测</span>' : '') + '</div>' : '') +
                             '</div></div>';
                     } else {
@@ -2520,7 +2479,7 @@ async function renderConcurrentCard(s) {
                         //   行2 = 元信息(以「XXX tok 待算」结尾, col1) + 曲线(col2) + 数字(col3)
                         // 进度条与曲线同处 col2(1fr) → 宽度一致且左右端对齐；
                         // col1 宽度 = 元信息右端 → 进度条/曲线左端不越过「XXX tok 待算」
-                        const titleHtml = '<span style="font-size:12px;font-weight:700;color:var(--orange);white-space:nowrap">预填充中</span>' + tChip + (ppExact ? ' <span style="font-size:9px;color:var(--green);font-weight:600">实测</span>' : '');
+                        const titleHtml = '<span style="font-size:12px;font-weight:700;color:var(--orange);white-space:nowrap">预填充中</span>' + tChip + (ppExact ? ' <span style="font-size:9px;color:var(--green);font-weight:600">实测</span>' : ' <span style="font-size:9px;color:var(--text-tertiary);font-weight:600" title="进度/速度为实测聚合按并发预填充行数分摊的估算">估</span>');
                         const metaInline = '<span style="font-size:10.5px;color:var(--text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;max-width:300px" title="' + esc(meta) + '">' + meta + '</span>';
                         const barHtml = '<div style="grid-column:2;grid-row:1;height:4px;background:var(--bg-primary);border-radius:2px;overflow:hidden;border:1px solid var(--border)"><div style="height:100%;width:' + ppPct + '%;background:var(--orange);border-radius:2px;transition:width .5s"></div></div>';
                         const curveHtml = '<div style="grid-column:2;grid-row:2;height:40px">' + tpsSpark(r.taskId || r.id, 'var(--orange)', 'prefill', 40) + '</div>';
@@ -6854,6 +6813,7 @@ function startDashboardTimers() {
     const _concTick = async () => { try { const _cs = await apiFetch('/v1/internal/stats'); if (_cs && Object.keys(_cs).length) await renderConcurrentCard(_cs); } catch (e) { console.warn('Concurrent tick error:', e); } };
     _concTick();
     _dashEvery(_concTick, 500);
+    window.__concTick = _concTick; // 供 kickDashboard/看门狗回前台即时补刷并发卡
     // GPU 排队·处理：已处理任务历史（右进左出）3s 轮询
     refreshGqDone();
     _dashEvery(refreshGqDone, 3000);
@@ -6879,6 +6839,7 @@ function kickDashboard(reason) {
     // 免得每次正常回前台都被看门狗误判成"停摆"而虚增自愈计数。
     window._lastKickAt = Date.now();
     try { refreshDashboard(); } catch (e) {}
+    try { if (window.__concTick) window.__concTick(); } catch (e) {}
     try { renderFreshnessBadge(); } catch (e) {}
     if (reason && window.console && window.__dashDebug) console.log('[dashboard] kick:', reason);
 }

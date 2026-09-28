@@ -3281,6 +3281,8 @@ function buildSglangActiveRequests(sg, liveStreams, genSpeed1s, prefillSpeed3s, 
       avg_speed: engineSpeed !== undefined ? parseFloat(engineSpeed.toFixed(1)) : parseFloat((e.tokens / elapsed).toFixed(1)),
       // 前端 decode 行大数字优先用此值（标签「近3s tok/s」）：引擎实测总生成吞吐分摊
       avg_speed_3s: engineSpeed !== undefined ? parseFloat(engineSpeed.toFixed(1)) : undefined,
+      // sglang 无每请求实时数据源，本行值是实例吞吐按 token 占比分摊 → 如实标 share
+      speed_src: 'share',
       tok_last_sec: Math.round(tokLastSec),
       // 预填充速度：引擎实时 prefill_effective_tokens_total{mode=input} 3s 差值，
       // 按 prefill 并发数分摊到单请求（prompt_tokens_total 批量计入不可用）
@@ -3850,14 +3852,14 @@ const LS_STALE_DONE_S = 30;    // 有 rid 但 >30s 无新行且无完成行 → 
 const LS_PORT_FRESH_MS = 6000; // 端口级新鲜度：该 port 会话 6s 内有行才算 v3 激活
 
 // v3 测速窗参数（滑窗 Δg/Δt，全部该 rid 自身样本）
-const V3_WIN_MIN = 1.8, V3_WIN_MAX = 6.0, V3_LAST_STALE = 2.2;
+const V3_WIN_MIN = 1.5, V3_WIN_MAX = 6.0, V3_LAST_STALE = 2.2;
 
 function lsIngestLine(r) {
   const S = global.__liveStream;
   if (!r || typeof r.rid !== 'string' || !r.sid) return;
   let m = S.sids.get(r.sid);
   if (!m) {
-    m = { byRid: new Map(), port: String(r.port || ''), pid: r.pid || null, maxT: 0, lastWall: Date.now() };
+    m = { byRid: new Map(), port: String(r.port || ''), pid: r.pid || null, maxT: 0, lastWall: Date.now(), skewN: 0, skewSum: 0, guardN: 0 };
     S.sids.set(r.sid, m);
     // 只留最近 LS_SID_KEEP 个会话（按最近写入时刻淘汰）
     if (S.sids.size > LS_SID_KEEP) {
@@ -3873,6 +3875,10 @@ function lsIngestLine(r) {
   // 时钟护栏：引擎与本机同机部署时 t 与墙钟同域；偏差>600s 视为异常时钟，
   // 用本地接收时刻替换（样本时刻只影响窗口分母，替换后仍单调可用）
   const nowS = Date.now() / 1000;
+  // 时钟偏差可观测（同机恒 ~tail 延迟；跨主机误配时 skew/guardN 会说话）。
+  // 只统计新鲜行（<10s）：首读回放的积压历史行年龄大，不能计入 skew 语义。
+  if (Math.abs(t - nowS) < 10) { m.skewN++; m.skewSum += Math.abs(t - nowS); }
+  if (Math.abs(t - nowS) > 600) m.guardN++;
   const ts = Math.abs(t - nowS) > 600 ? nowS : t;
   let st = m.byRid.get(r.rid);
   if (!st) {
@@ -3920,7 +3926,7 @@ function readLiveStream() {
     if (!stt || stt.size <= S.byteOffset) { rebuildPortView(now); return S; }
     if (now - S.lastReadAt < 120) { rebuildPortView(now); return S; }
     S.lastReadAt = now;
-    const LEN = Math.min(2 * 1024 * 1024, stt.size - S.byteOffset);
+    const LEN = Math.min(512 * 1024, stt.size - S.byteOffset);
     const buf = Buffer.alloc(LEN);
     const fd = fs.openSync(LIVE_STREAM_PATH, 'r');
     try { fs.readSync(fd, buf, 0, LEN, S.byteOffset); } finally { fs.closeSync(fd); }
@@ -3982,11 +3988,13 @@ function v3StreamFor(port) {
     if (!st.done && st.g > 0) active.push(st);
   }
   const fresh = (now - m.lastWall) < LS_PORT_FRESH_MS;
-  return { active, fresh: fresh && active.length > 0, sid: m ? [...S.sids.keys()].find(k => S.sids.get(k) === m) : null, session: m };
+  return { active, fresh: fresh && active.length > 0, sid: m ? [...S.sids.keys()].find(k => S.sids.get(k) === m) : null, session: m,
+    skew: m && m.skewN ? Math.round(m.skewSum / m.skewN * 1000) / 1000 : 0, guardN: m ? m.guardN : 0 };
 }
 
 // 每 rid 滑窗测速（纯自身样本）：
-//   末样本 t 距今 ≤V3_LAST_STALE 秒；基线 = 窗内最老可用样本（优先年龄≥MIN）。
+//   末样本 t 距今 ≤V3_LAST_STALE 秒；基线 = 年龄∈[V3_WIN_MIN,V3_WIN_MAX] 的最老
+//   样本；窗长上限钳制（span>V3_WIN_MAX → null）。
 //   返回 {spd, gen, span}；无合格窗 → null（如实 --）。g 冻结（抢占/排队）
 //   → Δg=0 → null，前端回落全程均值自然衰减，绝不发放 0 速假精确。
 function v3Rate(st, nowMs) {
@@ -4000,11 +4008,13 @@ function v3Rate(st, nowMs) {
     const age = nowS - s[k].t;
     if (age < V3_WIN_MIN) continue;
     if (age <= V3_WIN_MAX) { base = s[k]; break; }
-    if (!base) base = s[k]; // 全样本都老于窗（引擎刚恢复）：用最老者，span 会被下面钳制
+    // 全部样本年龄都 >V3_WIN_MAX（长冻结后恢复）：绝不返回跨冻结期的稀释均速
+    // ——那会把十几秒均值标成「实时」。如实 null，等窗内出现合格基线再出数。
+    return null;
   }
   if (!base) base = s[0];
   const span = last.t - base.t;
-  if (span < 1.0) return null;
+  if (span < 1.0 || span > V3_WIN_MAX) return null;
   const d = last.g - base.g;
   if (d <= 0) return null;
   return { spd: d / span, gen: last.g, span };
@@ -4019,7 +4029,8 @@ function v3LastSec(st, nowMs) {
   let b = null;
   for (let k = s.length - 1; k >= 0; k--) { if (s[k].t <= cut) { b = s[k]; break; } }
   if (!b) b = s[0];
-  return Math.max(0, last.g - b.g);
+  if (last.t - b.t < 0.6) return undefined; // 窗太短不外推 1s 口径（偏小失真）
+  return Math.max(0, Math.round((last.g - b.g) * 1.0 / (last.t - b.t)));
 }
 
 // 行数值字段以 rid 真值接管：累计输出 = 引擎累计 g（精确，含 MTP；旧的
@@ -4216,6 +4227,12 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
   rt.lastTotal = totalStarted;
   rt.conns = peers;
 
+  // v3 流状态提前读取（readLiveStream 自带节流，幂等）：retire/fill 循环需要
+  // 知道本轮 v3 是否激活——否则 v2→v3 切换首轮仍走 v2 retire 规则，会误丢
+  // 正在流上活跃的刚出生行（REQ 号断一次）。
+  readLiveStream();
+  const v3s = v3StreamFor(port);
+  const v3Active = v3s.fresh;
   // Align the live list with the running gauge. Completions are normally the
   // oldest requests (FCFS), but a request that was born AND completed between
   // two polls must not knock out a long-running one — retire young entries
@@ -4226,7 +4243,7 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
   // 直接丢弃；其余按 FCFS 视为完成。
   while (rt.live.length > running) {
     const nowTs = Date.now();
-    if (rt.v3Count) {
+    if (v3Active || rt.v3Count) {
       // v3 模式（上轮流激活）：已绑 rid 的行 = 引擎活跃真值，只退未绑行
       //（预填充完成/排队取消的那批）；全绑满仍超（gauge 滞后瞬态）退最老
       // 绑定行并把身份按 rid 暂存，本轮 ②③④ 重新绑定时原样复活。
@@ -4382,9 +4399,6 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
   // 绑定只决定标签（ip/任务号/REQ 号）挂到哪一行——数值永远跟着 rid 走，
   // 绑定错位不再产生错误速度（v2 顽疾的根）。
   // ======================================================================
-  readLiveStream();
-  const v3s = v3StreamFor(port);
-  const v3Active = v3s.fresh;
   const v3StateById = new Map(); // rid -> st（本轮活跃）
   if (v3Active) {
     const nowV3 = Date.now();
@@ -4402,7 +4416,12 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
         rt.parked.delete(st.rid);
       }
       lv.v3rid = st.rid; lv.v3Exact = !!exact;
+      // 接管过的行（曾是别的已完成请求）复位旧身份钉与 decode 起点，再按
+      // 新 rid 重钉——否则 elapsed 继承旧行虚高、avg_speed 分母错。
+      if (lv.v3goneAt || (lv.v3born && lv.tokens === 0)) { lv.v3born = false; lv.decodeStart = null; }
       if (st.arrival > 0 && !lv.v3born) { lv.startedAt = Math.round(st.arrival * 1000); lv.v3born = true; } // 引擎真实进队时刻，钉一次
+      // 断开 v2 时代残留的 tee 绑定（字符估算源），v3 行数值只认引擎真值
+      lv.boundLive = null; lv.boundLiveId = null; lv.boundSpd = undefined;
       v3TouchRow(lv, st);
       claimed.add(st.rid);
     };
@@ -4513,8 +4532,9 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
         const lv = rt.live[i];
         if (!lv) { zeroTokenIdx.push(i); continue; }
         if (lv.v3rid && v3StateById.has(lv.v3rid)) phaseOf[i] = 'decode';
-        else if (lv.v3goneAt && Date.now() - lv.v3goneAt < 3000) {
-          // 刚完成（gauge 滞后）：保持「输出中」冻结显示 ≤3s，避免闪「预填充中」
+        else if (lv.v3goneAt && Date.now() - lv.v3goneAt < 15000) {
+          // 刚完成（gauge 滞后，最坏=metrics 缓存失效回退窗口）：保持「输出中」
+          // 冻结显示 ≤15s，避免闪回「预填充中」（tokens 停在引擎终值）。
           phaseOf[i] = 'decode';
         } else zeroTokenIdx.push(i);
       }
@@ -4584,7 +4604,7 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
           rowV2[i] = { spd: rs ? rs.spd : undefined, gen: st.g, src: lv.v3Exact ? 'v3-exact' : 'v3' };
           lv.v3lastSec = v3LastSec(st, nowV3b);
           v2Used = true;
-        } else if (lv.v3goneAt && nowV3b - lv.v3goneAt < 3000) {
+        } else if (lv.v3goneAt && nowV3b - lv.v3goneAt < 15000) {
           // 刚完成（gauge 滞后 ≤3s）：瞬时速度不出数，累计冻结在终值
           rowV2[i] = { spd: undefined, gen: lv.tokens, src: 'v3' };
           v2Used = true;
@@ -4953,8 +4973,9 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
         let trueTok = -1;
         if (rowV2[i] !== null && rowV2[i].gen !== undefined) trueTok = Math.max(trueTok, rowV2[i].gen);
         if (rowEngOut[i] !== undefined) trueTok = Math.max(trueTok, rowEngOut[i]);
+        // v3 行禁用 tee 字符估算（会顶掉刚钉准的引擎真值）；仅非 v3 行保留
         const _blv = rt.live[i] && rt.live[i].boundLive;
-        if (_blv && !_blv.done) trueTok = Math.max(trueTok, Math.round(_blv.tokens || 0));
+        if (_blv && !_blv.done && !live.v3rid) trueTok = Math.max(trueTok, Math.round(_blv.tokens || 0));
         if (trueTok >= 0 && trueTok >= live.tokens) live.tokens = trueTok;
       }
       // tokens_since_last: 本轮该行新增输出（优先每请求真值差，回落均摊）
@@ -5190,6 +5211,10 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
   const allWaiting = holdRows.concat(fwdWaiting).slice(0, 20);
 
   return {
+    // v3 诊断（前端不消费；curl /v1/internal/stats | jq .v3 排障用）：
+    // active=v3 供数中 n=绑定行数 rids=流上活跃 rid skew=引擎↔本机时钟差(秒)
+    // guard=时钟护栏触发行数（>0 说明流来自异机/异常时钟，数值已降级保守）
+    _v3diag: { active: !!v3Active, n: (rt.v3Count || 0), rids: v3s.active ? v3s.active.length : 0, skew: v3s.skew || 0, guard: v3s.guardN || 0 },
     active_requests: activeRequests,
     waiting_requests: allWaiting,
     connected_clients: [...peers],
@@ -10163,6 +10188,7 @@ const server = http.createServer(async (req, res) => {
             try { fs.writeFileSync(path.join(__dirname, 'metrics-snapshot.json'), JSON.stringify(lastSnapshot)); } catch (e) {}
           }
           Object.assign(result, concurrency);
+          if (concurrency._v3diag) result.v3 = concurrency._v3diag; // 顶层排障字段：curl stats | jq .v3
           delete result._perReqTokens;
           // Remove debug
           delete result._debug;

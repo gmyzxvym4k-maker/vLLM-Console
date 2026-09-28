@@ -3890,7 +3890,7 @@ function lsIngestLine(r) {
     st = {
       rid: r.rid, arrival: Number(r.a) || ts, g: 0, firstT: null,
       samples: [], done: false, doneAt: 0, lastLineT: ts, lastWall: Date.now(),
-      obsT: ts, g0: 0, // 观测基线：首见时 g 已>0（中途接管）→ avg 只算接管后的增量
+      obsT: nowS, g0: 0, gLastT: ts, // 观测基线：窗口从"控制台开始观测它"起算——首见行即便是一分钟前的旧行（回放/接管），avg 分母也如实是观测窗而非历史全程
     };
     m.byRid.set(r.rid, st);
   }
@@ -3900,9 +3900,10 @@ function lsIngestLine(r) {
   if (r.f) { st.done = true; st.doneAt = ts; }
   const g = Number(r.g) || 0;
   // gauge 只增不减；回退 = 引擎重启后 rid 复用（同 sid 内不会），忽略
-  if (g >= st.g) {
+  if (g > st.g) {
     if (st.g === 0 && g > 0 && !r.pf && st.firstT === null) st.g0 = g; // 中途首见：基线抬到观测值
     st.g = g;
+    st.gLastT = ts;
   }
   if (r.pf && st.firstT === null) st.firstT = ts; // 首 token 步
   if (st.g > 0 || r.f) {
@@ -4053,6 +4054,10 @@ function v3LastSec(st, nowMs) {
 // （avg_speed 分母自此精确）。
 function v3TouchRow(lv, st) {
   lv.tokens = st.g;
+  // g 冻结 >2.5s（客户端断连/被抢占/引擎停顿，行未 done 但不再产出）：
+  // 均值钉住在最后活跃值——否则分母随时间增长把显示稀释成假低速（实测 117→16）。
+  const gAge = Date.now() / 1000 - (st.gLastT || st.obsT || 0);
+  if (gAge > 2.5) { lv.v3seenAt = Date.now(); return; }
   if (st.firstT) {
     lv.decodeStart = Math.round(st.firstT * 1000);
     const den = (Date.now() - lv.decodeStart) / 1000;

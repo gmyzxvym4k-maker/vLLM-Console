@@ -538,7 +538,7 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
     // [kvoff-off 0929] 生产真值：二级缓存关（A/B 定案 21h 零外部命中，省 107GB pinned）；
     // PLE=INT8+heap（匿名堆 49.2GB，不受 pinned 挤压页缓存影响，disk 模式与
     // 大 pinned 层共存有缺页拖垮 decode 的结构性风险，见 09-19 事故模式）。
-    kvoff: '0', kvOffGiB: 96, pleInt8: '1', pleLoc: 'heap',
+    kvoff: 'simple', kvOffGiB: 96, pleInt8: '1', pleLoc: 'heap', // 0927 生产定版=SimpleCPU 96GiB
   },
   bannedArgs: ['--mamba-ssm-cache-dtype', '--mamba-cache-mode', '--language-model-only',
                '--enable-prompt-tokens-details', '--safetensors-load-strategy',
@@ -843,7 +843,15 @@ function scriptModelLaunchPlan(sm, d) {
   if (kv && kv !== 'auto' && kv !== 'bfloat16') env.FN_KV_DTYPE = kv;
   // [kvoff-toggle 09-22][kvoff-off 0929] CPU KV 二级缓存：inner 脚本按 FN_KVOFF(缺省关)/FN_KVOFF_BYTES 决定。
   // 弹窗显式传 '0'/'1'；字段缺失 → 关闭（与 inner 缺省 :-0 一致；0929 A/B 定案后翻转）。
-  if (String(d.kvoff) === '1') {
+  // [kvoff-start-0927] 三态：simple=官方 SimpleCPUOffloadConnector（生产定版档，
+  // --kv-offloading-size GiB，实测容量≈36.3万token/GiB、命中80~97%无损）；
+  // 1=经典 OffloadingConnector（0929 退役，仅 A/B 取证）；0/缺省=关。
+  // simple 与经典互斥（inner 同开直接拒启），下发前显式清对侧变量。
+  const kvMode = String(d.kvoff || '0');
+  if (kvMode === 'simple') {
+    env.FN_KVOFF = '0';
+    env.FN_SIMPLE_OFFLOAD = String(Math.max(8, Math.min(200, int(d.kvoffGiB, 96))));
+  } else if (kvMode === '1') {
     env.FN_KVOFF = '1';
     const koG = int(d.kvoffGiB, 96);
     if (koG > 0) env.FN_KVOFF_BYTES = String(koG * 1073741824);
@@ -1177,7 +1185,9 @@ function kvOffloadCapacityBytes(pid) {
     if (e && now - e.t < 60000) return e.b;
     const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
     const mm = cmd.match(/cpu_bytes_to_use["'\s:\\]+(\d+)/);
-    const b = mm ? parseInt(mm[1], 10) : 0;
+    let b = mm ? parseInt(mm[1], 10) : 0;
+    // [kvoff-simple 0927] 官方 SimpleCPUOffloadConnector：容量走 --kv-offloading-size <GiB>
+    if (!b) { const ms = cmd.match(/--kv-offloading-size\s+(\d+(?:\.\d+)?)/); if (ms) b = Math.round(parseFloat(ms[1]) * 1073741824); }
     global.__kvOffCap.set(pid, { t: now, b });
     return b;
   } catch (err) { return 0; }
@@ -1340,6 +1350,20 @@ function samplePortMetrics(port) {
                 loadCount: pick('vllm:kv_offload_load_size_count', 'vllm:kv_offload_size_count', 'CPU_to_GPU'),
                 storeCount: pick('vllm:kv_offload_store_size_count', 'vllm:kv_offload_size_count', 'GPU_to_CPU'),
               };
+            } else {
+              // [kvoff-simple 0927] SimpleCPUOffloadConnector 不暴露 kv_offload_* 族，
+              // 只有 external_prefix_cache_*（查询/命中 token）→ 以 simple 口径出条目，
+              // 存/在飞等字段如实为 null/0，前端按 metric_kind=simple 隐藏误导性小字。
+              const q0 = counterTotal(m, 'vllm:external_prefix_cache_queries_total');
+              const h0 = counterTotal(m, 'vllm:external_prefix_cache_hits_total');
+              if (q0 || h0) {
+                tk.kvOffload = {
+                  metricKind: 'simple', fillPerc: 0, writePerc: null, readPerc: null,
+                  queries: q0, hits: h0, storedBytes: 0, loadedBytes: 0,
+                  extTokens: counterBySource(m, 'vllm:prompt_tokens_by_source_total', 'external_kv_transfer'),
+                  loadCount: 0, storeCount: 0,
+                };
+              }
             }
           } catch (e) {}
         }
@@ -1594,44 +1618,24 @@ const LIVE_DONE_KEEP_MS = 5000;  // keep finished entries this long for the UI
 const LIVE_PATH_RE = /^\/v1\/(chat\/completions|completions|responses)$/
 
 // ============================================================================
-// 并发请求实时输出速度 v2（2026-09-17 全新设计）
+// 并发请求实时输出速度 v2（保留为「无 v3 流实例」的降级链）
 // ----------------------------------------------------------------------------
-// 设计目标：每个并发请求行的「实时输出 tok/s」独立、稳定、可溯源，杜绝
-// 旧实现三宗罪——① arrival 时间近邻猜测归属（并发错配）、② SSE 文本字符
-// 估算 token（口径漂移）、③ 引擎总吞吐均摊残差（单行凭空满速）。
+// ⚠ 2026-10-06：主链路已换 v3（见 readLiveStream 模块注释）——引擎内部
+// 每步每请求输出真值流，逐请求精确测速。本 v2 链只在 v3 不激活的实例上
+// 运行：sglang / 远端实例 / 未装 rt-patch#11 的旧 vLLM。其产物各行同值
+// （实例吞吐÷估计并发数），前端如实标「分摊」。
 //
-// 数据源（按优先级，全部为引擎 Prometheus /metrics 真值，每秒采样）：
-//  A. 每请求在途 gauge（带真实 rid 标签，新版 vLLM 支持）：
-//     vllm:request_generation_tokens{req_id} 该请求已生成 token（累计）
-//     vllm:request_decode_time_seconds{req_id} 该请求已花 decode 时长
-//     vllm:time_to_first_token_seconds{req_id} 引擎侧请求到达时刻（epoch）
-//     → 速度 = 滑窗 Δgen/Δdecode_time（2~6s 窗；分母只用该请求自身 GPU
-//       生成时长 → 排队/首包等待/引擎停顿天然排除，并发零摊分）。
-//  B. 直方图驻留估计（实例不导出 A 时的引擎真值回退）：
-//     驻留 = decode 时长桶按秒差分的小时加权平均（桶上界是驻留硬下界，
-//     封顶 dt/le → 估计恒 ≤ 真值：宁可显示偏低绝不虚高）；
-//     速度 = 实例 generation_tokens 短窗吞吐 ÷ 在途 decode 数 N；
-//     累计接管 = 实例 genCum（重启基线续算）÷ 当前 decode 行数。
-//  C. 全无（实例刚重启、采样空窗）→ undefined（前端如实显示 --），
-//     绝不退回旧均摊残差编造数值。
+// v2 数据源（引擎 Prometheus /metrics，每秒采样）：
+//  A. 每请求在途 gauge（带真实 rid 标签，仅定制导出该族的实例命中；
+//     官方 0.30.0 无此族，实测恒不命中）：
+//     vllm:request_generation_tokens{req_id} / request_decode_time_seconds
+//     / time_to_first_token_seconds → 滑窗 Δgen/Δdecode_time。
+//  B. 直方图驻留估计（当前实际生效路径）：decode 时长桶差分按 Little 定律
+//     估在途 decode 数 N；速度 = 实例 generation_tokens 短窗吞吐 ÷ N。
+//  C. 全无 → undefined（前端如实显示 --）。
 //
-// 每请求序列 hist=[{t, gen, dec}] 每秒一个样本（主 ticker 循环驱动；
-// 样本时间戳 = 引擎真值「到达时刻+累计 decode 时长」折算墙钟，与抓取
-// 节奏解耦。stats 轮询时另有一层 >2.5s 空窗的同步补采兜底）。
-//
-// 归属（REQ 行 ↔ 引擎 rid）两级，杜绝 arrival 近邻错配：
-//   ① 精确：代理注入 X-Client-Req-Id → tee 首帧解析引擎真实 rid →
-//      taskId→crid→rid 直查（走 8889 的流量，零猜测）；
-//   ② 兜底：直连流量按「引擎到达时刻（ttft−dec）与行 startedAt 最近邻」
-//      + 粘性绑定（orphan 守卫防双行抢同一 rid）。
-//
-// 速度 = 滑窗差分：基线取「距现在 ∈[2s,6s] 内最老的新鲜样本」，末样本必须是
-// 最近 2.5s 内的新样本（否则如实 undefined 而非编造）。窗口内时间分母用
-// decode 时间增量（dDec）：decode gauge 只计该请求自己 GPU 生成时刻，天然
-// 排除排队/首包等待/引擎停顿 → 输出 tok 与时间分母严格同期，这是「准」的根。
-//
-// 覆盖边界：SGLang 实例无对应 gauge/桶族 → 速度如实 undefined（前端 --）。
-// speed_src 取值：v2-exact / v2-nearest / v2-hist（v2 真值，精度递减）；
+// speed_src 取值：v3 / v3-exact（引擎流实测，主链路）；v2-exact /
+// v2-nearest / v2-hist（v2 降级链）；tee / engine / residual（v1 残留兼容）。
 // tee / engine / residual 仅作为「v2 全无信号」时旧逻辑回落值保留。
 // ============================================================================
 if (!global.__reqOutSamplers) global.__reqOutSamplers = new Map(); // port -> sampler
@@ -3791,6 +3795,242 @@ function readLivePrefill(pid) {
   return lp;
 }
 
+// ============================================================================
+// 并发请求实时输出速度 v3（2026-10-06 全新设计——推翻 v2 的"从聚合指标反推
+// 每请求速度 + 到达时间猜归属"架构）
+// ----------------------------------------------------------------------------
+// v2 的根因性不准：官方 vLLM 0.30.0 的 /metrics 里**不存在任何每请求实时数据**
+// （request_* 族全是请求完成后才进桶的直方图），于是 v2 实际总是落到
+// "直方图驻留 + Little 定律估计并发数 + 实例总吞吐 ÷ 并发数"——每个 decode
+// 行显示同一个估计值、滞后数秒；行↔请求归属靠到达时间最近邻猜测，并发错绑
+// 时整行数值都是别人的。聚合指标反推个体在数学上就测不出"这一个请求此刻的
+// 速度"，修补参数没有意义。
+//
+// v3 把数据源换成引擎内部真值：
+//   rt-patch #11（vllm-0300/patches-extra/dsh_stream_rt.py）包前端进程的
+//   IterationStats.update_from_output——官方对每个产出 token 的引擎步都会调
+//   它，参数里现成有 output.request_id（真实 rid）、req_stats
+//   .num_generation_tokens（该请求累计输出，MTP 一步多 token 如实计入）、
+//   .arrival_time（进引擎墙钟）、is_prefilling（首 token 步=True）。
+//   dsh_vllm_logger 插件把搭车数据逐步骤写成 vllm-live-stream.jsonl：
+//     进度行 {"t","sid","pid","port","rid","g","a","pf","n"}
+//     完成行 {"t","sid","pid","port","rid","f":1,"g"}
+//   本模块 tail 该文件，维护 rid→{累计g, 样本环, arrival, firstT, done}。
+//
+// 由此每一行的三个数全部是"它自己"的引擎实测，不存在摊分：
+//   速度   = 该 rid 自身样本的滑窗差分 Δg/Δt（窗 [2s,6s]，末样本 >2.2s 未更新
+//            → null 如实显示 --；引擎停顿/抢占/排队都不产出假值）
+//   累计   = g（token 精确，非字符估算）
+//   TTFT   = firstT − arrival（引擎侧真实首 token 时刻）
+// 行↔rid 归属退化为纯标签问题（速度数值不依赖归属正确性）：走 8889 代理的
+// 流量用 crid→SSE id→rid 精确认领；直连流量按 arrival 最近邻配行——即便配
+// 错，每行显示的仍是某个真实请求的真实数值，且 Σ行 ≈ 实例总吞吐（天然守恒）。
+// 相位同样变精确：有 rid 在流里 = 已过 TTFT = 输出中；running − 流内数 =
+// 预填充行数，不再需要 nEw/bootstrap 估计。
+//
+// 降级链（如实标注，绝不编造）：
+//   ① 流新鲜（本模块）           → speed_src 'v3' / 'v3-exact'（引擎实测）
+//   ② 旧栈 live-prefill computed → speed_src 'eng'（同为每请求真值，保留）
+//   ③ 全无（sglang/远端/无插件） → speed_src 'share'：实例短窗吞吐 ÷ decode
+//      行数（守恒均摊，前端明标"估算"）；窗口未成熟行显示 --。
+// 引擎重启（sid 变化）即清空重采；流文件缺失/陈旧 → fresh=false，走②③。
+// ============================================================================
+const LIVE_STREAM_PATH = process.env.DSH_LIVE_STREAM_FILE || path.join(__dirname, 'vllm-live-stream.jsonl');
+if (!global.__liveStream) {
+  global.__liveStream = {
+    byteOffset: undefined, pending: '', lastStat: null, lastStatAt: 0, lastReadAt: 0,
+    sids: new Map(),      // sid -> { byRid: Map<rid,st>, port, pid, maxT, lastWall }
+    byPort: new Map(),    // port(String) -> 活跃 sid 的状态对象（消费视图）
+  };
+}
+const LS_SID_KEEP = 3;         // 文件里混跑多实例/多次重启，只留最近 3 个会话
+const LS_SAMPLE_GAP = 0.35;    // 样本环抽稀间隔（秒）：测速窗 2~6s，0.35s 粒度足够
+const LS_WIN_KEEP = 12;        // 样本环保留窗口（秒）
+const LS_STALE_DONE_S = 30;    // 有 rid 但 >30s 无新行且无完成行 → 视为已终止（abort/抢占丢弃）
+const LS_PORT_FRESH_MS = 6000; // 端口级新鲜度：该 port 会话 6s 内有行才算 v3 激活
+
+// v3 测速窗参数（滑窗 Δg/Δt，全部该 rid 自身样本）
+const V3_WIN_MIN = 1.8, V3_WIN_MAX = 6.0, V3_LAST_STALE = 2.2;
+
+function lsIngestLine(r) {
+  const S = global.__liveStream;
+  if (!r || typeof r.rid !== 'string' || !r.sid) return;
+  let m = S.sids.get(r.sid);
+  if (!m) {
+    m = { byRid: new Map(), port: String(r.port || ''), pid: r.pid || null, maxT: 0, lastWall: Date.now() };
+    S.sids.set(r.sid, m);
+    // 只留最近 LS_SID_KEEP 个会话（按最近写入时刻淘汰）
+    if (S.sids.size > LS_SID_KEEP) {
+      let dead = null, deadT = Infinity;
+      for (const [k, v] of S.sids) { if (v.lastWall < deadT) { deadT = v.lastWall; dead = k; } }
+      if (dead && S.sids.get(dead) === m) dead = null; // 新会话即最小者时不淘汰自己
+      if (dead) S.sids.delete(dead);
+    }
+  }
+  m.lastWall = Date.now();
+  const t = Number(r.t) || Date.now() / 1000;
+  if (t > m.maxT) m.maxT = t;
+  // 时钟护栏：引擎与本机同机部署时 t 与墙钟同域；偏差>600s 视为异常时钟，
+  // 用本地接收时刻替换（样本时刻只影响窗口分母，替换后仍单调可用）
+  const nowS = Date.now() / 1000;
+  const ts = Math.abs(t - nowS) > 600 ? nowS : t;
+  let st = m.byRid.get(r.rid);
+  if (!st) {
+    st = {
+      rid: r.rid, arrival: Number(r.a) || ts, g: 0, firstT: null,
+      samples: [], done: false, doneAt: 0, lastLineT: ts, lastWall: Date.now(),
+    };
+    m.byRid.set(r.rid, st);
+  }
+  st.lastLineT = ts;
+  st.lastWall = Date.now();
+  if (r.a && !st.arrival) st.arrival = Number(r.a);
+  if (r.f) { st.done = true; st.doneAt = ts; }
+  const g = Number(r.g) || 0;
+  // gauge 只增不减；回退 = 引擎重启后 rid 复用（同 sid 内不会），忽略
+  if (g >= st.g) st.g = g;
+  if (r.pf && st.firstT === null) st.firstT = ts; // 首 token 步
+  if (st.g > 0 || r.f) {
+    const last = st.samples[st.samples.length - 1];
+    if (!last || g !== last.g || ts - last.t >= LS_SAMPLE_GAP) {
+      if (!last || ts > last.t) st.samples.push({ t: ts, g });
+      else last.g = g;
+    } else if (g !== last.g) {
+      last.g = g; // 同刻多行（批内合并）取最新累计
+    }
+    const cut = ts - LS_WIN_KEEP;
+    while (st.samples.length > 2 && st.samples[0].t < cut) st.samples.shift();
+  }
+}
+
+function readLiveStream() {
+  const S = global.__liveStream;
+  const now = Date.now();
+  try {
+    if (!S.lastStatAt || now - S.lastStatAt > 300) {
+      const st = fs.statSync(LIVE_STREAM_PATH);
+      // 文件被 ring-trim 重写（变小）→ 偏移重置，只丢历史不丢当下
+      if (S.byteOffset === undefined || st.size < S.byteOffset) {
+        S.byteOffset = Math.max(0, st.size - 2 * 1024 * 1024);
+        S.pending = '';
+      }
+      S.lastStat = st; S.lastStatAt = now;
+    }
+    const stt = S.lastStat;
+    if (!stt || stt.size <= S.byteOffset) { rebuildPortView(now); return S; }
+    if (now - S.lastReadAt < 120) { rebuildPortView(now); return S; }
+    S.lastReadAt = now;
+    const LEN = Math.min(2 * 1024 * 1024, stt.size - S.byteOffset);
+    const buf = Buffer.alloc(LEN);
+    const fd = fs.openSync(LIVE_STREAM_PATH, 'r');
+    try { fs.readSync(fd, buf, 0, LEN, S.byteOffset); } finally { fs.closeSync(fd); }
+    S.byteOffset += LEN;
+    const text = S.pending + buf.toString('utf8');
+    const parts = text.split('\n');
+    S.pending = parts.pop() || '';
+    for (const l of parts) {
+      if (!l || !l.charCodeAt) continue;
+      try { lsIngestLine(JSON.parse(l)); } catch (e) { /* 坏行跳过 */ }
+    }
+    if (S.pending) {
+      try { const o = JSON.parse(S.pending); lsIngestLine(o); S.pending = ''; } catch (e) { /* 半行待补 */ }
+    }
+  } catch (e) { /* 文件不存在 → v3 不激活 */ }
+  rebuildPortView(now);
+  return S;
+}
+
+// 消费视图：port → 该端口最新活跃会话。归属优先级：
+//   ① 行带 port 字段（新插件+inner 已 export DSH_ENGINE_PORT）→ 精确到端口；
+//   ② 无 port 字段的会话（旧插件形态）只兜底服务主实例端口，且不抢①的地盘。
+function rebuildPortView(now) {
+  const S = global.__liveStream;
+  const byPort = S.byPort;
+  byPort.clear();
+  const noPort = [];
+  for (const [sid, m] of S.sids) {
+    if (now - m.lastWall > 60000) { S.sids.delete(sid); continue; } // 死亡会话回收
+    // 会话内逐 rid 清理：完成超 30s / 无行超 LS_STALE_DONE_S → 剔除
+    for (const [rid, st] of m.byRid) {
+      const ageS = now / 1000 - st.lastLineT;
+      if ((st.done && now - st.doneAt * 1000 > 30000) || (!st.done && ageS > LS_STALE_DONE_S)) m.byRid.delete(rid);
+    }
+    if (m.port) {
+      const cur = byPort.get(m.port);
+      if (!cur || m.maxT > cur.maxT) byPort.set(m.port, m);
+    } else noPort.push(m);
+  }
+  if (noPort.length) {
+    const key = String(config.vllmPort || 8000);
+    if (!byPort.has(key)) {
+      let best = null;
+      for (const m of noPort) { if (!best || m.maxT > best.maxT) best = m; }
+      if (best) byPort.set(key, best);
+    }
+  }
+}
+
+// v3 消费入口：返回该端口活跃 rid 状态 + 新鲜度。
+function v3StreamFor(port) {
+  const S = global.__liveStream;
+  const key = String(port || config.vllmPort || 8000);
+  const m = S.byPort.get(key);
+  const now = Date.now();
+  if (!m) return { active: [], fresh: false };
+  const active = [];
+  for (const st of m.byRid.values()) {
+    if (!st.done && st.g > 0) active.push(st);
+  }
+  const fresh = (now - m.lastWall) < LS_PORT_FRESH_MS;
+  return { active, fresh: fresh && active.length > 0, sid: m ? [...S.sids.keys()].find(k => S.sids.get(k) === m) : null, session: m };
+}
+
+// 每 rid 滑窗测速（纯自身样本）：
+//   末样本 t 距今 ≤V3_LAST_STALE 秒；基线 = 窗内最老可用样本（优先年龄≥MIN）。
+//   返回 {spd, gen, span}；无合格窗 → null（如实 --）。g 冻结（抢占/排队）
+//   → Δg=0 → null，前端回落全程均值自然衰减，绝不发放 0 速假精确。
+function v3Rate(st, nowMs) {
+  const s = st.samples;
+  if (!s || s.length < 2) return null;
+  const last = s[s.length - 1];
+  const nowS = nowMs / 1000;
+  if (nowS - last.t > V3_LAST_STALE) return null;
+  let base = null;
+  for (let k = 0; k < s.length - 1; k++) {
+    const age = nowS - s[k].t;
+    if (age < V3_WIN_MIN) continue;
+    if (age <= V3_WIN_MAX) { base = s[k]; break; }
+    if (!base) base = s[k]; // 全样本都老于窗（引擎刚恢复）：用最老者，span 会被下面钳制
+  }
+  if (!base) base = s[0];
+  const span = last.t - base.t;
+  if (span < 1.0) return null;
+  const d = last.g - base.g;
+  if (d <= 0) return null;
+  return { spd: d / span, gen: last.g, span };
+}
+
+// 上一秒真实产出（行 meta「上一秒 N」用）：窗末 g − 1s 前最近样本 g。
+function v3LastSec(st, nowMs) {
+  const s = st.samples;
+  if (!s || s.length < 1) return undefined;
+  const last = s[s.length - 1];
+  const cut = last.t - 1.0;
+  let b = null;
+  for (let k = s.length - 1; k >= 0; k--) { if (s[k].t <= cut) { b = s[k]; break; } }
+  if (!b) b = s[0];
+  return Math.max(0, last.g - b.g);
+}
+
+// 行数值字段以 rid 真值接管：累计输出 = 引擎累计 g（精确，含 MTP；旧的
+// 均摊积分/字符估算一经 v3 绑定立即作废）；decode 起点 = 引擎首 token 时刻
+// （avg_speed 分母自此精确）。
+function v3TouchRow(lv, st) {
+  lv.tokens = st.g;
+  if (st.firstT) lv.decodeStart = Math.round(st.firstT * 1000);
+  lv.v3seenAt = Date.now();
+}
+
 // ====== 控制台任务号（跨 GPU 关联同一任务）======
 // 每个经控制台代理转发的生成请求，到达时分配全局递增任务号 T<seq>。
 // PD 两步转发：prefill 腿到达即注册、decode 腿在 STEP2 真正转发（prefill 完成）
@@ -3986,6 +4226,27 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
   // 直接丢弃；其余按 FCFS 视为完成。
   while (rt.live.length > running) {
     const nowTs = Date.now();
+    if (rt.v3Count) {
+      // v3 模式（上轮流激活）：已绑 rid 的行 = 引擎活跃真值，只退未绑行
+      //（预填充完成/排队取消的那批）；全绑满仍超（gauge 滞后瞬态）退最老
+      // 绑定行并把身份按 rid 暂存，本轮 ②③④ 重新绑定时原样复活。
+      let idx = rt.live.findIndex(r => !r.v3rid && nowTs - r.startedAt >= 1000);
+      if (idx === -1) idx = rt.live.findIndex(r => !r.v3rid);
+      if (idx !== -1) {
+        const r = rt.live.splice(idx, 1)[0];
+        if (r && !r.tokens && !r.decodeStart && !r.filled) {
+          rt.hold = rt.hold || [];
+          if (rt.hold.length < 300) rt.hold.push(r);
+        }
+        continue;
+      }
+      const r = rt.live.shift();
+      if (r && r.v3rid) {
+        rt.parked = rt.parked || new Map();
+        if (rt.parked.size < 500) rt.parked.set(r.v3rid, { id: r.id, taskId: r.taskId, crid: r.crid, ip: r.ip, startedAt: r.startedAt, at: nowTs });
+      }
+      continue;
+    }
     let idx = rt.live.findIndex(r => nowTs - r.startedAt >= 1000 && nowTs - r.startedAt < 2500);
     if (idx !== -1) { rt.live.splice(idx, 1); continue; }
     idx = rt.live.findIndex(r => nowTs - r.startedAt < 1000);
@@ -4114,6 +4375,91 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
     }
   }
 
+  // ======================================================================
+  // ====== v3：引擎每请求输出真值流 → 行绑定 + 精确相位（2026-10-06） ======
+  // 流数据（readLiveStream）来自引擎内部逐步骤上报，rid 在流 = 该请求已过
+  // TTFT 且在产出 = 精确「输出中」；running − 流内数 = 预填充行数。行↔rid
+  // 绑定只决定标签（ip/任务号/REQ 号）挂到哪一行——数值永远跟着 rid 走，
+  // 绑定错位不再产生错误速度（v2 顽疾的根）。
+  // ======================================================================
+  readLiveStream();
+  const v3s = v3StreamFor(port);
+  const v3Active = v3s.fresh;
+  const v3StateById = new Map(); // rid -> st（本轮活跃）
+  if (v3Active) {
+    const nowV3 = Date.now();
+    for (const st of v3s.active) v3StateById.set(st.rid, st);
+    // 身份暂存表：行被 gauge 滞后误 retire 时按 rid 暂存身份，重新绑定时
+    // 原样复活（REQ 号/任务号/ip/曲线 key 不闪断）
+    if (!rt.parked) rt.parked = new Map();
+    for (const [rid, pk] of rt.parked) { if (nowV3 - pk.at > 60000) rt.parked.delete(rid); }
+    const claimed = new Set();
+    const bindRow = (lv, st, exact) => {
+      // 首次绑定优先复活暂存身份（REQ 号连续、sparkline 不reset）
+      const pk = rt.parked.get(st.rid);
+      if (pk) {
+        lv.id = pk.id; lv.taskId = pk.taskId; lv.crid = pk.crid; lv.ip = pk.ip;
+        rt.parked.delete(st.rid);
+      }
+      lv.v3rid = st.rid; lv.v3Exact = !!exact;
+      if (st.arrival > 0 && !lv.v3born) { lv.startedAt = Math.round(st.arrival * 1000); lv.v3born = true; } // 引擎真实进队时刻，钉一次
+      v3TouchRow(lv, st);
+      claimed.add(st.rid);
+    };
+    // ① 粘性：上轮绑定且 rid 仍活跃 → 保持（REQ 号不跳）
+    for (const lv of rt.live) {
+      if (!lv || !lv.v3rid) continue;
+      const st = v3StateById.get(lv.v3rid);
+      if (st) { v3TouchRow(lv, st); claimed.add(lv.v3rid); }
+      else { lv.v3goneAt = nowV3; lv.v3rid = null; lv.v3Exact = false; }
+    }
+    // ② 精确认领（代理流量）：taskId→crid→SSE id→rid
+    for (const lv of rt.live) {
+      if (!lv || lv.v3rid) continue;
+      const crid = lv.crid || (global.__taskCrid ? global.__taskCrid.get(lv.taskId) : null);
+      if (!crid) continue;
+      const e = global.__clientReqRid && global.__clientReqRid.get(crid);
+      if (!e) continue;
+      const rid = ridFind(v3StateById, e.rid);
+      if (!rid || claimed.has(rid)) continue;
+      bindRow(lv, v3StateById.get(rid), true);
+    }
+    // ③ 直连流量：剩余 rid × 未绑行 按引擎 arrival vs 行 startedAt 最近邻
+    const freeRids = [];
+    for (const [rid] of v3StateById) { if (!claimed.has(rid)) freeRids.push({ rid, arrive: v3StateById.get(rid).arrival * 1000 }); }
+    if (freeRids.length) {
+      const pairs = [];
+      for (let i = 0; i < rt.live.length; i++) {
+        const lv = rt.live[i];
+        if (!lv || lv.v3rid) continue;
+        for (const fr of freeRids) {
+          if (claimed.has(fr.rid)) continue;
+          const d = Math.abs(fr.arrive - lv.startedAt);
+          if (d < 30000) pairs.push({ i, rid: fr.rid, d });
+        }
+      }
+      pairs.sort((a, b) => a.d - b.d);
+      for (const pr of pairs) {
+        const lv = rt.live[pr.i];
+        if (!lv || lv.v3rid || claimed.has(pr.rid)) continue;
+        bindRow(lv, v3StateById.get(pr.rid), false);
+      }
+      // ④ 无行可领的 rid（gauge 滞后期刚进 decode）：建行接管，保行数=真值
+      for (const fr of freeRids) {
+        if (claimed.has(fr.rid)) continue;
+        const lv2 = { id: 'REQ-' + (++rt.seq), ip: '—', startedAt: Date.now(), tokens: 0, taskId: null, crid: null, filled: true };
+        rt.live.push(lv2);
+        bindRow(lv2, v3StateById.get(fr.rid), false);
+        claimed.add(fr.rid);
+      }
+    }
+    rt.v3Count = claimed.size;
+  } else if (rt.v3Count) {
+    // v3 掉线（引擎重启/插件停写）：清全部绑定，回落原链路
+    rt.v3Count = 0;
+    for (const lv of rt.live) { if (lv) { lv.v3rid = null; lv.v3Exact = false; } }
+  }
+
   // ====== Determine per-request phases & speeds ======
   let activeRequests = [];
   const savedPerReq = perReqTokens || {};
@@ -4155,13 +4501,24 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
       ? rt.lastPrefillSpeed : perRequestPrefillSpeed;
 
     // ====== Per-request phase: ground truth = has this request passed TTFT? ======
-    // A request is in PREFILL iff it has generated 0 tokens so far (never passed
-    // TTFT); once it has >=1 token it is in DECODE. We read this directly from the
-    // per-request cumulative token tracker (rt.live[i].tokens). This fixes the old
-    // bug where a prefill spanning more than one poll (newRequests==0, totalSpeed==0)
-    // fell into the "stale → assume all decode" branch and was wrongly shown as 输出中.
+    // v3（流激活）：相位 = 该行是否绑定了流上活跃 rid（引擎已过 TTFT 且在
+    // 产出）——真值，不再需要任何 bootstrap 估计。
+    // 无流回落：A request is in PREFILL iff it has generated 0 tokens so far
+    // (never passed TTFT); once it has >=1 token it is in DECODE. We read this
+    // directly from the per-request cumulative token tracker (rt.live[i].tokens).
     const phaseOf = new Array(running).fill('prefill');
     const zeroTokenIdx = [];
+    if (v3Active) {
+      for (let i = 0; i < running; i++) {
+        const lv = rt.live[i];
+        if (!lv) { zeroTokenIdx.push(i); continue; }
+        if (lv.v3rid && v3StateById.has(lv.v3rid)) phaseOf[i] = 'decode';
+        else if (lv.v3goneAt && Date.now() - lv.v3goneAt < 3000) {
+          // 刚完成（gauge 滞后）：保持「输出中」冻结显示 ≤3s，避免闪「预填充中」
+          phaseOf[i] = 'decode';
+        } else zeroTokenIdx.push(i);
+      }
+    } else {
     for (let i = 0; i < running; i++) {
       const lv = rt.live[i];
       if (lv && lv.tokens > 0) phaseOf[i] = 'decode';
@@ -4190,6 +4547,7 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
       bootstrap = Math.min(bootstrap, zeroTokenIdx.length);
       for (let j = 0; j < bootstrap; j++) phaseOf[zeroTokenIdx[zeroTokenIdx.length - 1 - j]] = 'decode';
     }
+    } // ====== v3/非 v3 相位分支收口 ======
 
     // 实际处于 decode 的行数（bootstrap 之后）。总生成速度（generation_tokens_total
     // 增量）只由 decode 行产生，prefill 行产出为 0 —— 所以单行速度必须按 decode
@@ -4201,23 +4559,42 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
     const decodeShareSpeed = numDecode > 0 ? (totalSpeed / numDecode) : 0;
 
     // ======================================================================
-    // ====== 行级实时输出速度 v2（2026-09-17 全新设计） ======
-    // 数据源 = 本模块（文件头 v2 注释）：sampler 每秒读 /metrics 每请求
-    // gauge（带真实 rid）或直方图驻回退。归属两级：
-    //   ① 精确：行凭 taskId→crid→rid（代理 tee 首帧登记）直查该 rid 序列；
-    //   ② 最近邻：直连流量按「引擎到达时刻（ttft−dec）vs 行 startedAt」
-    //      全局最近邻 + 粘性绑定（orphan 守卫）；
-    //   ③ 直方图驻留：实例无 req_id gauge 时的 v2 引擎真值（桶差分保守下界）；
-    //   ④ 全无：undefined（前端显示 --），由调用方回落 tee/residual。
-    // 数值口径：滑窗 Δgen/Δdecode_time（2~6s，分母只用该请求自身 GPU
-    // 生成时长）——排队/首包等待/引擎停顿天然排除，并发零摊分。
+    // ====== 行级瞬时速度供数（优先级：v3 引擎流 > v2 估计链 > 均摊） ======
+    // v3（2026-10-06 重设计，见 readLiveStream 模块注释）：行绑定的 rid 在
+    // 引擎输出真值流上有活跃样本 → 速度 = 自身样本滑窗差分（引擎实测、逐
+    // 请求独立、零摊分），累计/相位/TTFT 全部随 rid 精确接管。
+    // v2（保留为无流实例的降级链）：/metrics 每请求 gauge（官方 0.30 无此
+    // 族，仅带 gauge 的定制实例命中）与直方图驻留 + Little 定律估计——
+    // 各行同值、有滞后，前端标「分摊」。v3 激活时整段跳过。
     // ======================================================================
     const _nowV2 = Date.now();
     const sp = reqOutSamplerFor(port);
     sp.lastSeenAt = _nowV2; // 端口活跃标记（清理器据此回收死亡端口的采样器）
-    let v2Used = false; // 本轮存在 v2 真值行 → 后续 v1 回落路径整体跳过
-    const rowV2 = new Array(running).fill(null); // {spd,gen,src} 行 v2 速度
-    {
+    let v2Used = false; // 本轮存在每请求实测行 → 后续回落估计路径整体跳过
+    const rowV2 = new Array(running).fill(null); // {spd,gen,src} 行级瞬时速度
+    if (v3Active) {
+      const nowV3b = Date.now();
+      for (let i = 0; i < running; i++) {
+        const lv = rt.live[i];
+        if (!lv || phaseOf[i] !== 'decode') continue;
+        const st = lv.v3rid ? v3StateById.get(lv.v3rid) : null;
+        if (st) {
+          const rs = v3Rate(st, nowV3b);
+          v3TouchRow(lv, st);
+          rowV2[i] = { spd: rs ? rs.spd : undefined, gen: st.g, src: lv.v3Exact ? 'v3-exact' : 'v3' };
+          lv.v3lastSec = v3LastSec(st, nowV3b);
+          v2Used = true;
+        } else if (lv.v3goneAt && nowV3b - lv.v3goneAt < 3000) {
+          // 刚完成（gauge 滞后 ≤3s）：瞬时速度不出数，累计冻结在终值
+          rowV2[i] = { spd: undefined, gen: lv.tokens, src: 'v3' };
+          v2Used = true;
+        }
+      }
+      rt.__v3 = { n: rt.v3Count || 0, rids: v3s.active.length };
+      rt.__v2 = { n: 0, sum: 0, reqs: 0, cfgOk: sp.cfgOk, hist: false, v3: true };
+    }
+    if (!v3Active) {
+      {
       // ---- 归属阶段（幂等：已绑定行保持，新行重配） ----
       const claimed = new Set(); // 本轮已被行占用的 rid（orphan/最近邻守卫）
       // ① 精确认领：taskId→crid→rid（代理流量）
@@ -4335,6 +4712,7 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
         rt.__v2 = { n: v2N, sum: v2Sum, reqs: sp.reqs.size, cfgOk: sp.cfgOk, hist: !!rt.__v2Hist };
       }
     }
+    } // ====== v2 降级链收口（v3 激活时整段不执行） ======
     // ====== 回落路径（v2 无数据时启用：实例级短窗吞吐 + tee/引擎滑窗）======
     let instTotalThroughput;
     // v2-hist 模式：直方图驻留已建立时优先用 sampler 同口径吞吐（避免与
@@ -4420,7 +4798,7 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
     };
     const rowEngOut = new Array(running).fill(undefined);
     {
-      const lpm2 = (livePrefill && livePrefill.byRid) || null;
+      const lpm2 = (!v3Active && livePrefill && livePrefill.byRid) || null;
       if (lpm2) {
         for (let i = 0; i < running; i++) {
           if (phaseOf[i] !== 'decode') continue;
@@ -4609,8 +4987,10 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
       let reqSpdSrc;
       if (reqPhase === 'decode') {
         if (rowV2[i] !== null && rowV2[i].src !== 'hist') {
-          // v2 精确/最近邻每请求真值（decode 时间滑窗；引擎绝对值不缩放）
-          reqSpeed3s = parseFloat(rowV2[i].spd.toFixed(1)); reqSpdSrc = 'v2-' + rowV2[i].src;
+          // v3/v2 每请求实测（引擎绝对值不缩放）。v3 窗未成熟/流冻结时 spd 为
+          // undefined → 不发瞬时数（前端回落全程均值，同样精确），绝不编造。
+          reqSpeed3s = rowV2[i].spd !== undefined ? parseFloat(rowV2[i].spd.toFixed(1)) : undefined;
+          reqSpdSrc = (rowV2[i].src === 'v3' || rowV2[i].src === 'v3-exact') ? rowV2[i].src : 'v2-' + rowV2[i].src;
         } else if (rowV2[i] !== null && rowV2[i].src === 'hist') {
           // v2 直方图驻留（每行同值 = 实例吞吐÷引擎测得并发数 λ̄×W）。优先于
           // 逐行 tee：无每请求 gauge 的实例上 tee 依赖易漂移的 行↔流 配对，
@@ -4640,9 +5020,13 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
       // the batch's measured last-second token total split across decode rows.
       // In lockstep decode every row gets the same count — that is the truth.
       const tk = (ticker && ticker.lastSecond) ? ticker.lastSecond : { tokens: 0 };
-      const tokLastSec = reqPhase === 'decode' && numDecode > 0
-        ? Math.max(0, Math.round((tk.tokens || 0) / numDecode))
-        : 0;
+      // 「上一秒」：v3 行 = 该 rid 自身样本 1s 差分（每请求精确）；无 v3 沿用
+      // 本批实测总产出的 decode 行分摊（齐步 decode 下各行真值本就相同）。
+      const tokLastSec = reqPhase === 'decode' && rt.live[i] && rt.live[i].v3lastSec !== undefined
+        ? rt.live[i].v3lastSec
+        : (reqPhase === 'decode' && numDecode > 0
+          ? Math.max(0, Math.round((tk.tokens || 0) / numDecode))
+          : 0);
 
       // ====== 本行预填充统计：引擎实测 > 实测聚合守恒分摊 > 历史估算 ======
       // 1) 引擎实测（prefill_exact=true，vLLM 插件实时回传）：该请求的
@@ -4755,8 +5139,8 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
         speed_src: reqSpdSrc,
         // v2 诊断（绑定链可观测性）：pp=行绑定的引擎 rid 尾段，ex=是否 tee
         // 精确确认，cn=cHist 样本数（测速窗料），ck=taskId 是否认领到 crid。
-        pp_rid: live.ppRid ? String(live.ppRid).slice(-8) : null,
-        pp_exact: !!live.ppExact,
+        pp_rid: (live.v3rid || live.ppRid) ? String(live.v3rid || live.ppRid).slice(-8) : null,
+        pp_exact: !!(live.v3Exact || live.ppExact),
         chist_n: Array.isArray(live.cHist) ? live.cHist.length : 0,
         has_crid: !!(live.crid || (live.taskId && global.__taskCrid && global.__taskCrid.get(live.taskId))),
         speed: reqPhase === 'prefill' ? 0 : reqSpeed,
@@ -5798,7 +6182,7 @@ async function startVllmModel(modelName, params, callback) {
   // 弹窗缺省关闭 → 不传任何 flag，与旧行为逐字一致；PD 模式跳过（其自带 NixlConnector 配置）。
   // 注意：mamba 混合模型（qwen3.8-27b 系列）在本机 vLLM 0.29 上未验证过 connector，
   // 若开启后启动失败，把弹窗「二级缓存」切回关闭即可。
-  if (String(kvoff) === '1' && String(pdMode) !== '1') {
+  if ((String(kvoff) === '1' || String(kvoff) === 'simple') && String(pdMode) !== '1') {
     const koGiB = Math.max(8, Math.min(256, parseInt(kvoffGiB, 10) || 64));
     args.push('--kv-transfer-config', JSON.stringify({
       kv_connector: 'OffloadingConnector',

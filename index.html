@@ -1817,7 +1817,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20260927-r3'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20261006-r5'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -2511,7 +2511,7 @@ async function renderConcurrentCard(s) {
                             '</div>' +
                             '<div style="flex:1;min-width:0">' + tpsSpark(r.taskId || r.id, 'var(--green)', 'decode') + '</div>' +
                             '<div style="text-align:right;flex-shrink:0">' +
-                            '<div><span style="font-size:18px;font-weight:800;color:var(--green);font-variant-numeric:tabular-nums">' + (decodeTps > 0 ? decodeTps.toFixed(1) : '--') + '</span><span style="font-size:10px;color:var(--text-tertiary);margin-left:3px" title="' + (r.speed_src === 'residual' ? '该请求无每请求实测数据，值为并发各行按引擎总吞吐均摊（估算）' : r.speed_src === 'v2-exact' ? '引擎每请求实测·精确绑定（decode 时间滑窗）' : r.speed_src === 'v2-nearest' ? '引擎每请求实测·时间匹配（decode 时间滑窗）' : r.speed_src === 'v2-eng' ? '引擎每请求实时实测（调度器流式上报 computed 增量，按到达时间匹配）' : r.speed_src === 'v2-hist' ? '引擎实测·守恒分摊（实例生成吞吐 ÷ 引擎测得并发数，各输出行同值）' : r.speed_src === 'engine' ? '引擎每请求实时实测（近3s滑窗）' : r.speed_src === 'tee' ? '代理流每请求实测（近3s滑窗）' : '代理流每请求实测') + '">' + (has3s ? (String(r.speed_src || '').indexOf('v2-') === 0 ? (r.speed_src === 'v2-hist' ? '实时 tok/s·分摊' : '实时 tok/s·实测') : r.speed_src === 'residual' ? '实时 tok/s·均摊' : '近3s tok/s') : '全程均值 tok/s') + '</span></div>' +
+                            '<div><span style="font-size:18px;font-weight:800;color:var(--green);font-variant-numeric:tabular-nums">' + (decodeTps > 0 ? decodeTps.toFixed(1) : '--') + '</span><span style="font-size:10px;color:var(--text-tertiary);margin-left:3px" title="' + (r.speed_src === 'v3-exact' ? '引擎每步输出真值流·精确绑定（本请求自身样本滑窗差分，MTP 含投机接受；排队/停顿期如实不出数）' : r.speed_src === 'v3' ? '引擎每步输出真值流·每请求实测（数值即该 rid 真值；行↔请求按到达时间配对，只影响标签归属不影响数值）' : r.speed_src === 'residual' ? '该请求无每请求实测数据，值为并发各行按引擎总吞吐均摊（估算）' : r.speed_src === 'v2-exact' ? '引擎每请求实测·精确绑定（decode 时间滑窗）' : r.speed_src === 'v2-nearest' ? '引擎每请求实测·时间匹配（decode 时间滑窗）' : r.speed_src === 'v2-eng' ? '引擎每请求实时实测（调度器流式上报 computed 增量，按到达时间匹配）' : r.speed_src === 'v2-hist' ? '引擎实测·守恒分摊（实例生成吞吐 ÷ 引擎测得并发数，各输出行同值）' : r.speed_src === 'engine' ? '引擎每请求实时实测（近3s滑窗）' : r.speed_src === 'tee' ? '代理流每请求实测（近3s滑窗）' : '代理流每请求实测') + '">' + (has3s ? (String(r.speed_src || '').indexOf('v3') === 0 ? '实时 tok/s·实测' : String(r.speed_src || '').indexOf('v2-') === 0 ? (r.speed_src === 'v2-hist' ? '实时 tok/s·分摊' : '实时 tok/s·实测') : r.speed_src === 'residual' ? '实时 tok/s·均摊' : '近3s tok/s') : '全程均值 tok/s') + '</span></div>' +
                             (prefillTps > 0 ? '<div style="font-size:10px;color:var(--text-tertiary);margin-top:1px">预填充 <span style="color:var(--orange);font-weight:600">' + prefillTps.toFixed(0) + '</span> tok/s' + (ppExact ? ' <span style="color:var(--green)">实测</span>' : '') + '</div>' : '') +
                             '</div></div>';
                     } else {
@@ -2711,6 +2711,7 @@ async function _doRefreshDashboard() {
                 const _koFmt = (n) => (typeof billingTokenFmt === 'function' ? billingTokenFmt(n) : Number(n).toLocaleString());
                 if (_koPorts.length) {
                     const _isFill = _koPorts.every(p => (p.metric_kind || 'fill') === 'fill');
+                    const _isSimple = _koPorts.every(p => p.metric_kind === 'simple');
                     const _cap = _koPorts.reduce((n, p) => n + (p.capacity_gb || 0), 0);
                     const _fill = _koPorts.reduce((n, p) => n + (p.fill_gb || 0), 0);
                     const _sto = _koPorts.reduce((n, p) => n + (p.stored_gb || 0), 0);
@@ -2724,7 +2725,7 @@ async function _doRefreshDashboard() {
                         ? (_cap > 0 ? (_fill / _cap * 100).toFixed(0) : '--')
                         : (_koPorts.reduce((n, p) => n + (p.fill_pct || 0), 0) / _koPorts.length).toFixed(0);
                     // 新栈驻留真值：单实例时 /dev/shm 已用量即该实例内存档占用（多实例时不可切分，退回容量口径）
-                    const _memG = (!_isFill && _koPorts.length === 1 && _koMem && _koMem.used_gb > 0.05) ? _koMem.used_gb : null;
+                    const _memG = (!_isFill && !_isSimple && _koPorts.length === 1 && _koMem && _koMem.used_gb > 0.05) ? _koMem.used_gb : null;
                     // 主值已用 /dev/shm 实测驻留时，小字的百分比是「在飞钉住」而非驻留，标签必须区分
                     const _rTag = _isFill ? '驻留' : (_memG != null ? '在飞' : '钉住');
                     if (_koVal) {
@@ -2734,15 +2735,17 @@ async function _doRefreshDashboard() {
                         else _koVal.innerHTML = '已启用<span class="metric-item-unit"> 容量未知</span>';
                     }
                     if (_koHint) {
-                        const _hp = [_rTag + ' ' + _pct + '%'];
+                        const _hp = _isSimple ? ['SimpleCPU档'] : [_rTag + ' ' + _pct + '%'];
                         if (_qry > 0) _hp.push('查 ' + _koFmt(_qry) + '/中 ' + _koFmt(_hit));
                         else if (_ext > 0) _hp.push('命中 ' + _koFmt(_ext) + ' tok');
-                        _hp.push('存 ' + _sto.toFixed(1) + ' GiB');
+                        if (!_isSimple) _hp.push('存 ' + _sto.toFixed(1) + ' GiB');
                         _koHint.textContent = _hp.join(' · ');
                     }
                     _koCard.title = _koPorts.map(p => {
                         const _k = p.metric_kind || 'fill';
-                        const _stat = _k === 'fill'
+                        const _stat = _k === 'simple'
+                            ? '容量 ' + (p.capacity_gb || 0).toFixed(0) + ' GiB · SimpleCPU 锁页档（存/在飞不经指标暴露，命中看 external 计数）'
+                            : _k === 'fill'
                             ? '驻留 ' + (p.fill_gb || 0).toFixed(1) + '/' + (p.capacity_gb || 0).toFixed(0) + ' GiB（' + (p.fill_pct || 0).toFixed(1) + '%）'
                             : '容量 ' + (p.capacity_gb || 0).toFixed(0) + ' GiB · 在飞钉住 ' + (p.fill_pct || 0).toFixed(1) + '%（钉住≠驻留量）';
                         return ('GPU' + (p.gpus && p.gpus.length > 1 ? p.gpus.join('+') : (p.gpu != null ? p.gpu : '?'))) + ' :' + (p.model || p.port || '?') +
@@ -3881,7 +3884,7 @@ function startConfigDefaults(modelName, suggestPort, suggestGpu) {
             mtp: smd.mtp === '1' ? '1' : '0', dflash: '0', dspark: '0', mtpTokens: smd.mtpTokens || 6,
             kvCacheQuant: 'auto', retention: '', runtime: 'vllm',
             // [kvoff-toggle 09-22][sync 09-23] 脚本化模型（Flash-Next W4A16）：二级缓存=生产现状（开，96GiB，c5a 后命中已通）
-            kvOff: '0', kvOffGiB: Number(smd.kvOffGiB) || 96, // 0929 A/B 定案：缺省关
+            kvOff: String(smd.kvoff || 'simple'), kvOffGiB: Number(smd.kvoffGiB || smd.kvOffGiB) || 96, // 0927 生产定版=SimpleCPU 96GiB
             // [ple-field 0923] PLE 表精度=生产现状（INT8 磁盘驻留；选 BF16 则下发 FN_PLE_INT8=0）
             pleInt8: '1',
             // [ple-loc 0923][sync 09-23] 生产=heap：大 pinned 二级层会挤压页缓存，disk 模式有 09-19 缺页拖垮 decode 的事故模式；heap 匿名堆免疫此压力
@@ -4355,11 +4358,12 @@ function startModalFieldsHtml(modelName, suggestPort, suggestGpu) {
                         fp8_kv：仅对 KV 缓存做 FP8 量化，模型权重保持原精度，兼容所有模型。
                     </div>
                 </div>
-                <div class="config-field" style="margin-top:12px" data-tip="CPU KV 二级缓存（vLLM OffloadingConnector）：把显存 KV 块溢出到 CPU 内存形成第二层前缀缓存，超出显存池的长前缀回发时可回载、免重算。脚本化模型（Flash-Next）默认开启 64GiB（需镜像内 kvoff-c1/c2 补丁，已打）；普通 vLLM 开启=追加 --kv-transfer-config（mamba 混合模型本机未验证，启动失败请关闭本开关）；SGLang 运行时忽略。容量须 ≥ GPU KV 池才有收益（小于则是负优化，09-18 实测）。">
+                <div class="config-field" style="margin-top:12px" data-tip="CPU KV 二级缓存：把显存 KV 溢出到 CPU 内存形成第二层前缀缓存，被挤出显存的长前缀重发时免重算。SimpleCPU（推荐）=官方 vLLM 0.30 SimpleCPUOffloadConnector，脚本化模型（Flash-Next）经 inner 一等开关 FN_SIMPLE_OFFLOAD 下发 --kv-offloading-size；容量≈36.3万token/GiB（96GiB≈349万=2.9×GPU池），挤池窗口实测命中 80~97%、回载验证码无损；与经典档互斥（同开拒启）。经典 OffloadingConnector 0929 已退役（分组行开销致有效容量缩水 11×，生产零命中），仅留 A/B 取证。普通 vLLM 实例选 SimpleCPU 时按经典 connector 下发（simple 路径未在 27b 系验证）。容量须 ≥ GPU KV 池才有收益；启动后看仪表盘「二级缓存·CPU」卡（查/中计数）。"
                     <label class="config-label">二级缓存（CPU KV offload）</label>
                     <select id="modalKvOff" class="config-input" style="max-width:240px">
-                        <option value="0" selected>关闭 — 不溢出到内存</option>
-                        <option value="1">开启 — KV 缓存溢出到 CPU 内存</option>
+                        <option value="simple" selected>SimpleCPU — 官方锁页内存档（生产定版，推荐）</option>
+                        <option value="0">关闭 — 不溢出到内存</option>
+                        <option value="1">经典 OffloadingConnector（已退役，仅 A/B 取证）</option>
                     </select>
                     <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
                         <label style="font-size:12px;color:var(--text-secondary)">内存档容量</label>

@@ -61,6 +61,17 @@ class DshRequestLogger(StatLoggerBase):  # type: ignore[misc]
         # per-request prefill progress/speed (see server.js readLivePrefill).
         self.live_path = os.environ.get(
             "DSH_LIVE_PREFILL_FILE", "/home/ll/deploy/vllm-live-prefill.jsonl")
+        # [v3 2026-09-28] 每步每请求输出真值流：rt-patch #11 把官方前端
+        # IterationStats.update_from_output 手里的 (rid, 累计gen, arrival,
+        # 首token标记) 搭车到 iteration_stats._dsh_reqs，本插件每步转写
+        # 到此文件（一行一 rid 一步）。控制台 readLiveStream tail 后
+        # 按 rid 滑窗差分 → 并发卡实时 tok/s = 引擎自报真值。
+        # port 用于多实例归属（inner 脚本 export DSH_ENGINE_PORT）。
+        self.stream_path = os.environ.get(
+            "DSH_LIVE_STREAM_FILE", "/home/ll/deploy/vllm-live-stream.jsonl")
+        self._port = os.environ.get("DSH_ENGINE_PORT", "") or ""
+        self._pid = os.getpid()
+        self._trim_at = {}  # path -> next record() count to re-check size
         # Session id: random per plugin init → console detects vLLM restart by
         # a sid change and re-matches REQ rows to engine requests.
         self._sid = os.urandom(4).hex()
@@ -112,6 +123,71 @@ class DshRequestLogger(StatLoggerBase):  # type: ignore[misc]
                         "computed": rec.get("computed", 0),
                         "cached": rec.get("cached", 0),
                     }, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _trim(self, path: str, keep_lines: int) -> None:
+        """Ring trim：文件超限则只保留尾部 keep_lines 行（每 200 次写才 stat 一次）。
+
+        高频流文件每次 record() 都写，逐次 stat 会白白多一倍 syscall；
+        限频后超限最多拖后 200 个写周期，行宽 ~120B 时误差 <25KB，可忽略。
+        """
+        n = self._trim_at.get(path, 0)
+        if n:
+            self._trim_at[path] = n - 1
+            return
+        self._trim_at[path] = 200
+        try:
+            if os.path.getsize(path) > self.MAX_BYTES:
+                with open(path, "r", encoding="utf-8") as f:
+                    keep = f.read().splitlines()[-keep_lines:]
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(keep) + "\n")
+        except Exception:
+            pass
+
+    def _write_stream(self, iteration_stats) -> None:
+        """[v3] 每步转写每请求输出真值流（rt-patch #11 搭车的 _dsh_reqs）。
+
+        行格式（控制台 readLiveStream 消费）：
+          进度行  {"t","sid","pid","port","rid","g","a","pf","n"}
+            g=该 rid 累计输出 token（引擎真值） a=进引擎墙钟 epoch
+            pf=1 该行所在步是首 token 步（TTFT 标记） n=本步新 token 数（含 MTP）
+          完成行  {"t","sid","pid","port","rid","f":1,"g","a"}（finished_requests）
+        t 用 iteration_timestamp（与 a 同域、与产生时刻最接近）；缺则 time.time()。
+        """
+        d = getattr(iteration_stats, "_dsh_reqs", None)
+        finished = getattr(iteration_stats, "finished_requests", None) or []
+        if not d and not finished:
+            return
+        ts = getattr(iteration_stats, "iteration_timestamp", None) or time.time()
+        ts = round(ts, 3)
+        lines = []
+        try:
+            for rid, ent in d.items():
+                lines.append(json.dumps({
+                    "t": ts, "sid": self._sid, "pid": self._pid, "port": self._port,
+                    "rid": rid, "g": ent[0], "a": round(ent[1], 3),
+                    "pf": ent[2], "n": ent[3],
+                }, separators=(",", ":"), ensure_ascii=False))
+            for r in finished:
+                try:
+                    lines.append(json.dumps({
+                        "t": ts, "sid": self._sid, "pid": self._pid, "port": self._port,
+                        "rid": r.request_id, "f": 1,
+                        "g": int(getattr(r, "num_generation_tokens", 0) or 0),
+                        "a": round(time.time() - (getattr(r, "e2e_latency", 0.0) or 0.0), 3),
+                    }, separators=(",", ":"), ensure_ascii=False))
+                except Exception:
+                    continue
+        except Exception:
+            return
+        if not lines:
+            return
+        try:
+            with open(self.stream_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            self._trim(self.stream_path, 40000)
         except Exception:
             pass
 
@@ -206,6 +282,13 @@ class DshRequestLogger(StatLoggerBase):  # type: ignore[misc]
             self._write_live_prefill(out)
         except Exception:
             pass
+
+        # [v3] 每步每请求输出真值流（rt-patch #11 搭车数据，官方栈主通道）
+        if iteration_stats is not None:
+            try:
+                self._write_stream(iteration_stats)
+            except Exception:
+                pass
 
         if not iteration_stats:
             return

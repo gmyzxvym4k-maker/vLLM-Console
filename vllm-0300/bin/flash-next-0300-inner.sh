@@ -112,6 +112,19 @@ MEMLOCK=$(ulimit -l)
 # 顺序：上游目录在前，本地扩展在后 —— 上游 _chain_stock_sitecustomize() 会按 sys.path
 # 跳过自己目录、加载第一个外部 sitecustomize.py，即 patches-extra/sitecustomize.py。
 export PYTHONPATH="$RT_DIR:$RT_EXTRA${PYTHONPATH:+:$PYTHONPATH}"
+# ---- segfault 取证链（0927 rt-patch#10 配套）：允许 core dump，复发可直接 gdb bt ----
+# PLE 表+offload 档在 251GB 机器上，worker core 可能上百 GB：落数据盘（1.5T 空闲），
+# 绝不落系统盘。core_pattern 全局唯一，写前比对避免重复写。
+CORE_DIR=/media/ll/data/cores
+mkdir -p "$CORE_DIR" && chmod 1777 "$CORE_DIR" 2>/dev/null
+ulimit -c unlimited 2>/dev/null || true
+DESIRED="$CORE_DIR/core.%e.%p.%t"
+if [ "$(cat /proc/sys/kernel/core_pattern 2>/dev/null)" != "$DESIRED" ]; then
+  echo "$DESIRED" > /proc/sys/kernel/core_pattern 2>/dev/null \
+    && echo "[FN-0300] core_pattern -> $DESIRED (ulimit -c=$(ulimit -c))" >&2 \
+    || echo "[FN-0300] core_pattern 设置失败（忽略，不影响服务）" >&2
+fi
+
 export VLLM_RT_PATCHES=1
 
 # ---------------------------------------------------------------- PLE（Engram）
@@ -136,6 +149,9 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 # 多模态 warmup 跳过（rt-patch #8，本地扩展补丁）
 export VLLM_SKIP_MM_WARMUP=1
+# [v3 0928→1006] 每请求输出真值流（rt-patch #11 + dsh_vllm_logger stream）：
+# 插件把本变量打进 vllm-live-stream.jsonl 每行 port 字段 → 控制台多实例归属。
+export DSH_ENGINE_PORT="${FN_PORT:-18420}"
 # NCCL：与旧栈实跑逐项一致（P2P 已打通，走 PHB 级放行）
 export NCCL_CUMEM_ENABLE=0
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
@@ -206,17 +222,30 @@ if [ -n "${FN_SCHED_POLICY:-}" ]; then ARGS+=(--scheduling-policy "$FN_SCHED_POL
 #    1005 起经 rt-patch #9（patches-extra/dsh_kvoff_rt.py）移植回 0.30.0，缺省仍关。
 
 # ------------------------------------------------------- CPU KV 二级缓存
-# 1005 移植定版（rt-patch #9，语义=旧栈 c1/c2/c6/c7）：缺省关。
-# 旧栈结论全部继承：
-#  · 物理钉住 ≈1.56x 配置值（PP2 每 rank 私有 pinned，容量铁律 09-22）；
-#  · 容量必须 > GPU KV 池（≈122 万 tok）才有回载收益，store 侧 ≈40.4KB/token；
-#  · 对本机流量形态收益存疑（0929 退役依据：21h 生产 external hits=0，GPU 池自扛 ~90%）；
-#  · store 熔断只读降级 + 有界等待已内置（FN_KVOFF_WAIT_TIMEOUT 缺省 15s）。
+# 1005 移植定版（rt-patch #9，语义=旧栈 c1/c2/c6/c7）；1006 增补 c8「公共区」。
+# 缺省仍关（FN_KVOFF=0）。开启后的三条口径：
+#  · **物理钉住 = 配置值**（c8：PP2 下跨 rank 前缀和偏移的单一共享 pinned 区，
+#    /dev/shm/vllm_kvoff_slot.<engine>.r<rank>.json 协商）。c8 不适用/协商失败
+#    才退回 c2 每 rank 私有缓冲（≈1.56~2× 配置值，09-22 实测 64GiB→107GB）。
+#    显式关闭公共区：FN_KVOFF_SHARED=0。
+#  · 容量必须 > GPU KV 池（≈122 万 tok）才有回载收益；公共区下
+#    容量 = cpu_bytes_to_use ÷ 全局每块字节（≈51 MB/1616 tok ≈ 32 KB/token）
+#    ⇒ 64 GiB ≈ 236 万 tok = 1.95× GPU 池 ✓（私有路径要 107 GB 才够）。
+#  · 对本机流量形态收益存疑（0929 退役依据：21h 生产 external hits=0，
+#    GPU 池自扛 ~90%）；store 熔断只读降级 + 有界等待已内置
+#    （FN_KVOFF_WAIT_TIMEOUT 缺省 15s）。
 if [ "${FN_KVOFF:-0}" = "1" ]; then
   KVOFF_BYTES="${FN_KVOFF_BYTES:-68719476736}"
+  export FN_KVOFF_SHARED="${FN_KVOFF_SHARED:-1}"
   ARGS+=(--kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${KVOFF_BYTES}}}")
   export FN_KVOFF_WAIT_TIMEOUT="${FN_KVOFF_WAIT_TIMEOUT:-15}"
-  echo "[FN-0300] CPU KV 二级缓存：开 cpu_bytes_to_use=${KVOFF_BYTES} ($(( KVOFF_BYTES / 1073741824 )) GiB) wait_timeout=${FN_KVOFF_WAIT_TIMEOUT}s（rt-patch#9 c1/c2/c6/c7 已挂）" >&2
+  # 公共区是 tmpfs 文件，先看 /dev/shm 放得下（放不下 rt-patch 会自己退回私有，
+  # 这里只是提前出声，免得启动日志里两行相隔太远看不出因果）
+  SHM_FREE=$(df -B1 --output=avail /dev/shm 2>/dev/null | tail -1 | tr -d ' ')
+  if [ -n "${SHM_FREE:-}" ] && [ "${FN_KVOFF_SHARED}" = "1" ]      && [ "$SHM_FREE" -lt "$(( KVOFF_BYTES * 102 / 100 ))" ]; then
+    echo "[FN-0300] 警告：/dev/shm 可用 $(( SHM_FREE / 1073741824 )) GiB < 公共区 ${KVOFF_BYTES} 字节 ⇒ 会退回每 rank 私有 pinned（物理 ≈1.56x）" >&2
+  fi
+  echo "[FN-0300] CPU KV 二级缓存：开 cpu_bytes_to_use=${KVOFF_BYTES} ($(( KVOFF_BYTES / 1073741824 )) GiB) wait_timeout=${FN_KVOFF_WAIT_TIMEOUT}s 公共区=${FN_KVOFF_SHARED}（rt-patch#9 c1/c2/c6/c7/c8 已挂）" >&2
 fi
 
 if [ "${FN_EP:-0}" = "1" ]; then ARGS+=(--enable-expert-parallel); fi
@@ -256,6 +285,21 @@ if [ -n "${FN_EXTRA_ENV:-}" ]; then
   for kv in $FN_EXTRA_ENV; do export "$kv"; done
 fi
 
+# ------------------------------------------------ 内存二级缓存（官方 simple 实现）
+# 【2026-09-27 定版】经典 OffloadingConnector（FN_KVOFF=1）对本模型的 hybrid 递归状态
+# 回载语义不成立（详见交付仓库 stack-0300/ROUND2-verification.md §7）；官方新实现
+# SimpleCPUOffloadConnector（SupportsHMA，专为 hybrid 设计）实测正确（§9）。
+# 用法：FN_SIMPLE_OFFLOAD=<GiB>（两 rank 合计），或控制台「内存二级缓存(GB)」字段。
+if [ -n "${FN_SIMPLE_OFFLOAD:-}" ]; then
+  if [ "${FN_KVOFF:-0}" = "1" ]; then
+    echo "[FN-0300] 拒绝启动：FN_KVOFF=1（经典连接器）与 FN_SIMPLE_OFFLOAD 互斥，请只用后者" >&2
+    exit 1
+  fi
+  export VLLM_USE_SIMPLE_KV_OFFLOAD=1
+  ARGS+=(--kv-offloading-size "$FN_SIMPLE_OFFLOAD")
+  echo "[FN-0300] 内存二级缓存：SimpleCPUOffloadConnector，CPU 档 ${FN_SIMPLE_OFFLOAD} GiB（world_size 均分）" >&2
+fi
+
 # ---------------------------------------------------------------- 参数体检
 # 目标：任何「弹窗里能填、本脚本不消费」的 FN_* 都必须显式出声。
 # FN_PLE_INT8 / FN_KVOFF 在旧栈就是靠缺省值生效、切档静默失效（09-18 定版事故），
@@ -265,7 +309,8 @@ FN_MAXLEN FN_MAXLEN_EFF FN_PORT FN_SERVED FN_TP FN_PP FN_PP_PARTITION FN_DTYPE F
 FN_SEQS FN_GPUMEM FN_BLOCK FN_MBTOKENS FN_MOE FN_EP FN_EAGER FN_ENFORCE_EAGER FN_SPEC \
 FN_PREFIX_CACHE FN_CHUNKED FN_ASYNC FN_SEED FN_GENCFG FN_CHATKWARGS FN_CACHE_ROOT \
 FN_LOGLEVEL FN_CUDA_VISIBLE_DEVICES FN_EXTRA_ARGS FN_EXTRA_ENV FN_DRY_RUN \
-FN_KVOFF FN_KVOFF_BYTES FN_KVOFF_WAIT_TIMEOUT FN_SCHED_POLICY "
+FN_KVOFF FN_KVOFF_BYTES FN_KVOFF_WAIT_TIMEOUT FN_KVOFF_SHARED FN_SIMPLE_OFFLOAD \
+FN_KVOFF_LAYOUT_TIMEOUT FN_KVOFF_LAYOUT_WINDOW FN_SCHED_POLICY "
 NOOP_NOTE_FN_CPU_OFFLOAD_GB="FN_KVOFF=1 时用 FN_KVOFF_BYTES（字节数）指定容量，本变量未接"
 NOOP_NOTE_FN_PLE_INT8="官方 0.30.0 只有 BF16 锁页一档，INT8/磁盘驻留是旧镜像自研加载器（README-0300.md §3）"
 NOOP_NOTE_FN_PLE_LOC="$NOOP_NOTE_FN_PLE_INT8"

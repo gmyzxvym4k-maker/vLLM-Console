@@ -823,7 +823,25 @@ function scriptModelLaunchPlan(sm, d) {
   env.FN_SEQS = String(int(d.maxNumSeqs, b.maxNumSeqs));
   env.FN_BLOCK = String(int(d.blockSize, b.blockSize));
   env.FN_MBTOKENS = String(int(d.maxBatchedTokens, b.maxBatchedTokens));
-  env.FN_PP = String(b.pp || 2);
+  // [tp-presets 0928] 并行模式可切：弹窗/预设的 parallelMode='tp' + gpuCount=N →
+  // TP=N×PP=1；'pp' 或字段缺失 → 生产基准 PP=base.pp||2（TP1），与旧行为一致。
+  // TP2 内存账：PLE 表官方实现是 ETP-sharded（95.4GiB 跨 rank 分片，总量不变，
+  // 每 rank 常驻 ~47.7GiB）；SimpleCPU --kv-offloading-size 按 world_size 均分
+  // （96→48/rank，总量不变）⇒ 与 PP2 同账，251GiB 内存成立。
+  // 关键护栏：PP=1 时上游按 VLLM_PP_LAYER_PARTITION 的列表长度==pp_size 校验，
+  // 缺省 "26,22" 会让 TP 档启动直接 ValueError —— 用 FN_PP_PARTITION='none'
+  // 通知 inner 不设该变量（inner 侧配套改动，见 flash-next-0300-inner.sh）。
+  const _parMode = String(d.parallelMode || '').toLowerCase();
+  const _gpus = int(d.gpuCount, 0);
+  if (_parMode === 'tp' && _gpus >= 1) {
+    env.FN_TP = String(_gpus);
+    env.FN_PP = '1';
+    env.FN_PP_PARTITION = 'none';
+    if (_gpus !== 2) warnings.push('TP×' + _gpus + '：本机 2 张卡，请确认卡数与 --tensor-parallel-size 匹配（TP2 为当前硬件满配）');
+  } else {
+    env.FN_TP = '1';
+    env.FN_PP = String(_parMode === 'pp' && _gpus >= 1 ? _gpus : (b.pp || 2));
+  }
   env.FN_PREFIX_CACHE = String(String(d.prefixCaching) === '0' ? 0 : 1);
   env.FN_CHUNKED = String(String(d.chunkedPrefill) === '0' ? 0 : 1);
   env.FN_ASYNC = String(String(d.asyncScheduling) === '0' ? 0 : 1);
@@ -935,7 +953,7 @@ function scriptModelLaunchPlan(sm, d) {
     'serve ' + (env.FN_MODEL_PATH || sm.modelPath), '--served-model-name ' + served, '--port ' + port,
     '--max-model-len ' + maxLen, '--gpu-memory-utilization ' + env.FN_GPUMEM,
     '--max-num-seqs ' + env.FN_SEQS, '--max-num-batched-tokens ' + env.FN_MBTOKENS,
-    '--block-size ' + env.FN_BLOCK, '--pipeline-parallel-size ' + env.FN_PP,
+    '--block-size ' + env.FN_BLOCK, 'TP' + env.FN_TP + '×PP' + env.FN_PP,
     env.FN_SPEC ? ('spec=' + env.FN_SPEC) : '无投机',
     env.FN_GENCFG ? ('gen=' + env.FN_GENCFG) : '采样=模型默认',
     env.FN_LONGCTX === '1' ? '长上下文=YaRN×4/1M' : '',

@@ -136,7 +136,14 @@ export VLLM_PLE_CPU_OFFLOAD=1
 echo "[FN-0300] PLE 表：官方 BF16 锁页（pinned CPU 95.4 GiB，PP rank0 独占），由 rt-patch 分块 cuMemHostRegister(<=60 GiB)" >&2
 
 # ---------------------------------------------------------------- 并行/显存
-export VLLM_PP_LAYER_PARTITION="${FN_PP_PARTITION:-26,22}"
+# [tp-presets 0928] VLLM_PP_LAYER_PARTITION 只在 PP>1 时有意义，且上游按
+# 「列表长度 == pp_size」强校验（"26,22" 长度 2 ≠ pp=1 → 启动 ValueError）。
+# 控制台 plan 在 TP 档下发 FN_PP_PARTITION=none；PP 档不带该值走缺省 26,22。
+if [ "${FN_PP_PARTITION:-}" = "none" ]; then
+  echo "[FN-0300] 并行=TP${FN_TP:-1}×PP1：不设 VLLM_PP_LAYER_PARTITION" >&2
+else
+  export VLLM_PP_LAYER_PARTITION="${FN_PP_PARTITION:-26,22}"
+fi
 export CUDA_VISIBLE_DEVICES="${FN_CUDA_VISIBLE_DEVICES:-0,1}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1

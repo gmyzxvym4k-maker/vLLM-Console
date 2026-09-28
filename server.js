@@ -3859,7 +3859,7 @@ function lsIngestLine(r) {
   if (!r || typeof r.rid !== 'string' || !r.sid) return;
   let m = S.sids.get(r.sid);
   if (!m) {
-    m = { byRid: new Map(), port: String(r.port || ''), pid: r.pid || null, maxT: 0, lastWall: Date.now(), skewN: 0, skewSum: 0, guardN: 0 };
+    m = { byRid: new Map(), port: String(r.port || ''), pid: r.pid || null, maxT: 0, lastWall: Date.now(), skewEw: null, guardN: 0 };
     S.sids.set(r.sid, m);
     // 只留最近 LS_SID_KEEP 个会话（按最近写入时刻淘汰）
     if (S.sids.size > LS_SID_KEEP) {
@@ -3875,9 +3875,13 @@ function lsIngestLine(r) {
   // 时钟护栏：引擎与本机同机部署时 t 与墙钟同域；偏差>600s 视为异常时钟，
   // 用本地接收时刻替换（样本时刻只影响窗口分母，替换后仍单调可用）
   const nowS = Date.now() / 1000;
-  // 时钟偏差可观测（同机恒 ~tail 延迟；跨主机误配时 skew/guardN 会说话）。
-  // 只统计新鲜行（<10s）：首读回放的积压历史行年龄大，不能计入 skew 语义。
-  if (Math.abs(t - nowS) < 10) { m.skewN++; m.skewSum += Math.abs(t - nowS); }
+  // 时钟偏差/链路延迟可观测（同机恒 ~tail+轮询延迟，正常 <1.5s；跨主机误配时
+  // skew/guardN 会说话）。口径：只算年龄 <3s 的进度行（排除完成行与首读回放的
+  // 积压），EWMA 滑动（历史累计均值会被启动回放锁死，失去哨兵意义）。
+  if (!r.f && Math.abs(t - nowS) < 3) {
+    const d = Math.abs(t - nowS);
+    m.skewEw = m.skewEw === null ? d : m.skewEw + 0.25 * (d - m.skewEw);
+  }
   if (Math.abs(t - nowS) > 600) m.guardN++;
   const ts = Math.abs(t - nowS) > 600 ? nowS : t;
   let st = m.byRid.get(r.rid);
@@ -3984,12 +3988,14 @@ function v3StreamFor(port) {
   const now = Date.now();
   if (!m) return { active: [], fresh: false };
   const active = [];
+  const doneIds = new Set();
   for (const st of m.byRid.values()) {
-    if (!st.done && st.g > 0) active.push(st);
+    if (st.done) { if (st.g > 0) doneIds.add(st.rid); continue; }
+    if (st.g > 0) active.push(st);
   }
   const fresh = (now - m.lastWall) < LS_PORT_FRESH_MS;
-  return { active, fresh: fresh && active.length > 0, sid: m ? [...S.sids.keys()].find(k => S.sids.get(k) === m) : null, session: m,
-    skew: m && m.skewN ? Math.round(m.skewSum / m.skewN * 1000) / 1000 : 0, guardN: m ? m.guardN : 0 };
+  return { active, doneIds, fresh: fresh && active.length > 0, sid: m ? [...S.sids.keys()].find(k => S.sids.get(k) === m) : null, session: m,
+    skew: m && m.skewEw !== null && m.skewEw !== undefined ? Math.round(m.skewEw * 1000) / 1000 : 0, guardN: m ? m.guardN : 0 };
 }
 
 // 每 rid 滑窗测速（纯自身样本）：
@@ -4284,7 +4290,10 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
     const hc = Date.now() - 600000;
     rt.hold = rt.hold.filter(r => Date.now() - r.startedAt < hc);
   }
-  while (rt.live.length < running) {
+  // done 即时退场后 gauge 可能还差 1 轮才回落：本轮少建对应数量的补位行，
+  // 防 ghost「预填充中」一闪（下轮 gauge 自然追上，抑制量自动归零）。
+  const _dr = Math.max(0, Math.min(rt.doneRetired || 0, running));
+  while (rt.live.length < running - _dr) {
     // 最老的排队请求优先调度（FCFS 近似）：回归原行，身份（REQ 号/任务号）不丢
     const held = (rt.hold && rt.hold.length) ? rt.hold.shift() : null;
     if (held) { held.filled = true; rt.live.push(held); }
@@ -4430,6 +4439,11 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
       if (!lv || !lv.v3rid) continue;
       const st = v3StateById.get(lv.v3rid);
       if (st) { v3TouchRow(lv, st); claimed.add(lv.v3rid); }
+      else if (v3s.doneIds && v3s.doneIds.has(lv.v3rid)) {
+        // 流上完成行（f:1）= 引擎真实完成 → 标记即时退场（不等 gauge，实测
+        // gauge 滞后会让完成行滞留数秒、avg_speed 被继续的时间分母稀释）
+        lv.v3done = true;
+      }
       else { lv.v3goneAt = nowV3; lv.v3rid = null; lv.v3Exact = false; }
     }
     // ② 精确认领（代理流量）：taskId→crid→SSE id→rid
@@ -4473,7 +4487,12 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
       }
     }
     rt.v3Count = claimed.size;
+    // 完成确认行即时退场（本轮 rowV2 供数循环在其后，行序尚未被读取，安全）
+    const before = rt.live.length;
+    rt.live = rt.live.filter(lx => !(lx && lx.v3done));
+    rt.doneRetired = before - rt.live.length;
   } else if (rt.v3Count) {
+    rt.doneRetired = 0;
     // v3 掉线（引擎重启/插件停写）：清全部绑定，回落原链路
     rt.v3Count = 0;
     for (const lv of rt.live) { if (lv) { lv.v3rid = null; lv.v3Exact = false; } }

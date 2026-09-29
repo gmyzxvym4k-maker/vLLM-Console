@@ -88,6 +88,19 @@
 
 - 弹窗、预设、chroot 内层脚本各有一份采样参数，inner 硬编码不读 `FN_GENCFG` → 前端改了等于没改。`patches/patch-gencfg-0921.py` 三处统一。**参数只应有一个权威来源，其余全部透传。**
 
+### 12b. 采样参数第二案：wrapper 白名单漏 `FN_GENCFG`（09-26）
+
+- 现象：弹窗填 temperature=0.1 / repetition=1.2 启动，控制台「采样参数」卡仍显示 0.6 / 1.05。
+- **卡片没骗人**：它读的是引擎真实 `--override-generation-config`，那两组值正是 inner 脚本的 `GENCFG_DEFAULT`。
+- 链路断点：`server.js` 的 `scriptModelLaunchPlan()` 确实算出了 `FN_GENCFG`（日志 `[script-model] start ... gen={"temperature":0.1,...}` 可证），但
+  1. `start-flash-next-w4a16.sh` 落盘 ENVFILE 用的是一份**手写 FN_\* 白名单**，里面没有 `FN_GENCFG`；
+  2. 脚本末尾 `sudo -S setsid chroot` 会重置环境（sudo env_reset），弹窗传进来的 `FN_*` 只有写进 ENVFILE 的那部分进得了 chroot。
+  ⇒ `FN_GENCFG` 在 wrapper 这一跳被丢，inner 只能用自己的缺省值。
+- 同批被白名单吞掉的还有 `FN_CHATKWARGS / FN_PREFIX_CACHE / FN_CHUNKED / FN_SCHED_POLICY / FN_SEED / FN_NOLOG / FN_KV_DTYPE / FN_LIMIT_MM / FN_MAX_SCHED_TOKENS / FN_CPU_OFFLOAD_GB / FN_ENFORCE_EAGER`；另外 `FN_ENFORCE_EAGER`（server 侧）与 `FN_EAGER`（inner 侧）**根本不同名**，勾了也没用。
+- 修法：wrapper 改成动态扫全部 `FN_*`（排除 `FN_ENVFILE` 自身）落盘，今后 server.js 加键不必再改这张表；inner 认 `FN_ENFORCE_EAGER` 为 `FN_EAGER` 别名。前提已核：控制台进程环境不含任何 `FN_*`（否则会被一起透传）。
+- 排障套路（本案两分钟可定位）：① `tr '\0' ' ' < /proc/<引擎pid>/cmdline` 看引擎真实参数；② `cat flash-next-w4a16-launch.env` 看落盘了什么；③ `grep "script-model] start" server.log` 看弹窗本来想下发什么。三者一比，断点在哪一跳一目了然。
+- 遗留（未修，需要时再做）：上面那批 `FN_*` 现在能进 chroot，但 inner 仍不消费 `FN_CHATKWARGS/FN_PREFIX_CACHE/FN_CHUNKED/FN_SCHED_POLICY/FN_SEED/FN_NOLOG/FN_KV_DTYPE/FN_LIMIT_MM/FN_MAX_SCHED_TOKENS/FN_CPU_OFFLOAD_GB`——要真生效还得在 inner 里接上对应 ARGS。
+
 ### 13. PLE n-gram 表驻留判断：`free` 会骗人，要用 `fincore`
 
 - BF16 原生 95.37GiB 的 n-gram 表走 safetensors mmap，「是否全驻留页缓存」用 `free` 看不出来（页缓存不算任何进程头上）。判据：
@@ -101,6 +114,47 @@
 
 - **一个未注册的 gauge 炸掉全部请求**：`manager.py set_gauge(CPU_CACHE_FILL_PERC)`，但 `spec.py` 没注册元数据 → 每请求路径上的 `assert` 抛错 → 全部 500。教训：**nightly 上游的断言就是地雷**，打补丁前先 grep 所有 set/observe 调用与注册表的差集。
 - **稀疏键 vs 连续性要求**：滑动窗口组存储端每分段只留尾部检查点（稀疏键），查找端 eagle 却要求连续 sw+1 命中 → 命中率恒 0。四个纯日志探针补丁（c3b→c3e）逐级收窄实锤后，c4/c5a 才是真修。**探针先行、不改行为、用数据说话**，比凭猜想直接改省了一半以上时间。
+
+### 14b. 引擎换栈后指标名失配：仪表盘「二级缓存·CPU」卡整张消失（09-27）
+
+- **症状**：仪表盘没有 KV Cache 的二级缓存卡。引擎侧其实**开着**（`FN_KVOFF=1`、`--kv-transfer-config` 带 `cpu_bytes_to_use=103079215104`＝96 GiB、`vllm:kv_offload_store_bytes_total` 已累计 27.3 GiB / 61 次写入）。
+- **根因**：控制台采样 `/metrics` 时**只认旧栈（自研镜像 + kvfill 补丁）的 `vllm:kv_offload_cpu_cache_fill_perc` 作为「二级缓存已启用」的唯一开关**；官方 0.30.0 新栈没有这个补丁指标，只有上游原生 `vllm:kv_offload_cpu_cache_usage_perc`。找不到 fillKey → `tk.kvOffload` 恒 null → `kv_offload_ports` 返回 `[]` → 前端 `display:none`。**后端静默给空数组、前端静默隐藏，全链路无一处报错**，所以看起来像"功能没了"。
+- **修法（已上线 09-27）**：[`patches/patch-kvoff-0300-metric-0930.py`](../patches/patch-kvoff-0300-metric-0930.py)——两栈任一 gauge 在即认定启用；写入/回载字节与次数先取新栈无标签序列（`store_bytes_total` / `load_bytes_total` / `store_size_count` / `load_size_count`），回落旧栈 `total_bytes_total{transfer_type}` / `size_count{transfer_type}`；用 `metric_kind` 把口径透传到前端。
+- **口径红线**：两者**不是一回事**——`fill_perc`（旧栈）= 已存数据占内存档比例；`usage_perc`（新栈）= 官方文档写明的「被在飞传输钉住」的比例，空闲时恒 0。**把 usage 当驻留显示，会把"缓存塞满"和"完全空闲"画成同一个数**。新栈无驻留 gauge，故前端主值改显「容量 · 已启用」，钉住比例只进小字与 tooltip。
+- **判障顺序（这类"卡不见了"通用）**：① 引擎真实 cmdline 里有没有开关（`tr '\0' ' ' < /proc/<pid>/cmdline`）；② `/metrics` 里该指标族到底叫什么（`grep '^# TYPE vllm:kv_offload'`）；③ `curl /v1/internal/stats` 看后端字段是空数组还是缺字段；④ 最后才看前端 filter 与 `display`。**先证引擎开着，再往后端找，别一上来改前端。**
+
+### 14c. 引擎换栈后日志判据失配：运行参数卡不显示 PLE 精度/驻留（09-27）
+
+- **症状**：仪表盘「运行参数」里没有 `PLE 表精度`（INT8 还是 BF16）与 `PLE 表驻留`（硬盘还是内存）两行；引擎其实正常跑着（PLE 表已加载）。
+- **根因**：控制台的 PLE 判据是**按旧栈自研镜像的日志标记写死的**——只认 `[FN-PLE-*]` 行（`[FN-PLE-INT8] ... n-gram table attached`、inner echo 的「INT8 磁盘驻留」等）。官方 0.30.0 新栈压根不打这些行，它的判据是 `Initialized PLE embedding ... weight_dtype=torch.bfloat16, weight_device=cpu, pinned=True` 与 `[rt-patch] PLE pinned alloc: 95.368 GiB registered in 2 chunk(s)`；旧栈的 `FN_PLE_INT8`/`FN_PLE_LOC` 在新栈是 NOOP（不生效）。`readPleStatusCached` 扫不到任何判据 → `ple_table=null` → 前端两行整段不渲染。
+- **修法（已上线 09-27）**：`matchPleLine()` 双栈判据 + 反向扫尾 64MB，最近一条判据行赢；**主判据缺 GiB 时只往回补一条**（新栈「Initialized PLE embedding」行不带尺寸，靠上一条 `PLE pinned alloc` 补 95.368 GiB），不跨启动合并。归档：[`patches/patch-ple-0300-display-0930.diff`](../patches/patch-ple-0300-display-0930.diff)（线上 `patch -i ... /home/ll/deploy/server.js`，备份 `.bak-ple0300-0927`）。
+- **新增驻留态 `pinned`**：锁页主机内存（`cuMemHostRegister`），**不可回收也不可换出**，与旧栈的 `heap`（匿名堆，不可回收但可换出）是两码事；前端四态显示 disk/heap/pinned/gpu，别再把 pinned 显示成「匿名堆」。
+- **口径**：`pinned alloc` 那条能力提示行（`>60 GiB tables go through chunked cuMemHostRegister`）**不是**实建行，判据必须要求同时含 `registered`，否则会把"准备分块"当成"已分配 0 GiB"。
+- **教训**：凡是"从日志文本反解引擎状态"的显示，换引擎/换镜像后都必然失配；这类判据要写成**按信息量排序的多形态匹配**，并且**只信日志**（弹窗/FN_* 请求值在新栈可能是 NOOP）。
+
+### 14d. 「二级缓存·CPU」卡要常驻：三态显示 + /dev/shm 物理驻留真值（09-27）
+
+- **需求**：仪表盘常驻显示内存二级缓存（CPU KV offload）信息。改造前有两处让它"消失"：① 后端 `kvOffloadPortsInfo()` 对**未启用 / 尚未采到指标**的实例直接 `continue` → 返回 `[]`；② 前端见空数组就 `display:none`。于是引擎每次冷启动（约 8 分钟）或未配内存档时，整卡不见 —— 恰好是用户最想盯着看的时候。
+- **修法（已上线 09-27）**：后端改为**每个受管实例都出条目**并带 `enabled` 布尔（判据 = `/metrics` 已有 kv_offload 指标 **或** cmdline 已含 `cpu_bytes_to_use`，后者覆盖"配置已定、指标未暴露"的加载窗口）；前端三态常驻：已启用→数值 / 有实例未配→灰字「未启用」/ 无实例→灰字「--（引擎未运行 / 加载中）」。另在 `refreshDashboard` 的 `stats === {}` 早退分支里单独把该卡置为离线态 —— **否则引擎重启窗口内整轮跳过，卡会停在上一次的数字**（看起来像卡住）。
+- **新栈驻留真值**：新栈没有驻留 gauge（见 14b），但内存档的物理驻留可直接从 tmpfs 读：`fs.statfsSync('/dev/shm')` → `(blocks - bavail) * bsize`。本机 `/dev/shm` 只有 vLLM offload 在用（实测 c8 共享区建好后 used ≈ 68.9 GB ≈ 配置 64 GiB，引擎停止后回落到 64 KB），**无需 root、不 spawn 子进程**（引擎由 root 启动，`/proc/<pid>/smaps_rollup` 普通用户读不到，别走那条路）。口径写进 tooltip：整机 tmpfs 用量，多实例共享时不可按实例切分，故只在单实例时用它当主值。
+- **顺带补全命中维度**：新增 `vllm:external_prefix_cache_queries_total` / `hits_total`（OffloadingConnector 的二级缓存查询/命中），与原有 `prompt_tokens_by_source{source=external_kv_transfer}`（免重算 token 量）互补 —— 排查"缓存建起来了但一次没命中"（queries 涨、hits 恒 0）时，前者才是判据。
+- **本卡口径**：主值「驻留 / 容量 GiB」；小字三档 `在飞 p%`（新栈钉住比例，**不是驻留**）/ `查 N/中 M` / `存 X GiB`；只有旧栈 `fill` 口径才把百分比标成「驻留」。改动落点：`server.js` 的 `kvOffloadShmUsage()` / `kvOffloadPortsInfo()` / ticker 采样 + `index.html` 渲染块与 `stats` 空分支；线上备份 `server.js.bak-kvofflive-0927` / `index.html.bak-kvofflive-0927`，`PAGE_VERSION=20260927-r3`。
+
+### 14e. vLLM 运行日志面板空白：日志源不能依赖 `SCRIPT_MODELS` 注册表（09-29，已上线）
+
+- **症状**：「vLLM 运行日志」面板空白，接口返回 `{"logs":"","totalLines":0,"file":"/home/ll/deploy/vllm.log","stale_min":56,"cleared":true}`；引擎其实跑得好好的（18420 正常出 token）。
+- **根因**：`getVllmLogSource()` 的日志源优先级是 ① 脚本模型（遍历 `SCRIPT_MODELS`，靠 `scriptModelInstance()` 按**注册表里的模型路径**去 cmdline 里认领）→ ②③ 读进程 fd → ⑤ 兜底 `./vllm.log`。09-29 现场在跑的是 uncensored 栈（模型 `/media/ll/data/models-1m/Qwen3.8-Flash-Next-Uncensored-NVFP4-FP8PLE-1M`），**注册表只有 NVFP4 / W4A16 两条**，`scriptModelInstance()` 对两条都返 null → ① 段零候选；引擎由 root 起、`/proc/<pid>/fd/1` ll 读不到 → ②③ 空；一路掉到 ⑤，于是显示的是两小时前一次启动失败留下的 `vllm.log`。
+- **修法（已上线 09-29）**：新增 `pickLogFromProcs()`，在 `getVllmLogSource()` 最前面加 **⓪ 段通用判据**——任何在跑的 vLLM 进程，真实日志路径就写在它自己启动 wrapper 的 argv 里（形态 `sudo -S sh -c 'exec setsid bash "$1" >> "$2"' _ <inner> <logfile>`），用祖先链 `cmdline`（全局可读，root 进程同样适用）取 `.log`；主实例端口优先、其次 mtime 最新，且**候选全部停写 >24h 就不采用**（防拿残留进程的旧日志冒充当前日志）。
+- **为什么这是治本**：同一病因已犯三次——09-26（w4a16 → 官方 0.30.0 换栈）、09-27（两栈并存）、09-29（换 uncensored）。凡是「显示判据要先去注册表登记新东西」的结构，上新模型时必失配，而且**静默回落、无一处报错**。判据要挂在「进程」这个真值源上，不是挂在「配置表」上。
+- **落点与回滚**：`server.js` 的 `pickLogFromProcs()` / `getVllmLogSource()` ⓪ 段；线上备份 `server.js.bak-logsrc-0929`。验证手法：`curl /v1/internal/vllm-logs?tailLines=400` 看返回的 `file` 是否等于 wrapper argv 里那份日志（对照 `ps` 的 argv），再看 `stale_min` 归零。
+
+### 14f. 显存温度显示：`temperature.memory` 与核心温度阈值不能混用（09-29，已上线）
+
+- **需求**：显卡信息加显存温度。`nvidia-smi --query-gpu=temperature.memory` 在 CMP 170HX（cmpunlocker 魔改驱动 610.43.03）实测可返回数值（核心 68/显存 74、核心 64/显存 68）。
+- **两条采集链都要改**（容易只改一条）：① `GPU_LIVE_FIELDS` → `__gpuLive.temp_mem`，服务 `/v1/internal/gpu`（硬件监视页 + 页头 chip）；② `getGpuInfo()` 的 `--query-gpu` CSV → `gpu.temperature_mem` / `perGpu[].temperature_mem`，服务 `/v1/internal/gpu_info`（仪表盘温度卡与逐卡徽章）。**两条链的解析都是纯下标（`parts[N]` / `r[N]`），插字段必须把后面所有下标一起顺延**，否则功耗/温度整列错位。
+- **阈值口径**：显存温度天然比核心高几度，**不能套核心的 85/70 报警**，否则空载就满屏橙。前端显存独立阈值 `tempMemColor` = 95 红 / 85 橙；核心仍 85/70。
+- **缺值兼容**：`gpuNum()` 对 `[N/A]` 返 null、`gpu_info` 链对不支持时返 0，前端一律降级成 `--` / 不显示该项，不要显示 0 °C。
+- **落点**：`server.js` 两处字段 + `index.html` 的 `renderStorageGpuCard`（KPI 副值与明细表列，`kpiCard` 加第 5 参 `subColor`）、`updateHdrFromGpu`（tooltip）、`_doRefreshDashboard`（逐卡徽章与 `tempSub`）+ `mobile.html` 同步；`PAGE_VERSION=20261006-r6`；线上备份 `*.bak-gputempmem-0929`。
 
 ### 15. chroot 搭建的琐碎坑
 
@@ -122,6 +176,25 @@
 ### 17. 页面版本戳：区分「代码没生效」和「浏览器缓存」
 
 - 改完前端用户说「没变化」，八成是旧缓存页。`index.html` 顶部 `PAGE_VERSION = '20260923-r1'` 显示在右上角，一眼定位。每次发版记得戳一下。
+
+### 17b. 改 `index.html` 上线前必须对整页内联 JS 做 `node --check`（09-27）
+
+- **事故**：给「运行参数」加 PLE 两行时，模板字符串里一处括号写错（`row(...)` 外层多一个 `)`），**整个内联 `<script>` 解析失败 → 页面全部 JS 失效**（仪表盘、轮询、按钮全停），而 HTTP 仍是 200、文件也只是几 KB 的变化——单看响应状态完全看不出来。
+- **根因**：前端是 353KB 的单文件内联脚本，没有构建步骤、没有 lint，`.html` 后缀也让 `node --check` 不会自动覆盖到它。
+- **铁律**：改完 `index.html`（或任何含内联 JS 的页面），上线前跑一次整页语法自检，**校验对象必须是"将要上线的那个文件"**：
+
+```bash
+python3 - <<'PY'
+import re
+src = open('/home/ll/deploy/index.html', encoding='utf-8').read()
+for n, b in enumerate(re.findall(r'<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>', src, re.S)):
+    open('/tmp/live_chk_%d.js' % n, 'w', encoding='utf-8').write(b)
+PY
+for f in /tmp/live_chk_*.js; do node --check "$f" || echo "❌ $f 语法错误"; done
+```
+
+- **配套**：局部片段（如某几行模板表达式）单独抽出来在 node 里跑一遍渲染仿真，能同时抓住"语法过但输出错"的情况；页面 HTTP 200 **不等于** JS 能跑。
+- 备份命名 `index.html.bak-<tag>-<日期>`；回滚即 `cp` 回去（前端免重启，刷新即生效）。
 
 ---
 

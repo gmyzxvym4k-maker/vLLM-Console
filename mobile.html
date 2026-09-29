@@ -376,13 +376,14 @@ async function loadMachine() {
             $('utilBar').style.width = (g.gpu.utilization || 0) + '%';
             $('utilSub').textContent = 'GPU 计算利用率';
             $('tempVal').textContent = g.gpu.temperature > 0 ? g.gpu.temperature.toFixed(0) + '°C' : '--';
-            $('tempSub').textContent = 'nvidia-smi 实测';
+            $('tempSub').textContent = g.gpu.temperature_mem > 0 ? ('核心 ' + g.gpu.temperature.toFixed(0) + '°C · 显存 ' + g.gpu.temperature_mem.toFixed(0) + '°C') : 'nvidia-smi 实测';
             // 逐卡
             const per = g.gpu.perGpu || [];
             $('perGpuChips').innerHTML = per.map(x =>
                 '<span class="chip ' + (Number(x.index) === 0 ? 'gpu0' : 'gpu1') + '">GPU' + x.index +
                 ' ' + (x.utilization || 0) + '% · ' + gb(x.used) + '/' + gb(x.total) + 'GB · ' +
-                (x.power || 0).toFixed(0) + 'W · ' + (x.temperature > 0 ? x.temperature.toFixed(0) : '--') + '°C</span>'
+                (x.power || 0).toFixed(0) + 'W · ' + (x.temperature > 0 ? x.temperature.toFixed(0) : '--') + '°C' +
+                (x.temperature_mem > 0 ? (' / 显存 ' + x.temperature_mem.toFixed(0) + '°C') : '') + '</span>'
             ).join('');
         }
         if (p) {

@@ -1453,7 +1453,7 @@
                         <table class="tbl">
                             <thead><tr>
                                 <th>GPU / 型号</th><th>PCI 地址 / UUID</th><th style="text-align:center">PCIe 链路（当前 → 能力）</th><th style="text-align:right">PCIe 流量 / 占用</th>
-                                <th style="text-align:right">显存</th><th style="text-align:right">利用率 (GPU/MEM)</th><th style="text-align:right">温度</th>
+                                <th style="text-align:right">显存</th><th style="text-align:right">利用率 (GPU/MEM)</th><th style="text-align:right">温度 核心/显存</th>
                                 <th style="text-align:right">功耗 / 限值</th><th style="text-align:right">SM 频率</th><th style="text-align:center">P 状态</th>
                                 <th>驱动 / VBIOS</th><th style="text-align:center">计算能力</th>
                             </tr></thead>
@@ -2864,13 +2864,13 @@ async function _doRefreshDashboard() {
             const ptDetailEl = document.getElementById('powerTempDetail');
             if (ptDetailEl) {
                 ptDetailEl.innerHTML = multi ? g.gpu.perGpu.map(x =>
-                    `<span style="font-size:10px;background:var(--bg-primary);border-radius:5px;padding:1px 6px;white-space:nowrap;color:var(--text-secondary)">GPU${x.index} ${x.power.toFixed(0)}W · ${x.temperature > 0 ? x.temperature.toFixed(0) : '--'}°C</span>`
+                    `<span style="font-size:10px;background:var(--bg-primary);border-radius:5px;padding:1px 6px;white-space:nowrap;color:var(--text-secondary)">GPU${x.index} ${x.power.toFixed(0)}W · ${x.temperature > 0 ? x.temperature.toFixed(0) : '--'}°C${x.temperature_mem > 0 ? (' / 显存 ' + x.temperature_mem.toFixed(0) + '°C') : ''}</span>`
                 ).join('') : '';
             }
             const powerSub = document.getElementById('powerSub');
             if (powerSub) powerSub.textContent = multi ? 'Watts（两卡合计）' : 'Watts（实时）';
             const tempSub = document.getElementById('tempSub');
-            if (tempSub) tempSub.textContent = multi ? '°C（最高卡）' : '°C（实时）';
+            if (tempSub) tempSub.textContent = multi ? ('°C（最高卡 · 显存最高 ' + (g.gpu.temperature_mem > 0 ? g.gpu.temperature_mem.toFixed(0) : '--') + '）') : '°C（实时）';
             // 多卡明细（双卡并跑时逐卡展示）
             const gpuDetailEl = document.getElementById('gpuDetail');
             if (gpuDetailEl) {
@@ -5505,15 +5505,18 @@ function renderStorageGpuCard(d) {
         rows.innerHTML = '<tr><td colspan="12" style="text-align:center;padding:24px;color:var(--text-tertiary)">无 GPU 数据</td></tr>';
         return;
     }
-    const kpiCard = (label, value, sub, color) =>
+    const kpiCard = (label, value, sub, color, subColor) =>
         `<div style="min-width:0">
             <div class="kpi-label" style="font-size:10px;color:var(--text-tertiary);margin-bottom:3px">${label}</div>
             <div style="font-size:17px;font-weight:700;color:${color || 'var(--text-primary)'};font-variant-numeric:tabular-nums;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(String(value))}">${value}</div>
-            <div style="font-size:10px;color:var(--text-tertiary);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(String(sub || ''))}">${sub || ''}</div>
+            <div style="font-size:10px;color:${subColor || 'var(--text-tertiary)'};margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(String(sub || ''))}">${sub || ''}</div>
         </div>`;
     const genTxt = (g) => 'Gen' + (g != null ? g : '--');
     const wTxt = (w) => 'x' + (w != null ? w : '--');
     const tempColor = (t) => t == null ? 'var(--text-primary)' : (t >= 85 ? 'var(--red)' : (t >= 70 ? 'var(--orange)' : 'var(--green)'));
+    // 显存温度（temperature.memory，GDDR/HBM）：正常比核心高，阈值独立，别套核心口径误报
+    const tempMemColor = (t) => t == null ? 'var(--text-primary)' : (t >= 95 ? 'var(--red)' : (t >= 85 ? 'var(--orange)' : 'var(--green)'));
+    const tempMemTxt = (t) => t != null ? ('显存 ' + t.toFixed(0) + ' °C') : '显存 -- °C';
     kpiBox.innerHTML = gpus.map((g) => {
         // PCIe 链路：当前 vs 能力（宽度/代数任一低于能力 = 降级，橙色警示）
         const wDeg = g.width_current != null && g.width_max != null && g.width_current < g.width_max;
@@ -5546,7 +5549,9 @@ function renderStorageGpuCard(d) {
                 ${kpiCard('PCIe 带宽占用', bwMain, bwSub, bwColor)}
                 ${kpiCard('显存占用', memMain, memPct != null ? ('已用 ' + memPct + '%') : '', 'var(--violet)')}
                 ${kpiCard('GPU 利用率', utilPct, g.util_mem != null ? ('显存带宽占用 ' + g.util_mem.toFixed(0) + '%') : '', utilColor)}
-                ${kpiCard('温度', g.temp != null ? g.temp.toFixed(0) + ' °C' : '--', '', tempColor(g.temp))}
+                ${kpiCard('温度 核心/显存', g.temp != null ? g.temp.toFixed(0) + ' °C' : '--',
+                    tempMemTxt(g.temp_mem), tempColor(g.temp),
+                    g.temp_mem != null ? tempMemColor(g.temp_mem) : null)}
                 ${kpiCard('功耗（当前/限值）', powerMain, powerSub, 'var(--orange)')}
                 ${kpiCard('SM 频率 / P 状态', clkMain, clkSub, 'var(--blue)')}
             </div>
@@ -5577,7 +5582,7 @@ function renderStorageGpuCard(d) {
             <td style="text-align:right;font-variant-numeric:tabular-nums;font-size:12px">${(g.rx_mbs != null || g.tx_mbs != null) ? ('↓ ' + (g.rx_mbs != null ? g.rx_mbs : '--') + ' · ↑ ' + (g.tx_mbs != null ? g.tx_mbs : '--') + ' MB/s') : '--'}<div style="font-size:11px;color:var(--text-tertiary)">${(g.rx_pct != null) ? ('占用 ↓' + g.rx_pct + '% ↑' + g.tx_pct + '% · 理论 ' + theoTxtR) : '采样中…'}</div><div style="height:3px;background:var(--border);border-radius:2px;margin-top:4px;overflow:hidden"><div style="height:100%;width:${Math.min(100, bwPeakR)}%;background:${bwColorR};border-radius:2px;transition:width .4s"></div></div></td>
             <td style="text-align:right;font-variant-numeric:tabular-nums;font-size:12px">${memHtml}</td>
             <td style="text-align:right;font-variant-numeric:tabular-nums">${g.util_gpu != null ? g.util_gpu.toFixed(0) + '%' : '--'}<div style="font-size:11px;color:var(--text-tertiary)">MEM ${g.util_mem != null ? g.util_mem.toFixed(0) + '%' : '--'}</div></td>
-            <td style="text-align:right;font-variant-numeric:tabular-nums;color:${tempColor(g.temp)}">${g.temp != null ? g.temp.toFixed(0) + ' °C' : '--'}</td>
+            <td style="text-align:right;font-variant-numeric:tabular-nums;color:${tempColor(g.temp)}">${g.temp != null ? g.temp.toFixed(0) + ' °C' : '--'}<div style="font-size:11px;color:${g.temp_mem != null ? tempMemColor(g.temp_mem) : 'var(--text-tertiary)'}">显存 ${g.temp_mem != null ? g.temp_mem.toFixed(0) + ' °C' : '--'}</div></td>
             <td style="text-align:right;font-variant-numeric:tabular-nums;font-size:12px">${g.power_draw != null ? g.power_draw.toFixed(1) + ' W' : '--'}<div style="font-size:11px;color:var(--text-tertiary)">限值 ${g.power_limit != null ? g.power_limit.toFixed(0) : '--'} W${(g.power_min_limit != null && g.power_max_limit != null) ? ' (' + g.power_min_limit.toFixed(0) + '–' + g.power_max_limit.toFixed(0) + ')' : ''}</div></td>
             <td style="text-align:right;font-variant-numeric:tabular-nums;font-size:12px">${g.sm_clock != null ? g.sm_clock + ' MHz' : '--'}<div style="font-size:11px;color:var(--text-tertiary)">最大 ${g.sm_clock_max != null ? g.sm_clock_max + ' MHz' : '--'}</div></td>
             <td style="text-align:center;font-size:12px;font-family:monospace">${esc(g.pstate || '--')}</td>
@@ -7039,7 +7044,7 @@ function updateHdrFromGpu(d) {
         if (chip) chip.title = 'GPU SM 利用率（逐卡）\n' + gs.map(g =>
             'GPU' + g.index + '：' + (g.util_gpu == null ? '--' : g.util_gpu) + '% · 显存 ' + g.mem_used + '/' + g.mem_total + ' MiB · ' + (g.power_draw == null ? '--' : g.power_draw) + ' W').join('\n');
         const tChip = document.getElementById('hdrTempChip');
-        if (tChip) tChip.title = 'GPU 温度（逐卡）\n' + gs.map(g => 'GPU' + g.index + '：' + (g.temp == null ? '--' : g.temp) + ' °C').join('\n');
+        if (tChip) tChip.title = 'GPU 温度（逐卡，核心/显存）\n' + gs.map(g => 'GPU' + g.index + '：' + (g.temp == null ? '--' : g.temp) + ' °C / ' + (g.temp_mem == null ? '--' : g.temp_mem) + ' °C').join('\n');
     } catch (e) {}
 }
 let _hdrGpuTimer = null;

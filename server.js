@@ -2789,7 +2789,7 @@ function portInUse(port) {
 // ====== GPU Info ======
 function getGpuInfo(callback) {
   let processes = [];
-  let gpuInfo = { utilization: 0, total: 0, used: 0, power: 0, temperature: 0 };
+  let gpuInfo = { utilization: 0, total: 0, used: 0, power: 0, temperature: 0, temperature_mem: 0 };
   let done = 0;
   let fired = false;
 
@@ -2832,7 +2832,7 @@ function getGpuInfo(callback) {
   });
 
   const gpuQuery = spawn('nvidia-smi', [
-    '--query-gpu=index,utilization.gpu,memory.total,memory.used,power.draw,temperature.gpu',
+    '--query-gpu=index,utilization.gpu,memory.total,memory.used,power.draw,temperature.gpu,temperature.memory',
     '--format=csv'
   ]);
   const gpuTimer = setTimeout(() => { try { gpuQuery.kill('SIGKILL'); } catch (e) {} }, 5000);
@@ -2843,7 +2843,7 @@ function getGpuInfo(callback) {
   gpuQuery.on('close', (code) => {
     if (code === 0 && gpuOutput.trim()) {
       const lines = gpuOutput.trim().split('\n');
-      let total = 0, used = 0, utilSum = 0, utilCount = 0, power = 0, temperature = 0;
+      let total = 0, used = 0, utilSum = 0, utilCount = 0, power = 0, temperature = 0, temperatureMem = 0;
       const perGpu = [];
       for (const line of lines) {
         if (line.toLowerCase().includes('index')) continue;
@@ -2855,6 +2855,7 @@ function getGpuInfo(callback) {
           utilCount++;
           if (parts.length >= 5) power += parseFloat(parts[4]) || 0;
           if (parts.length >= 6) temperature = Math.max(temperature, parseFloat(parts[5]) || 0);
+          if (parts.length >= 7) temperatureMem = Math.max(temperatureMem, parseFloat(parts[6]) || 0);
           perGpu.push({
             index: parts[0],
             utilization: parseFloat(parts[1]) || 0,
@@ -2862,12 +2863,15 @@ function getGpuInfo(callback) {
             used: (parseInt(parts[3]) || 0) * 1024 * 1024,
             power: parts.length >= 5 ? (parseFloat(parts[4]) || 0) : 0,
             temperature: parts.length >= 6 ? (parseFloat(parts[5]) || 0) : 0,
+            // 09-29 显存温度（temperature.memory，GDDR/HBM；驱动不支持时为 0 → 前端隐藏）
+            temperature_mem: parts.length >= 7 ? (parseFloat(parts[6]) || 0) : 0,
           });
         }
       }
       gpuInfo = {
         utilization: utilCount ? Math.round(utilSum / utilCount) : 0,
         total, used, power, temperature,
+        temperature_mem: temperatureMem,
         gpuCount: utilCount,
         perGpu,
       };
@@ -3574,11 +3578,51 @@ function pickScriptModelLogFile(inst, sm) {
 // a TTY (/dev/pts/N) — reading it with readFileSync would BLOCK THE EVENT
 // LOOP FOREVER (a tty read waits for input/EOF that never comes). Mark it and
 // let the endpoint answer with a friendly notice instead of reading it.
-// 优先级：① 脚本化模型（chroot 内 root 进程，日志路径由 SCRIPT_MODELS 注册，最可靠）
+// 优先级：⓪ 在跑引擎进程祖先链 argv 里的 .log（通用，不依赖注册表）
+//         ① 脚本化模型（chroot 内 root 进程，日志路径由 SCRIPT_MODELS 注册，最可靠）
 //         ② 主实例端口(config.vllmPort)对应的 vLLM 进程 stdout
 //         ③ 其它 vLLM 进程 stdout  ④ SGLang 日志  ⑤ ./vllm.log
+//
+// ⓪ 段是 09-29 新增的治本修复。面板语义 =「在跑引擎正在写的那份日志」，而真实路径
+// 就写在引擎启动 wrapper 自己的 argv 里（形态见 ancestorLogFiles）。root 进程的
+// /proc/<pid>/fd 普通用户读不到，但 cmdline 全局可读 —— 所以这条判据对任何栈、
+// 任何新模型都成立，不需要有人先去 SCRIPT_MODELS 登记。
+// 复发史（同一病三次）：09-26 旧栈 w4a16 → 官方 0.30.0、09-27 二栈并存、09-29 换
+// uncensored 栈。每次都因「注册表跟不上换栈 → ① 段零候选 → 回落 ⑤ ./vllm.log」，
+// 面板显示陈旧日志、stale_min 一路增长，看起来就是"日志没了"。
+function pickLogFromProcs(procs) {
+  const out = [];
+  const mt = (x) => { try { return fs.statSync(x).mtimeMs; } catch (e) { return 0; } };
+  for (const c of ((procs && procs.vllm) || [])) {
+    let file = null;
+    try {
+      const anc = ancestorLogFiles(c.pid, 5);
+      // 近祖先优先（hop 小者更接近引擎本身），同层取最近写入的
+      anc.sort((a, b) => a.hop - b.hop || mt(b.file) - mt(a.file));
+      if (anc.length && mt(anc[0].file) > 0) file = anc[0].file;
+    } catch (e) { /* 读不到就换个进程 */ }
+    if (!file) continue;
+    const pm = String(c.cmd || '').match(/--port\s+(\d+)/);
+    out.push({ file: file, tty: false, pid: c.pid, port: pm ? parseInt(pm[1], 10) : null });
+  }
+  return out;
+}
 function getVllmLogSource() {
   const procs = scanInferenceProcs();
+  // ⓪ 通用判据：任何在跑的 vLLM 进程，其祖先链 argv 里的 .log 即真实日志。
+  //    主实例端口优先，其次取最近仍在写的；若候选全部停写超过 24h，说明只是残留
+  //    进程（引擎其实没在跑），继续往下走，别拿陈年日志冒充"当前日志"。
+  try {
+    const hits = pickLogFromProcs(procs);
+    if (hits.length) {
+      // 命名避开 ②③ 段的 mainPort/isMain（同一函数块，const 不可重复声明）
+      const mainPort0 = (typeof config !== 'undefined' && config && config.vllmPort) ? String(config.vllmPort) : '';
+      const mtOf = (h) => { try { return fs.statSync(h.file).mtimeMs; } catch (e) { return 0; } };
+      const onMain0 = (h) => !!(mainPort0 && String(h.port) === mainPort0);
+      hits.sort((a, b) => (onMain0(b) - onMain0(a)) || (mtOf(b) - mtOf(a)));
+      if (Date.now() - mtOf(hits[0]) < 24 * 3600 * 1000) return hits[0];
+    }
+  } catch (e) { /* 落回下面的旧逻辑 */ }
   // ① 脚本化模型（Flash-Next 等 chroot 镜像实例）：逐个条目定位「真正属于在跑实例」的
   //    日志文件（见 pickScriptModelLogFile），多实例时取最近写过的那个。
   try {
@@ -7293,7 +7337,7 @@ function gpuNum(v) {
   return Number.isFinite(n) ? n : null;
 }
 const GPU_STATIC_FIELDS = 'index,name,uuid,pci.bus_id,driver_version,vbios_version,compute_cap,pcie.link.gen.max,pcie.link.width.max,power.limit,power.min_limit,power.max_limit';
-const GPU_LIVE_FIELDS = 'index,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,pstate,clocks.sm,clocks.max.sm,pcie.link.gen.current,pcie.link.width.current,fan.speed';
+const GPU_LIVE_FIELDS = 'index,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,temperature.memory,power.draw,pstate,clocks.sm,clocks.max.sm,pcie.link.gen.current,pcie.link.width.current,fan.speed';
 function buildGpuStatic() {
   const out = { supported: false, gpus: [], driver_version: null };
   let rows;
@@ -7333,13 +7377,15 @@ function sampleGpuStats() {
       const rows = gpuParseRows(outStr);
     const gpus = [];
     for (const r of rows) {
-      // [index,util_gpu,util_mem,mem_used,mem_total,temp,power,pstate,sm_clk,sm_clk_max,gen_cur,width_cur,fan]
+      // [index,util_gpu,util_mem,mem_used,mem_total,temp,temp_mem,power,pstate,sm_clk,sm_clk_max,gen_cur,width_cur,fan]
+      // 09-29 新增 temp_mem（nvidia-smi temperature.memory，HBM/GDDR 显存温度；驱动不支持时该列 N/A → null）
       const g = {
         index: gpuNum(r[0]), util_gpu: gpuNum(r[1]), util_mem: gpuNum(r[2]),
         mem_used: gpuNum(r[3]), mem_total: gpuNum(r[4]), temp: gpuNum(r[5]),
-        power_draw: gpuNum(r[6]), pstate: r[7] || null,
-        sm_clock: gpuNum(r[8]), sm_clock_max: gpuNum(r[9]),
-        gen_current: gpuNum(r[10]), width_current: gpuNum(r[11]), fan: gpuNum(r[12]),
+        temp_mem: gpuNum(r[6]),
+        power_draw: gpuNum(r[7]), pstate: r[8] || null,
+        sm_clock: gpuNum(r[9]), sm_clock_max: gpuNum(r[10]),
+        gen_current: gpuNum(r[11]), width_current: gpuNum(r[12]), fan: gpuNum(r[13]),
       };
       if (g.index != null) gpus.push(g);
     }

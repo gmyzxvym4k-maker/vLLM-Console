@@ -13,7 +13,8 @@
 - [目录结构](#目录结构)
 - [配置详解](#配置详解)
 - [环境变量](#环境变量)
-- [鉴权（可选）](#鉴权可选)
+- [提权口令（运维脚本 sudo）](#提权口令运维脚本-sudo)
+- [鉴权（可选启用）](#鉴权可选启用)
 - [复现边界：哪些功能绑定了原作者机器](#复现边界哪些功能绑定了原作者机器)
 - [深入文档](#深入文档)
 - [License](#license)
@@ -104,6 +105,8 @@ loginctl enable-linger $USER   # 无登录会话也常驻
 ├── bench.html                 # 基准测试页（iframe 嵌入主界面「基准测试」标签）
 ├── cpu.html                   # CPU 控制页（iframe 嵌入「CPU 控制」标签，后端调 cpu-ctl）
 ├── cpu-ctl                    # CPU 运行时控制脚本（装到 /usr/local/bin，ops/install-cpu-ctl-127.sh 幂等安装+sudoers 白名单）
+├── gpu-ctl                    # GPU 功耗/频率控制脚本（同上套路，ops/install-gpu-ctl-127.sh）
+├── lib/sudo-pass.sh           # 运维脚本的提权口令入口（集中管理 sudo 凭据，仓库内无明文，见「提权口令」）
 ├── mobile.html                # 移动端只读视图
 ├── static/                    # 预编译 tailwind CSS、本地字体、Chart.js（全部本地托管，无 CDN 硬依赖）
 ├── prompts/                   # bench 提示词库（prompts13.json / prompts6.json，随便改）
@@ -156,6 +159,27 @@ loginctl enable-linger $USER   # 无登录会话也常驻
 | `VLLM_MODEL_PORTS` | `{}` | JSON 映射 `模型名→端口`（路由代理用，缺省运行时从进程自动注册） |
 | `PD_MODEL_PORTS` | `{}` | PD 分离模式的模型→端口映射 |
 | `VLLM_CHAT_TRIM` / `VLLM_CHAT_CAP_MAX_CHARS` / `VLLM_CHAT_KEEP_OLD_CHARS` / `VLLM_CHAT_KEEP_TAIL_CHARS` / `VLLM_CHAT_KEEP_MSG_CHARS` / `VLLM_CHAT_TRIM_CONTENT` | 内置 | 聊天代理的历史裁剪策略（长对话防爆上下文） |
+
+## 提权口令（运维脚本 sudo）
+
+网页上点「启动/停止实例」、CPU/GPU 调节、各类探针脚本都要以 root 干活。这些脚本**不含任何明文口令**，统一走 [`lib/sudo-pass.sh`](lib/sudo-pass.sh)，按下列优先级取凭据：
+
+| 顺序 | 来源 | 适用 |
+|---|---|---|
+| 1 | 环境变量 `CONSOLE_SUDO_PASS` | 临时试验、CI、systemd `Environment=` 下发 |
+| 2 | 文件 `${CONSOLE_SUDO_FILE:-~/.console-sudo}`（首行，权限务必 600） | 单机常态部署，推荐给看门狗/定时器用 |
+| 3 | 交互式输入 | 人在终端里手工跑脚本 |
+| — | 都没有 → 直接报错退出（fail-fast） | 绝不静默"猜一个口令"去试 |
+
+```bash
+# 建口令文件（一次搞定，之后所有脚本都能用）
+umask 077 && printf '%s\n' '<你的sudo口令>' > ~/.console-sudo
+```
+
+- 口令文件权限不是 600/400/500/700 时，helper 会提示一句 `建议 chmod 600`（只提示不阻断）。
+- 若你的机器已给运行账号配好 `NOPASSWD` 白名单（本项目的 `cpu-ctl` / `gpu-ctl` 就是这个路子，见 `ops/install-*-127.sh`），那么取不到口令也没关系：`sudo_run` 在无口令时自动回退裸 `sudo`。
+- **看门狗特例**：`fnx-18420-watchdog.sh` 跑在 systemd user 定时器里，取不到口令只会关掉「卡死取证」（`py-spy dump` 需要 root），健康检查与自愈拉起照常工作，不会因为缺口令而整个哑掉。
+- 早期版本曾在脚本里硬编码明文口令。如果你是从旧版本升级上来的，请把那份口令视为**已泄露**并尽快改密。
 
 ## 鉴权（可选启用）
 

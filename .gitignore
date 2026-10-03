@@ -27,3 +27,13 @@ __pycache__/
 *.egg-info/
 build/
 node_modules/
+
+# 本机工作痕迹（与开源内容无关，且体积很大）
+tmp/
+work/
+*.local-bak-*
+# 提权口令文件（正常应放家目录 ~/.console-sudo；这条兜底防误提交）
+.console-sudo
+
+# 与本控制台无关的同级资料（专利案卷等，只是碰巧放在同一个父目录下）
+/一种基于深度学习的PBFT改进方法及系统/

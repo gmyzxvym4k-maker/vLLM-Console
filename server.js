@@ -16,6 +16,36 @@ const zlib = require('zlib');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // execFile 的 Promise 版：长耗时脚本（停止脚本可达分钟级）不再用 execSync 阻塞主线程。
 const execFileAsync = (file, args, opts) => new Promise((resolve, reject) => {
+// [__close127_btn_1006__] ===== 关闭 127（18420 Flash-Next）按钮指令 =====
+// 独立端点：POST /v1/internal/close-127 → 走 SCRIPT_MODELS 注册的宿主停止脚本
+// （SIGTERM 优先、等退净才兜底，绝不无差别 SIGKILL 持 CUDA 上下文的进程）。
+// 与 model-manager 的脚本化停止分支同链路，供页面顶部按钮与外部 curl 指令共用。
+async function close127Instance() {
+  const port = 18420;
+  let smStop = null;
+  try { smStop = scriptModelForPort(port); } catch (e) {}
+  if (!smStop) {
+    try { smStop = SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] ? Object.assign({ key: 'qwen3.8-flash-next-w4a16' }, SCRIPT_MODELS['qwen3.8-flash-next-w4a16']) : null; } catch (e) {}
+  }
+  if (!smStop || !smStop.stopScript) return { success: false, error: '未找到 18420 的脚本化模型注册或停止脚本' };
+  let stopPath = null;
+  try { stopPath = resolveStopScript(smStop); } catch (e) { stopPath = smStop.stopScript; }
+  if (!stopPath || !fs.existsSync(stopPath)) return { success: false, error: '停止脚本不存在：' + (stopPath || '(未注册)') };
+  let out = '';
+  try {
+    out = await execFileAsync('bash', [stopPath, String(port)], { encoding: 'utf8', timeout: 240000, maxBuffer: 4 * 1024 * 1024 });
+  } catch (e) { out = String((e && e.stdout || '') + (e && e.stderr || '') || (e && e.message) || e); }
+  try { Object.keys(VLLM_MODEL_PORTS).forEach(k => { if (VLLM_MODEL_PORTS[k] === port) delete VLLM_MODEL_PORTS[k]; }); } catch (e) {}
+  try { global.__GPU_INSTANCES.delete(port); } catch (e) {}
+  let stillAlive = null;
+  try { stillAlive = scriptModelInstance(smStop); } catch (e) {}
+  console.log(`[close-127] stop ${smStop.key} port ${port}${stillAlive ? ' (WARN: 仍有残留 pid=' + stillAlive.pid + ')' : ' (已彻底停止)'} via ${stopPath}`);
+  return { success: !stillAlive, port, stoppedModel: smStop.key, script: stopPath,
+    error: stillAlive ? '已执行停止脚本但仍有残留进程（pid=' + stillAlive.pid + '），详见输出' : undefined,
+    output: String(out).trim().slice(-600) };
+}
+// ===== [__close127_btn_1006__] end =====
+
   require('child_process').execFile(file, args, opts, (err, stdout, stderr) => {
     if (err) { err.stdout = stdout; err.stderr = stderr; reject(err); } else resolve(stdout);
   });
@@ -518,6 +548,10 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   inner: '/home/ll/deploy/flash-next-w4a16-inner.sh',
   stopScript: '/home/ll/deploy/stop-flash-next-w4a16.sh',
   // 新栈（官方 0.30.0）在位时优先用新栈脚本对（resolve* 按 DISABLED 哨兵动态选，同看门狗）
+  // [dsh-sglang-stack-1003] SGLang 栈脚本对与日志（ACTIVE 哨兵在位时 resolve* 优先选它们）
+  scriptSglang: '/home/ll/deploy/sglang-18420/start-flash-next-sglang.sh',
+  stopScriptSglang: '/home/ll/deploy/sglang-18420/stop-flash-next-sglang.sh',
+  logSglang: '/home/ll/deploy/sglang-18420.log',
   scriptNew: '/home/ll/deploy/vllm-0300/start-flash-next-0300.sh',
   stopScriptNew: '/home/ll/deploy/vllm-0300/stop-flash-next-0300.sh',
   port: 18420,
@@ -528,13 +562,13 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   altLogs: ['/home/ll/deploy/vllm-flash-next-0300.log'],
   note: '\u5bb9\u5668\u955c\u50cf PP2 \u811a\u672c\u542f\u52a8\uff08W4A16-AutoRound\uff0c\u5b98\u65b9\u624b\u518c \u00a74\uff09\uff0c\u52a0\u8f7d\u7ea6 3~9 \u5206\u949f',
   base: {
-    maxModelLen: 262144, gpuMemUtil: 0.95, maxNumSeqs: 4, maxBatchedTokens: 8192,
-    // [gen-default 0927] 采样基准按用户定档改为 t1.0 / p0.95 / k20 / minp0 / pp0 / rp1.0。
+    maxModelLen: 262144, gpuMemUtil: 0.93, maxNumSeqs: 4, maxBatchedTokens: 8192,
+    // [gen-loopfix 0929] 采样基准回到 09-21 反循环定档 t0.6 / p0.95 / k20 / minp0 / pp0.1 / rp1.0（用户 09-29 拍板：09-27 的 1/0/1 裸档导致思考模型 uct/duct token 级硬循环）。
     // base 同时是「弹窗默认值」与「是否下发 FN_GENCFG 的比较基准」，因此两套栈的 inner
     // GENCFG_DEFAULT 必须与此逐字段一致（flash-next-w4a16-inner.sh / vllm-0300/bin/flash-next-0300-inner.sh），
     // 否则会出现「弹窗显示 ≠ 引擎 cmdline 真值」。
-    blockSize: 1616, temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
-    presencePenalty: 0, repetitionPenalty: 1.0, pp: 2, mtpTokens: 4,
+    blockSize: 1616, temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+    presencePenalty: 0.2, repetitionPenalty: 1.15, pp: 2, mtpTokens: 4,
     // [kvoff-off 0929] 生产真值：二级缓存关（A/B 定案 21h 零外部命中，省 107GB pinned）；
     // PLE=INT8+heap（匿名堆 49.2GB，不受 pinned 挤压页缓存影响，disk 模式与
     // 大 pinned 层共存有缺页拖垮 decode 的结构性风险，见 09-19 事故模式）。
@@ -588,7 +622,7 @@ function scriptModelInstance(sm) {
     // 09-26：两种栈形态都要认——旧 chroot 栈 cmdline 是 `python -m vllm.entrypoints.cli.main serve`，
     // 新官方 0.30.0 栈是 `/…/bin/vllm serve …`（comm=vllm）。旧模式只认前者，导致新栈在跑
     // 而本函数恒返回 null（停止/状态判活全瞎）。括号技巧防匹配到发起 pgrep 的父 shell 自身。
-    const out = execSync('pgrep -f "[v]llm.entrypoints|[v]llm serve" 2>/dev/null || true', { encoding: 'utf8', timeout: 3000 }).trim();
+    const out = execSync('pgrep -f "[v]llm.entrypoints|[v]llm serve|[s]glang.launch_server"   2>/dev/null || true', { encoding: 'utf8', timeout: 3000 }).trim();
     for (const pid of out.split('\n').filter(Boolean)) {
       try {
         const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ');
@@ -627,11 +661,18 @@ function scriptModelForPort(port) {
 // 表现为「停止不成功」。规则与 fnx-18420-watchdog.sh 选栈同源：DISABLED 哨兵缺席=新栈。
 // 新栈 stop 脚本同时兼容旧栈主进程判据，并在入口 touch 人工停止闩锁 fnx-manual-stop。
 const STACK0300_DISABLED = '/home/ll/deploy/vllm-0300/DISABLED';
+// [dsh-sglang-stack-1003] 第三栈：SGLang@18420。sglang-18420/ACTIVE 哨兵在位 = 现行生产走 sglang 脚本对，
+// 优先级高于 vllm-0300/DISABLED 双栈判定。移除哨兵文件即回退旧路由。
+const SGLANG_ACTIVE = '/home/ll/deploy/sglang-18420/ACTIVE';
+function sglangActive() {
+  try { return fs.existsSync(SGLANG_ACTIVE); } catch (e) { return false; }
+}
 function stack0300Active() {
   try { return !fs.existsSync(STACK0300_DISABLED); } catch (e) { return false; }
 }
 function resolveStopScript(sm) {
   try {
+    if (sm && sm.stopScriptSglang && sglangActive() && fs.existsSync(sm.stopScriptSglang)) return sm.stopScriptSglang;  // [dsh-sglang-stack-1003]
     if (sm && sm.stopScriptNew && stack0300Active() && fs.existsSync(sm.stopScriptNew)) return sm.stopScriptNew;
   } catch (e) {}
   return sm && sm.stopScript;
@@ -641,6 +682,7 @@ function resolveStopScript(sm) {
 // 指向自家 inner，被旧值覆盖会跑出「新栈环境 + 旧栈 inner」的杂交命令（09-26 评审发现）。
 function resolveStartScript(sm) {
   try {
+    if (sm && sm.scriptSglang && sglangActive() && fs.existsSync(sm.scriptSglang)) return sm.scriptSglang;  // [dsh-sglang-stack-1003]
     if (sm && sm.scriptNew && stack0300Active() && fs.existsSync(sm.scriptNew)) return sm.scriptNew;
   } catch (e) {}
   return sm && sm.script;
@@ -652,7 +694,7 @@ function scriptModelDefaults(sm) {
   return {
     port: sm.port, servedName: sm.served, maxModelLen: String(b.maxModelLen), ctxLen: '',
     gpuId: 0, gpuCount: b.pp || 2, parallelMode: 'pp', pdMode: '0',
-    maxSeqs: b.maxNumSeqs, gpuMemUtil: b.gpuMemUtil, maxBatchedTokens: b.maxBatchedTokens,
+    maxSeqs: b.maxNumSeqs, maxBatchedTokens: b.maxBatchedTokens,
     blockSize: b.blockSize, temperature: b.temperature, topP: b.topP, topK: b.topK,
     minP: b.minP, presencePenalty: b.presencePenalty, repetitionPenalty: b.repetitionPenalty,
     // [gen-default 0927] 思考深度缺省 xhigh（启动页默认；脚本模型经 FN_CHATKWARGS 真下发到引擎）
@@ -662,7 +704,13 @@ function scriptModelDefaults(sm) {
     // 故弹窗默认选中「MTP」并带出生产档位 mtpTokens（base=4）。NVFP4 档保持关闭：
     // 本镜像 PP2 下 MTP 有连续长请求 device assert 残余 bug。
     mtp: sm.key === 'qwen3.8-flash-next-w4a16' ? '1' : '0', dflash: '0', dspark: '0', mtpTokens: b.mtpTokens || 6,
-    runtime: 'vllm', dtype: 'auto',
+    // [sglang-adapt-1003] SGLang 栈（sglang-18420/ACTIVE 哨兵）在位时，脚本模型的现行生产
+    // 引擎是 sglang：弹窗默认 runtime 跟随，否则用户看到 vLLM 面板、启动的却是 sglang 栈，
+    // 且 sglang 的 mem-fraction-static 上限 0.88（给 decode 期动态内核留余量）必须显示为真值。
+    runtime: (typeof sglangActive === 'function' && sglangActive()) ? 'sglang' : 'vllm',
+    gpuMemUtil: (typeof sglangActive === 'function' && sglangActive())
+      ? Math.min(b.gpuMemUtil || 0.88, 0.88) : b.gpuMemUtil,
+    dtype: 'auto',
     // 1M 长上下文开关（'0' 原生 256K / '1' YaRN×4 → 1M）；maxModelLenLong=0 表示该脚本
     // 模型没提供 1M 档（如 NVFP4 栈），前端据此隐藏开关
     longCtx: '0', maxModelLenLong: sm.maxModelLenLong || 0, maxModelLen512: sm.maxModelLen512 || 0,
@@ -959,6 +1007,134 @@ function scriptModelLaunchPlan(sm, d) {
     env.FN_LONGCTX === '1' ? '长上下文=YaRN×4/1M' : '',
   ].filter(Boolean).join(' ');
   return { env, port, served, warnings, summary };
+}
+// ====== SGLang 脚本栈（sglang-18420 脚本对）参数下发 ======
+// [sglang-adapt-1003] 背景：18420 现行生产切到 SGLang 后，启动 wrapper
+// start-flash-next-sglang.sh 只把 SG_* 环境变量落盘（compgen 扫 ^SG_），inner 也只消费
+// SG_*。若沿用 vLLM 栈的 scriptModelLaunchPlan 下发 FN_*，弹窗/快启的所有参数一个都进
+// 不了引擎（= 09-26「参数三跳」铁律的复发形态：静默失效、inner 缺省值冒充实跑真值）。
+// 因此本栈单独建 plan：语义与 vLLM plan 同字段，落到 SG_*；SGLang 不支持的项显式警告，
+// 不静默丢弃。sglang-18420/ACTIVE 哨兵在位时，两个启动入口（弹窗/快启）自动走这里。
+function scriptModelLaunchPlanSglang(sm, d) {
+  const b = sm.base || {};
+  const warnings = [];
+  const env = {};
+  const num = (v, dflt) => { const n = parseFloat(v); return isNaN(n) ? dflt : n; };
+  const int = (v, dflt) => { const n = parseInt(v, 10); return isNaN(n) ? dflt : n; };
+  const port = int(d.port, sm.port);
+  const served = String(d.servedName || sm.served).trim() || sm.served;
+  env.SG_PORT = String(port);
+  env.SG_SERVED = served;
+  // 上下文档位：SGLang 无运行时 YaRN 缩放参数，1M/512K 靠加载已含 rope 缩放的 config 副本
+  //（与 vLLM 栈同一批 models-1m/models-512k 目录，选择逻辑与 FN 版一致）。
+  let maxLen = String(d.ctxLen || '').trim() || String(d.maxModelLen || '').trim();
+  if (!maxLen || maxLen === 'auto') maxLen = String(b.maxModelLen);
+  const cap1m = int(sm.maxModelLenLong, 0);
+  const cap512 = int(sm.maxModelLen512, 0);
+  const baseCap = int(b.maxModelLen, 262144);
+  const nMaxLen = int(maxLen, NaN);
+  let tier = '';
+  const lcRaw = String(d.longCtx || '').trim().toLowerCase();
+  if (lcRaw === '1' || lcRaw === '1m') tier = '1m';
+  else if (lcRaw === '512k' || lcRaw === '512') tier = '512k';
+  else if (cap512 > 0 && !isNaN(nMaxLen) && nMaxLen > baseCap && nMaxLen <= cap512) tier = '512k';
+  else if (cap1m > baseCap && !isNaN(nMaxLen) && nMaxLen > baseCap) tier = '1m';
+  if (tier === '1m' && cap1m <= 0) tier = cap512 > 0 ? '512k' : '';
+  if (tier === '512k' && cap512 <= 0) tier = cap1m > 0 ? '1m' : '';
+  let modelPath = sm.modelPath;
+  if (tier === '1m') { maxLen = String(cap1m); modelPath = sm.longCtxModelPath || sm.modelPath; }
+  else if (tier === '512k') { maxLen = String(cap512); modelPath = sm.longCtx512ModelPath || sm.modelPath; }
+  else if (!isNaN(nMaxLen) && nMaxLen > baseCap) {
+    maxLen = String(baseCap);
+    warnings.push(`原生档上限 ${baseCap} token；SGLang 栈更长上下文需选 1M/512K YaRN 副本，本次已钳到 ${baseCap}。`);
+  }
+  env.SG_MODEL = modelPath;
+  env.SG_CTX = String(maxLen);
+  // 并行拓扑：默认 PP2（内层缺省 TP1×PP2、层切 26,22）；弹窗改 TP 时下发 TP/PP
+  const gpuN = Math.max(1, int(d.gpuCount, b.pp || 2));
+  const gpuId = Math.max(0, int(d.gpuId, 0));
+  env.SG_CVD = Array.from({ length: gpuN }, (_, i) => gpuId + i).join(',');
+  if (String(d.parallelMode) === 'tp' && gpuN > 1) { env.SG_TP = String(gpuN); env.SG_PP = '1'; }
+  else { env.SG_TP = '1'; env.SG_PP = String(gpuN); }
+  // 显存比例：sglang --mem-fraction-static。投机档上限 0.88（decode 期动态加载 GDN/
+  // EAGLE 内核需余量，超了会 OOM 打坏 CUDA 上下文——09-30 弹窗同款保护）、无投机 0.92。
+  const specOn = String(d.mtp) === '1';
+  if (String(d.dflash) === '1' || String(d.dspark) === '1') {
+    warnings.push('SGLang 脚本栈（18420）投机仅支持内置 NEXTN（MTP），DFlash/DSpark 外部草稿未接线，本次按投机开关处理。');
+  }
+  env.SG_SPEC = specOn ? 'nextn' : 'none';
+  const memCap = specOn ? 0.88 : 0.92;
+  const memRaw = num(d.gpuMemUtil, specOn ? Math.min(b.gpuMemUtil || 0.88, 0.88) : 0.88);
+  const memFrac = Math.min(memRaw, memCap);
+  if (memRaw > memCap) warnings.push(`显存比例 ${memRaw} 已钳到 ${memCap}（SGLang ${specOn ? '投机' : ''}档安全上限，防 decode 期动态内核加载 OOM）。`);
+  env.SG_MEMFRAC = String(memFrac);
+  env.SG_SEQS = String(int(d.maxSeqs, b.maxNumSeqs));
+  env.SG_CHUNKED_PREFILL = String(int(d.maxBatchedTokens, b.maxBatchedTokens));
+  // 采样参数：无条件下发。inner 内置缺省与弹窗基准(base)不同值，省略会「弹窗显示 ≠ 引擎真值」。
+  const gen = {
+    temperature: num(d.temperature, b.temperature), top_p: num(d.topP, b.topP),
+    top_k: int(d.topK, b.topK), min_p: num(d.minP, b.minP),
+    presence_penalty: num(d.presencePenalty, b.presencePenalty),
+    repetition_penalty: num(d.repetitionPenalty, b.repetitionPenalty),
+  };
+  env.SG_GENCFG = JSON.stringify(gen);
+  // 思考模式（同 FN_CHATKWARGS 白名单：模板只认 xhigh/medium/low）
+  const effortIn = String(d.thinkingEffort || '').trim().toLowerCase();
+  if (String(d.thinking) === '0') {
+    env.SG_CT_KWARGS = JSON.stringify({ enable_thinking: false });
+  } else {
+    const kw = { enable_thinking: true, preserve_thinking: true };
+    if (effortIn === '' || effortIn === 'xhigh') kw.reasoning_effort = 'xhigh';
+    else if (effortIn === 'medium' || effortIn === 'low') kw.reasoning_effort = effortIn;
+    else warnings.push(`思考深度「${effortIn}」不是 Flash-Next 模板支持的档位（仅 xhigh / medium / low），本次不下发 reasoning_effort，引擎按模板缺省 xhigh 运行。`);
+    env.SG_CT_KWARGS = JSON.stringify(kw);
+  }
+  // vLLM 专属项：SGLang 栈无对应实现 → 显式警告（不静默丢）
+  const vOnly = [];
+  if (String(d.blockSize || '') !== '' && int(d.blockSize, 0) !== 0) vOnly.push('block-size（SGLang page_size 由内核自动选）');
+  if (String(d.kvoff || '') !== '' && String(d.kvoff) !== '0') vOnly.push('CPU 二级缓存（SGLang 为显存 radix cache，无对应档）');
+  if (String(d.pleInt8 || '') !== '' || String(d.pleLoc || '') !== '') vOnly.push('PLE 精度/位置（本栈固定 BF16 锁页）');
+  if (String(d.enforceEager || '') === '1') vOnly.push('enforce-eager');
+  if (String(d.kvCacheQuant || '') !== '' && String(d.kvCacheQuant) !== 'auto') vOnly.push('KV 量化');
+  if (String(d.dtype || '') !== '' && String(d.dtype) !== 'auto' && String(d.dtype) !== 'bfloat16') vOnly.push('dtype（本栈固定 bfloat16）');
+  if (String(d.pdMode || '') === '1') vOnly.push('PD 分离');
+  if (vOnly.length) warnings.push('以下参数为 vLLM 栈专属，SGLang 脚本栈忽略：' + vOnly.join('、') + '。');
+  // 附加环境变量：仅 SG_* 键能进 wrapper（sudo env_reset，落盘只扫 SG_*）；其余剔除并警告
+  const keptEnv = [];
+  String(d.vllmExtraEnv || '').split('\n').map(x => x.trim()).filter(x => x && !x.startsWith('#')).forEach(line => {
+    const key = line.split('=')[0].trim().toUpperCase();
+    if (/^SG_[A-Z0-9_]+$/.test(key)) keptEnv.push(line);
+    else if (key) warnings.push('附加环境变量「' + key + '」非 SG_* 键：SGLang 脚本栈经 sudo env_reset 只透传 SG_*，已忽略该行。');
+  });
+  keptEnv.forEach(line => { const i = line.indexOf('='); if (i > 0) env[line.slice(0, i).trim()] = line.slice(i + 1).trim(); });
+  const extra = String(d.vllmExtraArgs || '').trim() + '\n' + String(d.sglangExtraArgs || '').trim();
+  if (extra.trim()) warnings.push('SGLang 脚本栈暂不透传附加命令行参数（inner 命令行固定）；如需请修改 sglang-18420/sglang-inner.sh。填写内容未生效：\n' + extra.trim());
+  const summary = [
+    'sglang serve ' + modelPath, '--served-model-name ' + served, '--port ' + port,
+    '--context-length ' + maxLen, '--mem-fraction-static ' + env.SG_MEMFRAC,
+    '--max-running-requests ' + env.SG_SEQS, '--chunked-prefill-size ' + env.SG_CHUNKED_PREFILL,
+    'TP' + env.SG_TP + '×PP' + env.SG_PP,
+    'spec=' + (specOn ? 'NEXTN(MTP)' : 'none'),
+    'gen=' + env.SG_GENCFG,
+    tier === '1m' ? '长上下文=YaRN×4/1M副本' : (tier === '512k' ? '长上下文=YaRN×2/512K副本' : ''),
+  ].filter(Boolean).join(' ');
+  return { env, port, served, warnings, summary, runtime: 'sglang', gpuCount: gpuN };
+}
+// 启动入口选择：ACTIVE 哨兵 + 脚本对在位 → sglang plan，否则 vLLM plan（两栈共用同一弹窗字段）。
+function scriptPlanFor(sm, d) {
+  try {
+    if (sm && sm.scriptSglang && sglangActive() && fs.existsSync(sm.scriptSglang)) return scriptModelLaunchPlanSglang(sm, d);
+  } catch (e) {}
+  return scriptModelLaunchPlan(sm, d);
+}
+// [sglang-adapt-1003] 脚本模型的启动 wrapper 输出日志（≠ inner 引擎日志 logSglang，后者由
+// wrapper 自己重定向并有祖先链判据）：sglang 栈在位时写 sglang-launch.log 语义的文件，
+// 避免 8889 把 sglang 启动行追进 vLLM 老日志里造成「日志面板显示陈旧文件」误判。
+function scriptLaunchLog(sm) {
+  try {
+    if (sm && sm.scriptSglang && sglangActive() && fs.existsSync(sm.scriptSglang)) return sm.logSglang || sm.log;
+  } catch (e) {}
+  return sm.log;
 }
 function vllmPortForModel(model) {
   if (!model) return null;
@@ -2704,6 +2880,12 @@ function findVllmPidByPort(port) {
     if (first) return parseInt(first);
     // 兜底：chroot 内引擎进程属 root，ll 用户的 lsof 看不到其监听端口，
     // 改按 /proc/<pid>/cmdline 的 --port 匹配定位（cmdline 宿主可见）。
+    // [sglang-adapt-1003] root 起的 sglang 同样看不见，且 vllm.entrypoints 兜底不认它 →
+    // 先查 /proc 扫描的 sglang 实例表（listSglangInstances，3s 缓存）。
+    try {
+      const sgi = listSglangInstances().find(x => x.port === port);
+      if (sgi && sgi.pid) return sgi.pid;
+    } catch (e) {}
     const pg = execSync('pgrep -f "[v]llm.entrypoints" 2>/dev/null || true', { encoding: 'utf8', timeout: 3000 }).trim();
     for (const pid of pg.split('\n').filter(Boolean)) {
       try {
@@ -2762,12 +2944,25 @@ function getVllmInstances(ports, callback) {
           const j = JSON.parse(data);
           if (j.data && j.data.length) {
             const pid = findVllmPidByPort(p);
+            let gpu = gpuIndexForPid(pid);
+            let rt = detectRuntimeForPid(pid);
+            // [sglang-adapt-1003] root 起的 sglang：/proc/<pid>/environ 读不到（gpu=null）、
+            // 或 pid 兜底未命中（runtime=unknown）→ 用 /proc cmdline 扫描的实例表补归因。
+            if (!rt || gpu == null) {
+              try {
+                const sgi = listSglangInstances().find(x => x.port === p);
+                if (sgi) {
+                  rt = rt || 'sglang';
+                  if (gpu == null) gpu = sgi.gpu != null ? String(sgi.gpu) : null;
+                }
+              } catch (e) {}
+            }
             instances.push({
               port: p,
               model: j.data[0].id,
               pid,
-              gpu: gpuIndexForPid(pid),
-              runtime: detectRuntimeForPid(pid) || 'unknown',
+              gpu,
+              runtime: rt || 'unknown',
               running: true,
             });
           }
@@ -2926,6 +3121,21 @@ function gaugeValue(m, base) {
   for (const k of Object.keys(m)) if (k.startsWith(base + '|')) return m[k];
   return 0;
 }
+// [sglang-adapt-1003] PP 双 stage 的 gauge 取值：sglang 每个 pp_rank 各注册一份 gauge，
+// 且部分族（spec_accept_rate/spec_accept_length/spec_num_steps…）只登记在**末段 stage**
+// （rank0 恒 0）——gaugeValue「取第一条」会拿到 rank0 的假 0，控制台投机命中率永远空。
+// 正确口径：带 pp_rank 的序列取 max（副本同值不受影响，单段真值不再被 0 遮蔽）。
+function gaugeValuePp(m, base) {
+  let best = null;
+  for (const k of Object.keys(m)) {
+    if (k.indexOf(base + '|') !== 0) continue;
+    let l = {};
+    try { l = JSON.parse(k.substring(k.indexOf('|') + 1)); } catch (e) {}
+    if (l && l.pp_rank != null) { if (best == null || m[k] > best) best = m[k]; continue; }
+    return m[k]; // 无 pp_rank 维度：保持原语义（首条）
+  }
+  return best == null ? 0 : best;
+}
 // Counter 类：累加所有该指标（可能多标签）的值
 function counterTotal(m, base) {
   let t = 0;
@@ -2966,7 +3176,9 @@ function histogramSumCount(m, base) {
 // sglang 的 /metrics 指标命名/结构（sglang: 前缀）与 vLLM 差异较大，这里用独立构建器
 // 产出与前端 `/v1/internal/stats` 兼容的结果结构（vllm 路径保持不变）。
 function buildSglangStats(m, ticker) {
-  const g = (base) => gaugeValue(m, base);
+  // [sglang-adapt-1003] 改用 gaugeValuePp：PP2 下 spec_* 等 gauge 只在末段登记（rank0 恒 0），
+  // 旧 gaugeValue 取首条 → 投机命中率等永远显示空/0。
+  const g = (base) => gaugeValuePp(m, base);
   const hist = (base) => histogramSumCount(m, base);
   const cnt = (base) => counterTotal(m, base);
 
@@ -3527,6 +3739,10 @@ function ancestorLogFiles(pid, maxHops) {
   return found;
 }
 function pickScriptModelLogFile(inst, sm) {
+  // [dsh-sglang-stack-1003] sglang 栈在位 → 直接读 sglang 日志（打分链候选不含该文件名）
+  try {
+    if (sm && sm.logSglang && sglangActive() && fs.existsSync(sm.logSglang)) return sm.logSglang;
+  } catch (e) {}
   if (!inst) return null;
   const memo = (global.__scriptLogPick = global.__scriptLogPick || new Map());
   const memoKey = (inst.pid || 0) + ':' + (inst.port || 0);
@@ -6285,6 +6501,12 @@ async function startVllmModel(modelName, params, callback) {
     }
   }
 
+  // [__ncclp2p_1001_arg__] P2P 损坏 ⇒ 多卡实例必须关 custom allreduce（它走 CUDA IPC 直读对端显存，
+  // 不受 NCCL_P2P_DISABLE 管辖，会静默污染数据）。弹窗显式开启过时不重复添加。
+  if (gpuN > 1 && !args.includes('--disable-custom-all-reduce')) {
+    args.push('--disable-custom-all-reduce');
+  }
+
   // KV 缓存量化：fp8_kv 权重不量化仅量化 KV；fp8/int8 同时量化权重+KV。
   // 注意：若模型自身 config.json 已声明量化（quantization_config，如 ornith 的
   // compressed-tensors、qwen fp8），再传 --quantization 会因不匹配直接启动失败
@@ -6383,6 +6605,12 @@ async function startVllmModel(modelName, params, callback) {
     // 2026-09-16: 本地模型路径解析失败时禁止回退 HF hub 在线查询（否则报 Repo id 错误）
     HF_HUB_OFFLINE: '1',
     TRANSFORMERS_OFFLINE: '1',
+    // [__ncclp2p_1001_env__] 本机 BAR1 P2P 补丁数据通路静默损坏（10-01 实锤：跨卡拷贝 data ok=False），
+    // 任何多卡实例（TP/PP/PD）一律 NCCL 走 host SHM，否则首个 all-reduce 即死锁。
+    NCCL_P2P_DISABLE: '1',
+    NCCL_SHM_DISABLE: '0',
+    NCCL_CUMEM_ENABLE: '0',
+    NCCL_NET_GDR_LEVEL: '0',
   };
 
   // 上下文长度超过模型原生上限时自动加 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
@@ -8511,6 +8739,807 @@ function installGzip(req, res) {
 process.on('unhandledRejection', (e) => { try { console.error('[unhandledRejection]', (e && e.stack) || e); } catch (_) {} });
 process.on('uncaughtException', (e) => { try { console.error('[uncaughtException]', (e && e.stack) || e); } catch (_) {} });
 
+// ==== [strata-console] BEGIN module ====
+// ====== Strata 推理引擎管理 API（console-backend，2026-09-30）======
+// 契约文档：strata/console/STRATA-API.md（前缀 /v1/internal/strata）。
+// 设计铁律（本项目事件循环教训）：
+//  · 绝不 execSync 长耗时调用；nvidia-smi / 端口探测一律异步 execFile + 短缓存；
+//  · 对引擎（默认 127.0.0.1:8080）的 http.get 一律 2s 超时，失败降级为 {ok:false} 字段，不抛穿；
+//  · 进程存活判定走 /proc 直扫 cmdline（不依赖 pid 文件）；spawn 用 setsid + detached + unref，
+//    使 Strata 进程组独立于 dsh-console 的 cgroup（控制台重启/停止绝不带崩引擎）。
+// 资源门禁（产品要求，非可选项）：Strata 需 35-55GB 专家进 RAM + 大量空闲显存，与 18420
+//  生产实例互斥——启动前每卡显存占用必须 < 8GB 且系统可用内存 > 80GB，否则 409 拒绝。
+//  · force=true 跳过显存/内存两项（端口占用与已在运行两项永不跳过），并在日志记 OVERRIDE 一笔。
+// 进程识别（实测引擎侧事实）：
+//  · 主服务进程 cmdline = "<Strata>/.venv/bin/python <Strata>/serve/server.py --engine strata --config ... --port N"
+//  · 引擎子进程 cmdline = "<Strata>/engine/strata --serve ..."（由 server.py Popen 拉起，同进程组）
+//  · 启动器 setup.py 进程只在加载期短暂存在，不作运行判据。
+// 停止 = SIGTERM 整个进程组（负 pgid），最多等 60s，超时不强杀。
+
+// —— 路径常量（env 可覆盖，便于异机复现）——
+const STRATA_ROOT   = process.env.STRATA_DIR      || '/media/ll/data/strata/Strata';
+const STRATA_DATA   = process.env.STRATA_DATA_DIR || '/media/ll/data/strata/Strata-data';
+const STRATA_PY     = process.env.STRATA_PY       || path.join(STRATA_ROOT, '.venv/bin/python');
+const STRATA_SETUP  = process.env.STRATA_SETUP    || path.join(STRATA_ROOT, 'setup.py');
+const STRATA_CONSOLE_LOG = process.env.STRATA_CONSOLE_LOG || '/media/ll/data/strata/strata-console.log';
+const STRATA_ENGINE_BIN  = path.join(STRATA_ROOT, 'engine/strata');   // 引擎二进制名以 setup.py EXE 常量为准
+const STRATA_BUILD_JSON  = path.join(STRATA_ROOT, 'engine/BUILD.json');
+const STRATA_GATE_VRAM_MB = 8192;    // 每卡占用必须低于此值
+const STRATA_GATE_RAM_GB  = 80;      // 系统可用内存必须高于此值
+const STRATA_FETCH_TIMEOUT_MS = 2000;
+
+// —— 小工具 ——
+function strataFsExists(p) { try { return fs.existsSync(p); } catch (e) { return false; } }
+function strataReadJson(p) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return null; }
+}
+
+// 最近一次启动参数（config = Strata/strata-<tag>.json，installed_configs 按 mtime 倒序取第一份）
+function strataLatestConfig() {
+  try {
+    const files = fs.readdirSync(STRATA_ROOT)
+      .filter((f) => /^strata-.*\.json$/.test(f))
+      .map((f) => { const p = path.join(STRATA_ROOT, f); let mt = 0; try { mt = fs.statSync(p).mtimeMs; } catch (e) {} return { p, mt }; })
+      .sort((a, b) => b.mt - a.mt);
+    for (const c of files) { const j = strataReadJson(c.p); if (j && j.exe) { j.__path = c.p; return j; } }
+  } catch (e) { /* 目录不存在=未安装 */ }
+  return null;
+}
+
+// —— 引擎 args 工具（flag 值读写；setup.py 快路径不吃命令行覆盖，参数调整全靠改写 cfg JSON）——
+function strataArgVal(argsArr, flag) {
+  const i = argsArr.indexOf(flag);
+  return i >= 0 && i + 1 < argsArr.length ? argsArr[i + 1] : null;
+}
+// 设置 flag：已有则替换值；没有则插入到 anchorFlag 之前（无 anchor 则追加尾部）
+function strataArgSet(argsArr, flag, val, anchorFlag) {
+  const v = String(val);
+  const i = argsArr.indexOf(flag);
+  if (i >= 0 && i + 1 < argsArr.length) { argsArr[i + 1] = v; return argsArr; }
+  const at = anchorFlag ? argsArr.indexOf(anchorFlag) : -1;
+  if (at >= 0) argsArr.splice(at, 0, flag, v);
+  else argsArr.push(flag, v);
+  return argsArr;
+}
+function strataArgRemove(argsArr, flag) {
+  const i = argsArr.indexOf(flag);
+  if (i >= 0) argsArr.splice(i, flag === '--mmap-experts' ? 1 : 2);   // --mmap-experts 是无值开关
+  return argsArr;
+}
+
+// 按 start 请求体改写并落盘 cfg（幂等：目标态写入；同文件备份只留最新一份 .bak-console）
+// 返回 {changed, backup, effective} 或抛 Error（写失败=拒绝带着不确定参数启动）
+function strataApplyTuning(cfgPath, cfg, t) {
+  // [STRICT_8G_PATCH_V1] strict_8g（用户红线：只用 GPU0 的 8GB、GPU1 禁用）归一化。
+  // 引擎语义实锤：--vram-reserve-mib 是"预留"（缓存吃 free−reserve，设大反而缓存更大）；
+  // --expert-cache auto/0 都会吃满（0 实测被当 auto：24576 slots/33.02GiB）；只有显式正整数被尊重
+  // （200 → 205 slots/0.28GiB 峰值 5716MiB；300 + 32K ctx → 6260MiB）。
+  // 固定 reserve=1024、expert_cache=300、gpu=0 ⇒ serve 端 CUDA_VISIBLE_DEVICES=0 ⇒ GPU1 不可见。
+  if (t && t.strict_8g === true) {
+    t = Object.assign({}, t, { vram_mb: 1024, expert_cache: 300, gpu: 0 });
+    if (t.kv_resident == null && t.max_context != null && t.max_context >= 65536) t.kv_resident = 20480;   // [KV_STREAM_PATCH_V1]
+  }
+  const before = JSON.stringify(cfg);
+  const errs = [];
+  const args = Array.isArray(cfg.args) ? cfg.args.slice() : [];
+  if (t.vram_mb != null) {
+    // 上限=每卡实际显存（170HX=65536MiB）；预留值不应超过整卡显存
+    if (!(Number.isInteger(t.vram_mb) && t.vram_mb >= 256 && t.vram_mb <= 65535)) errs.push('vram_mb 需为 256~65535 的整数（MiB）');
+    else strataArgSet(args, '--vram-reserve-mib', t.vram_mb, '--max-context');
+  }
+  if (t.expert_cache != null) {
+    // [STRICT_8G_PATCH_V1] 0 必须拒绝：引擎 `--expert-cache 0` 实测被当 auto 吃满显存
+    const ecOk = t.expert_cache === 'auto' || (Number.isInteger(t.expert_cache) && t.expert_cache >= 1);
+    if (t.expert_cache === 0) errs.push('expert_cache 不能为 0（引擎会当 auto 吃满显存），严格模式请用 300');
+    else if (!ecOk) errs.push('expert_cache 需为 "auto" 或 ≥1 的整数');
+    else strataArgSet(args, '--expert-cache', t.expert_cache, '--max-context');
+  }
+  if (t.mmap_experts === true) { if (!args.includes('--mmap-experts')) args.push('--mmap-experts'); }
+  else if (t.mmap_experts === false) { strataArgRemove(args, '--mmap-experts'); }
+  if (t.max_context != null) {
+    const mc = parseInt(t.max_context, 10);
+    if (!isFinite(mc) || mc < 1024 || mc > 1048576) errs.push('max_context 需为 1024~1048576');
+    else strataArgSet(args, '--max-context', mc);
+  }
+  if (t.kv_resident != null) {   // [KV_STREAM_PATCH_V1] KV 流式：整个 K/V 进 pinned RAM，VRAM 每层只留 N cells
+    const kr = parseInt(t.kv_resident, 10);
+    if (!isFinite(kr) || kr < 20480 || kr > 1048576) errs.push('kv_resident 需为 20480~1048576（引擎下限 20480）');
+    else strataArgSet(args, '--kv-resident', kr, '--max-context');
+  }
+  if (t.gpu != null) {
+    // [DUAL_170HX_PATCH_V1] gpu 可为 int（单卡）或 "0,1"/[0,1]（多卡分层 PP — 引擎 layer split，见 docs/MULTI_GPU.md）
+    const raw = Array.isArray(t.gpu) ? t.gpu : String(t.gpu).split(',');
+    const list = raw.map((x) => parseInt(x, 10)).filter((x) => Number.isInteger(x) && x >= 0 && x <= 15);
+    if (!list.length) errs.push('gpus 需为合法卡号（单卡 0；双卡 "0,1"）');
+    else if (list.length === 1) {
+      cfg.gpu = list[0];             // 单卡=int；serve 端 CUDA_VISIBLE_DEVICES 按 gpu_list 收敛
+      delete cfg.layer_split;        // 多卡遗留项
+    } else {
+      cfg.gpu = list;                // 多卡=列表；serve 端自动追加 --layer-split
+      cfg.layer_split = t.layer_split || cfg.layer_split || 'auto';
+    }
+    cfg.gpus_asked = true;           // 保持 true：offer_together 见标志早退，--yes 下不会再把 cfg 改回双卡列表
+  }
+  if (t.prefill != null) {   // [DUAL_170HX_PATCH_V1] 8GB 卡双卡必需：提示路径缓冲随 chunk 线性增长（160+chunk*680/1024 MiB）
+    const pf = String(t.prefill) === 'auto' ? 'auto' : parseInt(t.prefill, 10);
+    if (pf !== 'auto' && (!isFinite(pf) || pf < 128 || pf > 8192)) errs.push('prefill 需为 auto 或 128~8192');
+    else if (pf === 'auto') strataArgSet(args, '--prefill', 'auto', '--max-context');
+    else strataArgSet(args, '--prefill', pf, '--max-context');
+  }
+  if (errs.length) { const e = new Error(errs.join('；')); e.userFacing = true; throw e; }
+  cfg.args = args;
+  const after = JSON.stringify(cfg);
+  const changed = before !== after;   // 含 gpu/layer_split/gpus_asked 字段增删，杜绝「只删不改写回」漏网
+  let backup = null;
+  if (changed) {
+    try {
+      backup = cfgPath + '.bak-console';
+      fs.copyFileSync(cfgPath, backup);   // 同文件只留最新一份（固定名覆盖，防堆积）
+      const out = Object.assign({}, cfg);
+      delete out.__path;
+      fs.writeFileSync(cfgPath, JSON.stringify(out, null, 1), 'utf8');   // [STRICT_8G_PATCH_V1] 修 encoding= 赋值式误写
+      console.log('[strata] cfg 已改写并备份：' + cfgPath + '（backup=' + backup + '）');
+    } catch (e) {
+      const err = new Error('改写配置失败：' + String((e && e.message) || e));
+      throw err;
+    }
+  }
+  return { changed, backup, effective: strataEffectiveArgs(cfg) };
+}
+
+// 生效参数摘要（status.effective_args / 前端展示）：从 args+cfg 提炼关键项
+function strataEffectiveArgs(cfg) {
+  if (!cfg) return null;
+  const a = Array.isArray(cfg.args) ? cfg.args : [];
+  return {
+    vram_reserve_mib: strataArgVal(a, '--vram-reserve-mib') != null ? parseInt(strataArgVal(a, '--vram-reserve-mib'), 10) : null,
+    expert_cache: strataArgVal(a, '--expert-cache'),
+    mmap_experts: a.includes('--mmap-experts'),
+    max_context: strataArgVal(a, '--max-context') != null ? parseInt(strataArgVal(a, '--max-context'), 10) : null,
+    gpu: cfg.gpu === undefined ? null : cfg.gpu,
+    kv: strataArgVal(a, '--kv'),
+    kv_resident: strataArgVal(a, '--kv-resident') != null ? parseInt(strataArgVal(a, '--kv-resident'), 10) : null,   // [KV_STREAM_PATCH_V1]
+    spec: strataArgVal(a, '--spec'),
+    prefill: strataArgVal(a, '--prefill'),
+  };
+}
+
+// 从配置提炼契约要求的 config 摘要（model/context/vision/host/port + 派生项）
+function strataConfigBrief(cfg) {
+  if (!cfg) return null;
+  const a = Array.isArray(cfg.args) ? cfg.args : [];
+  const argVal = (flag) => { const i = a.indexOf(flag); return i >= 0 && i + 1 < a.length ? a[i + 1] : null; };
+  let model = null;
+  try {
+    const native = argVal('--native') || '';
+    const m = native.match(/-(Q2_0|IQ2_XS|IQ3_XXS|IQ3_S|Q2_K|Q3_K|IQ2_M|IQ3_M)[-_]/i) || native.match(/\/([A-Za-z0-9_]+)\//);
+    if (m) model = m[1].toUpperCase();
+    if (!model) model = (String(cfg.model_name || '').split('-').pop() || '').toUpperCase() || null;
+  } catch (e) {}
+  return {
+    model,
+    model_name: cfg.model_name || null,
+    context: parseInt(argVal('--max-context') || '0', 10) || null,
+    vision: a.includes('--vision') ? 'gpu' : 'none',
+    kv: argVal('--kv'),
+    spec: argVal('--spec'),
+    port: cfg.port || 8080,
+    host: cfg.host || '127.0.0.1',
+    api_key_set: !!cfg.api_key,
+    exe: cfg.exe || null,
+    log: cfg.log || null,
+    config_path: cfg.__path || null,
+    gpu: cfg.gpu === undefined ? null : cfg.gpu,
+    effective: strataEffectiveArgs(cfg),
+  };
+}
+
+// /proc 直扫找 Strata 主服务进程（serve/server.py --engine strata）。
+// 排除 ssh/bash/pgrep/grep/ps 探测类进程（沿用本项目 resolveBackendPort 过滤规则）。
+function strataScanMainProc() {
+  let names = [];
+  try { names = fs.readdirSync('/proc'); } catch (e) { return null; }
+  const cands = [];
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    let cmd;
+    try { cmd = fs.readFileSync(`/proc/${name}/cmdline`, 'utf8'); } catch (e) { continue; }
+    if (!cmd) continue;
+    const flat = cmd.split('\0').join(' ');
+    if (!cmd.includes('serve/server.py') || !flat.includes('--engine strata')) continue;
+    if (/(^|\s)(ssh|bash|sh|expect)(\s|$)/.test(flat)) continue;
+    if (/\b(pgrep|grep|ps)\b/.test(flat)) continue;
+    const pm = flat.match(/--port[\s=]+(\d+)/);
+    let stat = '';
+    try { stat = fs.readFileSync(`/proc/${name}/stat`, 'utf8'); } catch (e) {}
+    const state = (stat.match(/\)\s+(\S)/) || [])[1] || '';
+    if (state === 'Z') continue;   // 僵尸进程绝不算存活（本项目 stop 脚本铁律）
+    let starttimeTicks = 0;
+    // comm 可含空格：剥到最后一个 ')' 再切（fields[19]=starttime ticks）
+    try { starttimeTicks = parseInt(stat.slice(stat.lastIndexOf(')') + 2).split(/\s+/)[19], 10) || 0; } catch (e) {}
+    let uid = null;
+    try { uid = fs.statSync(`/proc/${name}`).uid; } catch (e) {}
+    // 多个 Strata 实例并存时取 pid 最大者（最后启动）
+    cands.push({
+      pid: parseInt(name, 10),
+      port: pm ? parseInt(pm[1], 10) : null,
+      state,
+      starttime_ticks: starttimeTicks,
+      uid,
+      cmd: flat.slice(0, 400),
+    });
+  }
+  if (!cands.length) return null;
+  cands.sort((a, b) => b.pid - a.pid);
+  return cands[0];
+}
+
+// /proc 扫引擎子进程（engine/strata --serve），仅作辅助展示/取证
+function strataScanEngineProcs() {
+  const out = [];
+  let names = [];
+  try { names = fs.readdirSync('/proc'); } catch (e) { return out; }
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    let cmd;
+    try { cmd = fs.readFileSync(`/proc/${name}/cmdline`, 'utf8'); } catch (e) { continue; }
+    if (!cmd || !cmd.includes(STRATA_ENGINE_BIN) || !cmd.split('\0').includes('--serve')) continue;
+    out.push(parseInt(name, 10));
+  }
+  return out;
+}
+
+// 进程启动时刻（epoch ms）：btime + starttime/HZ，不依赖 pid 文件
+function strataProcStartEpochMs(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // 铁律：comm 可含空格/括号，必须先剥到最后一个 ')' 再切字段（fields[19]=starttime，即整行第 22 字段）
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(/\s+/);
+    const startTicks = parseInt(fields[19], 10);
+    if (!isFinite(startTicks)) return null;
+    const uptime = parseFloat(fs.readFileSync('/proc/uptime', 'utf8').split(' ')[0]);
+    if (!isFinite(uptime)) return null;
+    return Date.now() - Math.round(uptime * 1000) + Math.round((startTicks / 100) * 1000);
+  } catch (e) { return null; }
+}
+
+// —— 引擎 HTTP 转发（http.get + 2s 超时，失败 resolve null，绝不抛穿）——
+function strataHttpGetJson(port, pathName, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    let req;
+    try {
+      req = http.get({ host: '127.0.0.1', port, path: pathName, timeout: timeoutMs || STRATA_FETCH_TIMEOUT_MS }, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { body += c; if (body.length > 4 * 1024 * 1024) { req.destroy(); } });
+        res.on('end', () => {
+          if (res.statusCode !== 200) return done(null);
+          try { done(JSON.parse(body)); } catch (e) { done({ __raw: body.slice(0, 2048) }); }
+        });
+      });
+    } catch (e) { return done(null); }
+    req.on('timeout', () => { try { req.destroy(); } catch (e) {} done(null); });
+    req.on('error', () => done(null));
+  });
+}
+
+// —— 资源门禁：GPU 显存（异步 execFile，2s 缓存 + 单飞）。
+// 竞态铁律（09-30 实锤）：过期时绝不可在 execFile 完成前 resolve(缓存)——首发调用会拿到
+// null（调用方 .ok 直接炸 TypeError）。正解=每次都 await 本轮刷新 Promise，缓存只作回填源。
+let __strataGpuCache = { at: 0, data: null };
+let __strataGpuFly = null;
+function strataGpuMemUsed() {
+  const now = Date.now();
+  if (__strataGpuCache.data && now - __strataGpuCache.at <= 2000) return Promise.resolve(__strataGpuCache.data);
+  if (__strataGpuFly) return __strataGpuFly;
+  __strataGpuFly = new Promise((resolve) => {
+    execFileAsync('nvidia-smi', ['--query-gpu=index,memory.used', '--format=csv,noheader,nounits'], { timeout: 4000, encoding: 'utf8' })
+      .then((out) => {
+        const gpus = [];
+        String(out).split('\n').forEach((line) => {
+          const p = line.split(',').map((x) => x.trim());
+          if (p.length >= 2 && /^\d+$/.test(p[0])) gpus.push({ index: parseInt(p[0], 10), used_mb: parseInt(p[1], 10) || 0 });
+        });
+        __strataGpuCache = { at: Date.now(), data: { ok: gpus.length > 0, gpus } };
+      })
+      .catch(() => { __strataGpuCache = { at: Date.now(), data: { ok: false, gpus: [] } }; })
+      .then(() => { __strataGpuFly = null; resolve(__strataGpuCache.data); });
+  });
+  return __strataGpuFly;
+}
+
+// —— 资源门禁：系统可用内存（/proc/meminfo 直读，2s 缓存）——
+let __strataRamCache = { at: 0, avail_kb: 0 };
+function strataAvailMemKB() {
+  const now = Date.now();
+  if (now - __strataRamCache.at > 2000) {
+    try {
+      const txt = fs.readFileSync('/proc/meminfo', 'utf8');
+      const m = txt.match(/^MemAvailable:\s+(\d+)\s*kB/m);
+      __strataRamCache = { at: now, avail_kb: m ? parseInt(m[1], 10) : 0 };
+    } catch (e) { __strataRamCache = { at: now, avail_kb: 0 }; }
+  }
+  return __strataRamCache.avail_kb;
+}
+
+// —— 资源门禁：端口占用探测（异步 execFile ss，60s 负缓存）。
+// 缓存只缓存「空闲=false」：true（被占用）必须每次现查——Strata 刚停 60s 内重开是常态，
+// 缓存忙碌态会误报「端口已被监听」。
+const __strataPortCache = new Map();   // port -> {at, listening}
+function strataPortListening(port) {
+  return new Promise((resolve) => {
+    const hit = __strataPortCache.get(port);
+    if (hit && hit.listening === false && Date.now() - hit.at < 60000) return resolve(false);
+    execFileAsync('ss', ['-ltnH', `( sport = :${port} )`], { timeout: 3000, encoding: 'utf8' })
+      .then((out) => {
+        const listening = String(out).split('\n').some((l) => l.trim() && l.includes(':' + port));
+        if (!listening) __strataPortCache.set(port, { at: Date.now(), listening: false });
+        resolve(listening);
+      })
+      .catch(() => resolve(false));   // ss 不可用：不缓存、不误拦（spawn 后端口真被占 setup.py 自会失败并落日志）
+  });
+}
+
+// —— 安装/就绪度（status 与 options 共用）——
+function strataInstalled() { return strataFsExists(STRATA_SETUP); }
+function strataEngineReady() {
+  const meta = strataReadJson(STRATA_BUILD_JSON);
+  return { ready: !!meta && strataFsExists(STRATA_ENGINE_BIN), build: meta };
+}
+function strataModelDirs() {
+  // 扫 Strata-data/models/*/：目录内所有 .gguf 都有同名 .done → ready；gb=分片实际字节和
+  const out = [];
+  let dirs = [];
+  try { dirs = fs.readdirSync(path.join(STRATA_DATA, 'models')); } catch (e) { return out; }
+  for (const d of dirs) {
+    const dp = path.join(STRATA_DATA, 'models', d);
+    let st;
+    try { st = fs.statSync(dp); } catch (e) { continue; }
+    if (!st.isDirectory()) continue;
+    let files = [];
+    try { files = fs.readdirSync(dp); } catch (e) { continue; }
+    const shards = files.filter((f) => f.endsWith('.gguf'));
+    let bytes = 0, doneCnt = 0;
+    for (const s of shards) {
+      try { bytes += fs.statSync(path.join(dp, s)).size; } catch (e) {}
+      if (files.includes(s + '.done')) doneCnt++;
+    }
+    out.push({ name: d, gb: parseFloat((bytes / 1e9).toFixed(1)), shards: shards.length, ready: shards.length > 0 && doneCnt === shards.length });
+  }
+  return out;
+}
+function strataModelReady() { return strataModelDirs().some((m) => m.ready); }
+
+// 上次启动失败摘要：控制台日志尾部若有 error/Traceback 迹象，取最后一行非空错误行。
+// 注意 statSync 必须在 try 内——文件不存在（从未启动）时直接返回 null，不得抛穿。
+function strataLastError() {
+  let sz = 0;
+  try { sz = fs.statSync(STRATA_CONSOLE_LOG).size; } catch (e) { return null; }
+  try {
+    if (sz === 0) return null;
+    const fd = fs.openSync(STRATA_CONSOLE_LOG, 'r');
+    try {
+      const len = Math.min(sz, 64 * 1024);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, sz - len);
+      const lines = buf.toString('utf8').split('\n').map((l) => l.trim()).filter(Boolean);
+      const bad = lines.slice(-80).reverse().find((l) => /error|Error|ERROR|Traceback|Exception|refused|failed/.test(l));
+      return bad ? bad.slice(0, 300) : null;
+    } finally { fs.closeSync(fd); }
+  } catch (e) { return null; }
+}
+
+// —— status 短缓存（1s TTL + 单飞，防前端轮询叠发；引擎 fetch 只在缓存过期时真跑）——
+let __strataStatusCache = null;
+let __strataStatusFly = null;
+async function strataStatusCompute() {
+  const eng = strataEngineReady();
+  const models = strataModelDirs();
+  const cfg = strataLatestConfig();
+  const proc = strataScanMainProc();
+  const running = !!proc;
+  const port = (proc && proc.port) || (cfg && cfg.port) || 8080;
+  const host = (cfg && cfg.host) || '127.0.0.1';
+  let health = { ok: false };
+  let activity = { phase: running ? 'unknown' : 'idle' };
+  if (running) {
+    const [h, s] = await Promise.all([strataHttpGetJson(port, '/health'), strataHttpGetJson(port, '/status')]);
+    if (h && !h.__raw) health = { ok: true, status: h.status, max_context: h.max_context, model: h.model, images: h.images, api_key: h.api_key };
+    else if (h && h.__raw) health = { ok: true, raw: h.__raw.slice(0, 512) };
+    if (s && !s.__raw) {
+      const busy = !!s.busy;
+      activity = {
+        phase: busy ? (s.first_token ? 'generating' : 'reading') : 'idle',
+        queued: s.queued || 0,
+        elapsed_s: s.elapsed_s != null ? s.elapsed_s : null,
+        tokens_per_s: s.tokens_per_s != null ? s.tokens_per_s : null,
+        tokens_per_s_mean: s.tokens_per_s_mean != null ? s.tokens_per_s_mean : null,
+        raw: s,
+      };
+    }
+  }
+  const startedAtMs = running ? strataProcStartEpochMs(proc.pid) : null;
+  return {
+    installed: strataInstalled(),
+    engine_ready: eng.ready,
+    model_ready: models.some((m) => m.ready),
+    running,
+    pid: running ? proc.pid : null,
+    engine_pids: running ? strataScanEngineProcs() : [],
+    port,
+    host,
+    api_key_set: !!(cfg && cfg.api_key),
+    started_at: startedAtMs ? new Date(startedAtMs).toISOString() : null,
+    uptime_s: startedAtMs ? Math.max(0, Math.round((Date.now() - startedAtMs) / 1000)) : null,
+    health,
+    activity,
+    config: strataConfigBrief(cfg),
+    effective_args: strataEffectiveArgs(cfg),   // 改写后 args 的关键项摘要（vram_reserve/expert_cache/mmap/gpu/context）
+    last_error: strataLastError(),
+    models,
+    engine_build: eng.build,
+    vram_watch: strataVramWatchView(),   // [STRICT_8G_PATCH_V1] 严格模式显存看护（limit/peak/current/violated）
+  };
+}
+function strataStatus(force) {
+  if (!force && __strataStatusCache && Date.now() - __strataStatusCache.t < 1000) {
+    return Promise.resolve(__strataStatusCache.data);
+  }
+  if (__strataStatusFly) return __strataStatusFly;
+  __strataStatusFly = strataStatusCompute()
+    .then((data) => { __strataStatusFly = null; __strataStatusCache = { t: Date.now(), data }; return data; })
+    .catch((e) => {
+      __strataStatusFly = null;
+      const data = { installed: strataInstalled(), engine_ready: false, model_ready: false, running: false,
+        pid: null, port: 8080, host: '127.0.0.1', api_key_set: false, started_at: null, uptime_s: null,
+        health: { ok: false }, activity: { phase: 'unknown' }, config: null,
+        last_error: 'status 计算异常：' + String((e && e.message) || e).slice(0, 200), models: [], engine_build: null };
+      __strataStatusCache = { t: Date.now(), data };
+      return data;
+    });
+  return __strataStatusFly;
+}
+
+// —— start ——
+function strataShellQuote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+
+async function strataStart(body) {
+  const reply409 = (reason) => ({ code: 409, obj: { ok: false, reason } });
+  const cfg = strataLatestConfig();
+  const defPort = (cfg && cfg.port) || 8080;
+  const defHost = (body && body.host) || (cfg && cfg.host) || '127.0.0.1';
+  const port = Math.min(65535, Math.max(1, parseInt((body && body.port) || defPort, 10) || defPort));
+  const host = (body && body.host) || defHost;
+  const api_key = (body && body.api_key) || (cfg && cfg.api_key) || null;
+  const force = !!(body && body.force);
+
+  // —— 单卡/显存调优参数（返场任务 09-30）：vram_mb / expert_cache / mmap_experts / gpus / max_context ——
+  // 语义：vram_mb = 传给引擎的 --vram-reserve-mib（预留显存，专家缓存只吃"显存-预留"；
+  //       8GB 单卡方案=预留 6144~7168 → 专家缓存 ~1-2GB，其余全在 CPU 池）。
+  // 实现：快路径不吃命令行 flag，全部通过改写 cfg JSON 生效（见 strataApplyTuning）；
+  //       gpus（单卡卡号）走 setup.py start() 的真参数 --gpu N，同时落盘进 cfg["gpu"]。
+  const tuning = {
+    strict_8g: !!(body && body.strict_8g),   // [STRICT_8G_PATCH_V1] 严格模式：GPU0 only ≤8GB、GPU1 禁用
+    kv_resident: (body && body.kv_resident != null && body.kv_resident !== '') ? parseInt(body.kv_resident, 10) : null,   // [KV_STREAM_PATCH_V1] KV 流式常驻 cells
+    vram_mb: (body && body.vram_mb != null && body.vram_mb !== '') ? parseInt(body.vram_mb, 10) : null,
+    expert_cache: (body && body.expert_cache != null && body.expert_cache !== '')
+      ? (String(body.expert_cache) === 'auto' ? 'auto' : parseInt(body.expert_cache, 10)) : null,
+    mmap_experts: (body && body.mmap_experts != null) ? !!body.mmap_experts : null,
+    // [DUAL_170HX_PATCH_V1] gpus：0=单卡；"0,1"/[0,1]=多卡分层 PP（引擎 layer split）
+    gpu: (body && body.gpus != null && body.gpus !== '')
+      ? (Array.isArray(body.gpus)
+          ? body.gpus.map((x) => parseInt(x, 10)).filter((x) => Number.isInteger(x))
+          : (String(body.gpus).indexOf(',') >= 0
+              ? String(body.gpus).split(',').map((s) => parseInt(s.trim(), 10)).filter((x) => Number.isInteger(x))
+              : parseInt(body.gpus, 10)))
+      : null,
+    prefill: (body && body.prefill != null && body.prefill !== '')
+      ? (String(body.prefill) === 'auto' ? 'auto' : parseInt(body.prefill, 10)) : null,   // [DUAL_170HX_PATCH_V1]
+    layer_split: (body && body.layer_split != null && body.layer_split !== '') ? String(body.layer_split) : null,   // [DUAL_170HX_PATCH_V1]
+    max_context: (body && body.max_context != null && body.max_context !== '') ? parseInt(body.max_context, 10) : null,
+  };
+  // [STRICT_8G_PATCH_V1] strict_8g 归一化前置——显存门禁也要按 GPU0 单卡判定
+  if (tuning.strict_8g) {
+    tuning.vram_mb = 1024; tuning.expert_cache = 300; tuning.gpu = 0;
+    // [KV_STREAM_PATCH_V1] 长上下文必须把 KV 流到 pinned RAM：int8 KV ≈1056B/cell/层，
+    // 256K 全驻显存要 ~3.6GB，加上权重/MTP 会顶穿 8GB（实测 32K 全驻已 6736MiB）。
+    // 20480 = 引擎下限（layer.cpp:526），VRAM 侧仅 ~0.28GB。
+    if (tuning.kv_resident == null && tuning.max_context != null && tuning.max_context >= 65536) tuning.kv_resident = 20480;
+  }
+  const hasTuning = tuning.strict_8g || tuning.kv_resident != null || tuning.vram_mb != null || tuning.expert_cache != null || tuning.mmap_experts != null || tuning.gpu != null || tuning.max_context != null;   // [KV_STREAM_PATCH_V1]
+  if (hasTuning && !cfg) return reply409('尚无已安装配置（strata-*.json），调优参数仅对已安装模型有效；首次安装请用 model/context/vision 参数');
+  // NaN 防御（parseInt 失败）
+  if (tuning.vram_mb != null && !Number.isFinite(tuning.vram_mb)) return reply409('vram_mb 不是合法数值');
+  if (tuning.expert_cache != null && !(tuning.expert_cache === 'auto' || Number.isInteger(tuning.expert_cache))) return reply409('expert_cache 需为 "auto" 或整数');
+  if (tuning.expert_cache === 0) return reply409('expert_cache 不能为 0（引擎会当 auto 吃满显存），严格模式请用 300');   // [STRICT_8G_PATCH_V1]
+  if (tuning.gpu != null && !Number.isFinite(tuning.gpu)) return reply409('gpus 不是合法数值');
+  if (tuning.max_context != null && !Number.isFinite(tuning.max_context)) return reply409('max_context 不是合法数值');
+  // 范围校验同样前置到资源门禁之前（09-30 lead 验收：非法参数必须报参数错误，不被显存拦截遮蔽）
+  if (tuning.vram_mb != null && !(tuning.vram_mb >= 256 && tuning.vram_mb <= 65535)) return reply409('vram_mb 需为 256~65535 的整数（MiB）');
+  if (tuning.expert_cache != null && tuning.expert_cache !== 'auto' && tuning.expert_cache < 1) return reply409('expert_cache 需为 "auto" 或 ≥1 的整数');   // [STRICT_8G_PATCH_V1]
+  if (tuning.gpu != null && !(tuning.gpu >= 0 && tuning.gpu <= 15)) return reply409('gpus 需为合法卡号（0~15）');
+  if (tuning.max_context != null && !(tuning.max_context >= 1024 && tuning.max_context <= 1048576)) return reply409('max_context 需为 1024~1048576');
+  if (tuning.kv_resident != null && (!Number.isFinite(tuning.kv_resident) || tuning.kv_resident < 20480 || tuning.kv_resident > 1048576)) return reply409('kv_resident 需为 20480~1048576（引擎下限 20480）');   // [KV_STREAM_PATCH_V1]
+
+  // 参数校验（先于就绪门禁：给用户明确的原因，不被泛化拦截遮蔽）
+  const STRATA_MODELS_OK = { Q2_0: 1, IQ2_XS: 1, IQ3_XXS: 1, IQ3_S: 1, IQ1_M: 1 };   // = setup.py MODELS 档位表（IQ1_M 属 coder 家族）
+  let model = (body && body.model) ? String(body.model).toUpperCase() : null;
+  if (model && !STRATA_MODELS_OK[model]) return reply409('未知模型档位 ' + model + '（合法：' + Object.keys(STRATA_MODELS_OK).join('/') + '）');
+  if (!model) {
+    const tail = cfg && cfg.model_name ? String(cfg.model_name).split('-').pop().toUpperCase() : null;
+    model = (tail && STRATA_MODELS_OK[tail]) ? tail : (strataModelDirs().find((m) => m.ready) || {}).name || null;
+  }
+  const context = parseInt((body && body.context) || (body && body.max_context) || (cfg && cfg.args && cfg.args[cfg.args.indexOf('--max-context') + 1]) || 32768, 10) || 32768;
+  const vision = (body && body.vision) || (cfg && Array.isArray(cfg.args) && cfg.args.includes('--vision') ? 'gpu' : 'no');
+
+  // 就绪门禁（安装/引擎/模型）——放在参数校验之后
+  if (!strataInstalled()) return reply409('Strata 未安装（找不到 ' + STRATA_SETUP + '）');
+  {
+    const eng = strataEngineReady();
+    if (!eng.ready) return reply409('引擎尚未编译完成（engine/strata 或 BUILD.json 缺失），请先完成构建');
+  }
+  if (!strataModelReady()) return reply409('模型分片未就绪（Strata-data/models/ 无完整 .done 档位）');
+
+  // 门禁 4：已在运行（永不跳过）
+  const proc = strataScanMainProc();
+  if (proc) return reply409('Strata 已在运行 (pid ' + proc.pid + ', port ' + (proc.port || '?') + ')');
+  // 门禁 3：端口占用（永不跳过）
+  if (await strataPortListening(port)) return reply409('端口 ' + port + ' 已被监听，无法启动（可换 --port 或先停占用方）');
+
+  // 门禁 1/2：显存 + 可用内存（force=true 跳过并记 OVERRIDE）
+  // 单卡模式（gpus 指定）：显存门禁只查所选那张卡——其它卡即便被占也不影响本方案。
+  if (!force) {
+    const gpu = await strataGpuMemUsed();
+    if (!gpu.ok) return reply409('nvidia-smi 查询失败，无法确认显存占用，拒绝启动（紧急情况可用 force）');
+    // [DUAL_170HX_PATCH_V1] gpu 可能是单值或列表
+    const wantGpus = tuning.gpu == null ? null : (Array.isArray(tuning.gpu) ? tuning.gpu : [tuning.gpu]);
+    const scope = wantGpus ? gpu.gpus.filter((g) => wantGpus.indexOf(g.index) >= 0) : gpu.gpus;
+    if (wantGpus && scope.length === 0) return reply409('所选 GPU ' + wantGpus.join(',') + ' 不存在（nvidia-smi 未见该卡）');
+    const hot = scope.filter((g) => g.used_mb >= STRATA_GATE_VRAM_MB);
+    if (hot.length) {
+      const detail = hot.map((g) => 'GPU' + g.index + ' 占用 ' + (g.used_mb / 1024).toFixed(1) + 'GB').join('/');
+      return reply409('GPU 占用过高：18420 生产实例仍在运行（' + detail + '，门禁 <8GB），请先停掉生产实例；紧急情况可带 force=true 跳过（风险自担）');
+    }
+    const availGB = strataAvailMemKB() / 1024 / 1024;
+    if (availGB < STRATA_GATE_RAM_GB) {
+      return reply409('可用内存不足（当前 ' + availGB.toFixed(1) + ' GB，需 ≥' + STRATA_GATE_RAM_GB + 'GB）：Strata 首次加载需 35-55GB 专家进 RAM');
+    }
+  } else {
+    console.log('[strata] START OVERRIDE：force=true 跳过显存/内存门禁（' + new Date().toISOString() + '，body=' + JSON.stringify(body || {}).slice(0, 200) + '）');
+  }
+
+  // —— 改写 cfg JSON（仅在有调优参数时；备份 .bak-console 同文件只留最新一份）——
+  // 注意顺序：门禁全过才动配置——拒绝启动时不留半成品改写。
+  let tuningResult = null;
+  if (hasTuning && cfg && cfg.__path) {
+    try {
+      tuningResult = strataApplyTuning(cfg.__path, cfg, tuning);
+    } catch (e) {
+      if (e.userFacing) return reply409(String(e.message));
+      return { code: 500, obj: { ok: false, reason: '改写启动参数失败：' + String((e && e.message) || e) } };
+    }
+    __strataStatusCache = null;   // cfg 变了，status 立即反映 effective_args
+  }
+
+  // spawn：setsid 独立进程组 + detached + unref；日志追加到 strata-console.log。
+  // 两种形态（与引擎侧实测一致）：
+  //  ① 有已安装配置（Strata/strata-*.json）→ `python setup.py --yes [--port N] [--gpu N]`：走
+  //     installed→start() 快路径（subprocess.call 前台常驻=进程组长），host/api-key 由配置文件承载
+  //     （setup.py 启动路径不接收这两个参数）。**绝不可带 --model/--context**：那会落入完整安装
+  //     流程（PC 检查/引擎更新/重生成配置），前台窗口退出即 SIGTERM 杀掉刚起的引擎。
+  //     引擎 flag 类调优（vram_mb/expert_cache/mmap/max_context）不走命令行，靠上面改写 cfg。
+  //  ② 无配置（首次安装）→ 完整安装参数；此时 body 的 model/context/vision 生效。
+  // 注：setup.py 无 --no-browser 参数；--open 由 start() 追加，headless 无 DISPLAY 时
+  //     webbrowser.open 静默失败，不影响服务。
+  const haveCfg = !!cfg;
+  let args;
+  if (!haveCfg) {
+    const m = (body && body.model) ? String(body.model).toUpperCase() : (model || null);
+    if (!m || !STRATA_MODELS_OK[m]) return reply409('首次安装需指定合法模型档位（' + Object.keys(STRATA_MODELS_OK).join('/') + '）');
+    args = [STRATA_SETUP, '--model', m, '--context', String(context), '--vision', String(vision), '--yes', '--port', String(port)];
+    if (host && host !== '127.0.0.1' && host !== 'localhost') args.push('--host', String(host));
+    if (api_key) args.push('--api-key', String(api_key));
+  } else {
+    if (body && body.model) console.log('[strata] 已有安装配置：忽略 model 变更请求（改档位请用停止后手动 setup.py --setup），走快路径启动');
+    args = [STRATA_SETUP, '--yes', '--port', String(port)];
+    if (tuning.gpu != null) args.push('--gpu', String(tuning.gpu));   // start() 真参数：cmd += --gpu N（cfg 里 int 亦已落盘）
+    if (api_key && !cfg.api_key) args.push('--api-key', String(api_key));   // 仅首次落盘进配置（start 路径不读该参数，但安装流程会写）
+  }
+  const cmdLine = strataShellQuote(STRATA_PY) + ' ' + args.map(strataShellQuote).join(' ') +
+    ' >> ' + strataShellQuote(STRATA_CONSOLE_LOG) + ' 2>&1 < /dev/null';
+  let child;
+  try {
+    // [STRICT_8G_PATCH_V1] GPU 隔离双保险：serve/server.py 按 cfg["gpu"] 设 CUDA_VISIBLE_DEVICES，
+    // 这里在派发层再钉一次 —— 单卡/严格模式下 GPU1 对整棵子进程树完全不可见。
+    const spawnEnv = Object.assign({}, process.env);
+    if (tuning.gpu != null) spawnEnv.CUDA_VISIBLE_DEVICES = String(tuning.gpu);
+    child = spawn('setsid', ['-f', 'bash', '-c', cmdLine], { cwd: STRATA_ROOT, detached: true, stdio: 'ignore', env: spawnEnv });
+  } catch (e) {
+    return { code: 500, obj: { ok: false, reason: 'spawn 失败：' + String((e && e.message) || e) } };
+  }
+  child.on('error', (e) => { console.error('[strata] spawn error:', String((e && e.message) || e)); });
+  child.unref();
+  const spawnPid = child.pid || null;
+  console.log('[strata] 启动已派发 pid=' + spawnPid + ' port=' + port + ' model=' + model + ' ctx=' + context
+    + (hasTuning ? ' tuning=' + JSON.stringify(tuning) + ' cfg_changed=' + !!(tuningResult && tuningResult.changed) : '')
+    + '（加载 35-55GB 专家需 1-3 分钟）');
+  __strataStatusCache = null;   // 状态缓存作废，下次 status 立见新进程
+  if (tuning.strict_8g) strataVramWatchStart();   // [STRICT_8G_PATCH_V1] 机器级兜底：GPU0 超限立即停实例
+  return { code: 200, obj: {
+    ok: true, pid: spawnPid, port,
+    cfg_rewritten: !!(tuningResult && tuningResult.changed),
+    effective_args: (tuningResult && tuningResult.effective) || strataEffectiveArgs(cfg),
+    vram_watch: tuning.strict_8g ? strataVramWatchView() : null,
+    note: '进程组已派发；模型加载中（1-3 分钟），/v1/internal/strata/status 可轮询进度',
+  } };
+}
+
+// —— stop：SIGTERM 进程组，最多等 60s，超时不强杀 ——
+async function strataStop() {
+  const proc = strataScanMainProc();
+  if (!proc) return { code: 200, obj: { ok: true, note: '未在运行，无需停止' } };
+  let pgid = proc.pid;
+  try {
+    const stat = fs.readFileSync(`/proc/${proc.pid}/stat`, 'utf8');
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(/\s+/);
+    const p = parseInt(fields[2], 10);   // 第 3 字段（跳过 comm 后）= pgrp
+    if (isFinite(p) && p > 0) pgid = p;
+  } catch (e) {}
+  try {
+    process.kill(-pgid, 'SIGTERM');
+  } catch (e) {
+    // 进程组信号失败（如权限/组不存在）→ 退回单进程 SIGTERM
+    try { process.kill(proc.pid, 'SIGTERM'); } catch (e2) {
+      return { code: 500, obj: { ok: false, reason: '发送 SIGTERM 失败：' + String((e && e.message) || e) } };
+    }
+  }
+  const t0 = Date.now();
+  while (Date.now() - t0 < 60000) {
+    await sleep(1000);
+    if (!strataScanMainProc()) {
+      __strataStatusCache = null;
+      strataVramWatchStop();   // [STRICT_8G_PATCH_V1]
+      console.log('[strata] 已优雅退出（' + ((Date.now() - t0) / 1000).toFixed(0) + 's）');
+      return { code: 200, obj: { ok: true } };
+    }
+  }
+  return { code: 200, obj: { ok: false, reason: '优雅退出超时（60s），未强杀；请人工检查 pid ' + proc.pid } };
+}
+
+// —— logs：日志尾 N 行（默认 200，上限 2000；只读尾部窗口，绝不整文件读）——
+function strataLogs(tail) {
+  const n = Math.min(2000, Math.max(1, parseInt(tail, 10) || 200));
+  const meta = { file: STRATA_CONSOLE_LOG, lines: [], mtime: null, size: 0, truncated: false };
+  let st;
+  try { st = fs.statSync(STRATA_CONSOLE_LOG); } catch (e) { return meta; }
+  meta.mtime = st.mtimeMs; meta.size = st.size;
+  if (st.size === 0) return meta;
+  const window = Math.min(st.size, Math.max(n * 4096, 256 * 1024));   // 每行按 4KB 估，最少 256KB
+  try {
+    const fd = fs.openSync(STRATA_CONSOLE_LOG, 'r');
+    try {
+      const buf = Buffer.alloc(window);
+      fs.readSync(fd, buf, 0, window, st.size - window);
+      const lines = buf.toString('utf8').split('\n');
+      if (st.size > window) { lines.shift(); meta.truncated = true; }   // 窗口首行可能不完整，丢弃
+      meta.lines = lines.filter((l) => l.length > 0).slice(-n);
+    } finally { fs.closeSync(fd); }
+  } catch (e) { meta.error = String((e && e.message) || e); }
+  return meta;
+}
+
+// —— metrics：透传引擎 /metrics（未跑 {ok:false}；解析失败回 raw 前 2KB）——
+async function strataMetrics() {
+  const proc = strataScanMainProc();
+  if (!proc) return { code: 200, obj: { ok: false } };
+  const j = await strataHttpGetJson(proc.port || 8080, '/metrics', 3000);
+  if (!j) return { code: 200, obj: { ok: false, reason: '引擎 /metrics 无响应（加载中或已挂）' } };
+  if (j.__raw) return { code: 200, obj: { ok: false, raw: j.__raw } };
+  return { code: 200, obj: j };
+}
+
+// —— 严格 8GB 显存看护（[STRICT_8G_PATCH_V1]，用户红线：GPU0 ≤8GB、GPU1 完全禁用）——
+// 参数只是第一道防线；这里是机器级兜底：每 2s 采样 GPU0，超限立即保护性停止并留下违规事实。
+// 状态挂 global（本项目铁律：handler 作用域 const 会被 TDZ 吞掉，让定时器静默失效）。
+function strataVramWatchState() {
+  if (!global.__strataVramWatch) {
+    global.__strataVramWatch = { active: false, limit_mib: STRATA_GATE_VRAM_MB, peak_mib: 0, current_mib: 0, violated: false, since: null, timer: null };
+  }
+  return global.__strataVramWatch;
+}
+function strataVramWatchView() {   // 只回标量：timer 不可进 JSON
+  const st = strataVramWatchState();
+  return { active: st.active, limit_mib: st.limit_mib, peak_mib: st.peak_mib, current_mib: st.current_mib, violated: st.violated, since: st.since };
+}
+async function strataVramWatchTick() {
+  const st = strataVramWatchState();
+  if (!st.active) return;
+  const gpu = await strataGpuMemUsed();
+  if (!gpu || !gpu.ok || !Array.isArray(gpu.gpus)) return;
+  const g0 = gpu.gpus.find((g) => g.index === 0);
+  if (!g0) return;
+  st.current_mib = g0.used_mb;
+  if (g0.used_mb > st.peak_mib) st.peak_mib = g0.used_mb;
+  if (g0.used_mb > st.limit_mib) {
+    st.violated = true;
+    st.since = st.since || new Date().toISOString();
+    console.error('[strata][vram-watch] GPU0 ' + g0.used_mb + ' MiB 超过上限 ' + st.limit_mib + ' MiB → 保护性停止实例');
+    try { await strataStop(); } catch (e) { console.error('[strata][vram-watch] 停止失败：' + String((e && e.message) || e)); }
+    strataVramWatchStop();
+    __strataStatusCache = null;
+  }
+}
+function strataVramWatchStart() {
+  const st = strataVramWatchState();
+  st.active = true; st.violated = false; st.peak_mib = 0; st.current_mib = 0; st.since = null;
+  if (st.timer) { clearInterval(st.timer); st.timer = null; }
+  st.timer = setInterval(() => { strataVramWatchTick().catch(() => {}); }, 2000);
+  console.log('[strata][vram-watch] 已启动：GPU0 硬上限 ' + st.limit_mib + ' MiB，每 2s 采样，超限即停');
+}
+function strataVramWatchStop() {
+  const st = strataVramWatchState();
+  st.active = false;
+  if (st.timer) { clearInterval(st.timer); st.timer = null; }
+}
+
+// —— options：可选档位 + 引擎构建信息 + 缺省值 ——
+function strataOptions() {
+  const eng = strataEngineReady();
+  const cfg = strataLatestConfig();
+  const brief = strataConfigBrief(cfg);
+  return {
+    models: strataModelDirs(),
+    engine: eng.build ? { version: eng.build.version || null, archs: eng.build.archs || null, source: eng.build.source || null, ...eng.build } : null,
+    engine_ready: eng.ready,
+    defaults: { context: (brief && brief.context) || 32768, port: (brief && brief.port) || 8080, vision: 'no', host: '127.0.0.1' },
+    gate: { vram_free_per_gpu_mb: STRATA_GATE_VRAM_MB, ram_avail_gb: STRATA_GATE_RAM_GB },
+    // [STRICT_8G_PATCH_V1] 显存方案预设：strict8g = 用户红线方案（GPU0 only ≤8GB、GPU1 禁用），实测峰值 6260MiB。
+    // 旧 single8g（vram_mb=7168）语义错误——--vram-reserve-mib 是"预留"，会让专家缓存自动吃满 33GiB。
+    // [DEFAULT_FULL_VRAM_V1] 用户 09-30 拍板：默认=吃满整卡空闲显存（Strata 原生最优形态，专家缓存 auto）。
+    // 每个 preset 同时带平铺字段与 fields{}（前端两版提取逻辑都兼容）；is_default 标记缺省选中项。
+    vram_presets: [
+      // [DUAL_170HX_PATCH_V1] 用户 09-30 拍板：默认档 = 双卡 170HX 分层 PP（8GB×2 实测 prefill 767~947 tok/s、
+      // decode 66~88 tok/s）。prefill 512 与 kv 流式是 8GB 卡上双卡能起来的硬条件。
+      { value: 'default', label: '默认（双卡 170HX 分层 PP，推荐）', is_default: true, vram_mb: null,
+        gpus: '0,1', layer_split: 'auto', prefill: 512, kv_resident: 20480, max_context: 65536,
+        fields: { gpus: '0,1', layer_split: 'auto', prefill: 512, kv_resident: 20480, max_context: 65536 } },
+      { value: 'strict8g', label: '严格 GPU0 ≤8GB', strict_8g: true, gpus: 0, expert_cache: 300, vram_mb: 1024, max_context: 32768,
+        fields: { strict_8g: true, gpus: 0, expert_cache: 300, vram_mb: 1024, max_context: 32768 } },
+    ],
+    tuning_fields: ['strict_8g', 'max_context', 'vram_mb', 'expert_cache', 'mmap_experts', 'gpus', 'prefill', 'layer_split', 'kv_resident'],   // [DUAL_170HX_PATCH_V1]
+    strict_8g: { limit_mib: STRATA_GATE_VRAM_MB, expert_cache: 300, vram_reserve_mib: 1024, gpus: 0, kv_resident: 20480, kv_resident_from_context: 65536 },   // [KV_STREAM_PATCH_V1]
+  };
+}
+
+// —— 路由入口（pathname 前缀 /v1/internal/strata；POST 已被上层口令拦截）——
+async function strataHandle(req, res, urlObj) {
+  const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  const sub = urlObj.pathname.slice('/v1/internal/strata'.length);
+  // 兼容前端可能的无子路径 GET（等价 /status），避免 404
+  if (req.method === 'GET' && (sub === '' || sub === '/')) { return reply(200, await strataStatus()); }
+  if (req.method === 'GET' && sub === '/status') { return reply(200, await strataStatus()); }
+  if (req.method === 'GET' && sub === '/logs')  { return reply(200, strataLogs(urlObj.searchParams.get('tail'))); }
+  if (req.method === 'GET' && sub === '/metrics') { const r = await strataMetrics(); return reply(r.code, r.obj); }
+  if (req.method === 'GET' && sub === '/options') { return reply(200, strataOptions()); }
+  if (req.method === 'POST' && sub === '/start') {
+    let body = {};
+    try {
+      const raw = await new Promise((resolve, reject) => {
+        let s = ''; req.on('data', (c) => { s += c; if (s.length > 65536) req.destroy(); });
+        req.on('end', () => resolve(s)); req.on('error', reject);
+      });
+      body = raw ? JSON.parse(raw) : {};
+    } catch (e) { return reply(400, { ok: false, reason: '请求体不是合法 JSON' }); }
+    const r = await strataStart(body);
+    return reply(r.code, r.obj);
+  }
+  if (req.method === 'POST' && sub === '/stop') { const r = await strataStop(); return reply(r.code, r.obj); }
+  return reply(404, { ok: false, reason: 'strata: 未知路由 ' + sub });
+}
+// ==== [strata-console] END module ====
+
 // ---------------- 5) CPU 控制（X99 / E5-2696 v4 定制版，移植自 bench-console/cpu-control） ----------------
 // 调 /usr/local/bin/cpu-ctl（脚本随本仓库部署；非 root 时自提权，需 sudoers.d 白名单，
 // 见 ops/install-cpu-ctl-127.sh）。全部为运行时软控制 sysfs，重启回 BIOS/内核默认。
@@ -8638,7 +9667,7 @@ const server = http.createServer(async (req, res) => {
   const pathname = urlObj.pathname;
 
   // 09-20：内部 API/页面/静态资源启用 gzip；代理路径（chat/completions 流式）绝不压缩
-  if (pathname === '/' || pathname === '/index.html' || pathname === '/m' || pathname === '/mobile.html' || pathname === '/bench.html' || pathname === '/cpu.html'
+  if (pathname === '/' || pathname === '/index.html' || pathname === '/m' || pathname === '/mobile.html' || pathname === '/bench.html' || pathname === '/cpu.html' || pathname === '/sglang.html'
       || pathname.startsWith('/static/') || pathname.startsWith('/v1/internal/')) {
     installGzip(req, res);
   }
@@ -8670,6 +9699,14 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // ==== [strata-console] BEGIN route ====
+  // === Strata 推理引擎管理 API（契约见 STRATA-API.md，模块实现见上方 strata-console 块）===
+  if (pathname === '/v1/internal/strata' || pathname.startsWith('/v1/internal/strata/')) {
+    return strataHandle(req, res, urlObj).catch((e) => {
+      try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}
+    });
+  }
+  // ==== [strata-console] END route ====
   // === Internal API: Model Running Parameters ===
   if (pathname === '/v1/internal/model-params') {
     // 采样参数回落：命令行未显式传采样参数时，读模型目录的 generation_config.json。
@@ -8891,6 +9928,18 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+
+  // === Internal API: 关闭 127（18420 Flash-Next）[__close127_btn_1006__] ===
+  if (pathname === '/v1/internal/close-127' && req.method === 'POST') {
+    close127Instance().then((r) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(r));
+    }).catch((e) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: String((e && e.message) || e) }));
+    });
+    return;
+  }
   // === Internal API: Model Manager ===
   if (pathname === '/v1/internal/model-manager') {
     if (req.method === 'GET') {
@@ -8915,10 +9964,18 @@ const server = http.createServer(async (req, res) => {
             const sm1 = scriptModelForName(m.name);
             if (sm1) {
               const inst = scriptModelInstance(sm1);
+              // [sglang-adapt-1003] SGLang 脚本栈在位 → 卡片注记显示真实引擎（否则写着
+              // 「容器镜像 PP2 脚本启动」误导：现行 18420 是 sglang.launch_server）。
+              let onSgStack = false;
+              try { onSgStack = !!(sm1.scriptSglang && sglangActive() && require('fs').existsSync(sm1.scriptSglang)); } catch (e) {}
               return Object.assign({}, m, {
                 name: sm1.key, dir_name: m.name, script_model: true,
                 port: inst ? inst.port : sm1.port, pid: inst ? inst.pid : null,
-                served_name: sm1.served, note: sm1.note || '',
+                served_name: sm1.served,
+                note: onSgStack
+                  ? 'SGLang 脚本启动（sglang-18420 脚本对 · NEXTN 投机 + PLE BF16 锁页 · 加载约 6~10 分钟）'
+                  : (sm1.note || ''),
+                engine: onSgStack ? 'sglang' : 'vllm',
                 running: !!inst,
                 defaults: scriptModelDefaults(sm1),
                 schemes: flashNextSchemes(),
@@ -9025,12 +10082,12 @@ const server = http.createServer(async (req, res) => {
                 res.end(JSON.stringify({ success: false, error: `模型 ${smStart.key} 已在运行（端口 ${inst0.port}，PID ${inst0.pid}），如需重启请先点「停止」` }));
                 return;
               }
-              const plan = scriptModelLaunchPlan(smStart, data);
+              const plan = scriptPlanFor(smStart, data); // [sglang-adapt-1003] sglang 栈在位时下发 SG_*
               try {
                 const startScript = resolveStartScript(smStart);
                 // INNER 只对旧栈 wrapper 有意义；解析到新栈时绝不带旧 inner 覆盖（见 resolveStartScript 注）
                 const envPrefix = (startScript === smStart.script && smStart.inner) ? `INNER=${smStart.inner} ` : '';
-                const child = require('child_process').spawn('bash', ['-c', `${envPrefix}setsid bash ${startScript} >> ${smStart.log} 2>&1 < /dev/null & echo $!`], {
+                const child = require('child_process').spawn('bash', ['-c', `${envPrefix}setsid bash ${startScript} >> ${scriptLaunchLog(smStart)} 2>&1 < /dev/null & echo $!`], {
                   detached: true,
                   stdio: ['ignore', 'pipe', 'ignore'],
                   env: Object.assign({}, process.env, plan.env),
@@ -9048,7 +10105,7 @@ const server = http.createServer(async (req, res) => {
                   MODEL_ALIASES[smStart.key] = plan.served;
                   (smStart.dirNames || []).forEach(dn => { MODEL_ALIASES[dn] = plan.served; });
                   if (global.__GPU_INSTANCES && typeof global.__GPU_INSTANCES.set === 'function') {
-                    global.__GPU_INSTANCES.set(plan.port, { port: plan.port, gpuId: 0, gpuCount: (smStart.base && smStart.base.pp) || 2, runtime: 'vllm', model: smStart.key, startedAt: Date.now() });
+                    global.__GPU_INSTANCES.set(plan.port, { port: plan.port, gpuId: 0, gpuCount: plan.gpuCount || (smStart.base && smStart.base.pp) || 2, runtime: plan.runtime || 'vllm', model: smStart.key, startedAt: Date.now() });
                   }
                   console.log(`[script-model] start ${smStart.key} port=${plan.port} served=${plan.served} pid=${pid} :: ${plan.summary}`);
                   plan.warnings.forEach(w => console.warn(`[script-model] warn: ${w}`));
@@ -9459,8 +10516,21 @@ const server = http.createServer(async (req, res) => {
       // 09-18：返回前统一剔除脏时间戳记录（含 sglang 侧），避免脏时钟霸占排序首位
       const plausible = out.filter(r => traceTsPlausible(r && r.t));
       plausible.sort((a, b) => (b.t || 0) - (a.t || 0));
+      // [sglang-adapt-1003] 在跑 sglang 实例未带 --export-metrics-to-file 时，本表没有任何
+      // 该实例的逐请求记录，只剩 vLLM 时代的历史残留行（时间是旧的、字段无 port）——用户
+      // 视角就是「表格全是过期假数据」。显式回传缺导出旗标，前端据此显示黄条提示。
+      let sgExportOff = [];
+      try {
+        for (const si of listSglangInstances()) {
+          let cmd = '';
+          try { cmd = fs.readFileSync(`/proc/${si.pid}/cmdline`, 'utf8').split('\0').join(' '); } catch (e) { continue; }
+          if (cmd && !/--export-metrics-to-file(\s|$)/.test(cmd)) sgExportOff.push(si.port);
+        }
+      } catch (e) {}
+      const hasSglRows = plausible.some(r => r.runtime === 'sglang');
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ requests: plausible.slice(0, limit) })); // newest first
+      res.end(JSON.stringify({ requests: plausible.slice(0, limit),
+        sglang_export_off: (sgExportOff.length && !hasSglRows) ? sgExportOff : undefined })); // newest first
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message }));
@@ -9862,17 +10932,21 @@ const server = http.createServer(async (req, res) => {
         if (!sm) { done({ success: false, error: '未注册的脚本化模型：' + preset.modelName }); return; }
         const inst0 = scriptModelInstance(sm);
         if (inst0) { done({ success: false, alreadyRunning: true, error: `已在运行（端口 ${inst0.port}，PID ${inst0.pid}）` }); return; }
-        const plan = scriptModelLaunchPlan(sm, preset.params || {});
+        const plan = scriptPlanFor(sm, preset.params || {}); // [sglang-adapt-1003] sglang 栈在位时下发 SG_*
         const startScript = resolveStartScript(sm);
         // INNER 只对旧栈 wrapper 有意义；新栈 wrapper 的 INNER 缺省即自家 inner
         const envPrefix = (startScript === sm.script && sm.inner) ? `INNER=${sm.inner} ` : '';
-        // 上次启动落盘的 FN_* 若不清掉，本次「没写到的变量」会继承旧值（sudo 会清环境，
+        // 上次启动落盘的 FN_*/SG_* 若不清掉，本次「没写到的变量」会继承旧值（sudo 会清环境，
         // chroot 内的 inner 只能靠这个文件）。09-15 实跑就被残留的 FN_SPEC=none 影响过。
         // 09-26：清哪个 env 文件跟解析后的栈走——新栈的 launch.env 在 vllm-0300/ 下。
-        const envFile = preset.envFile || (startScript.match(/0300/) ? '/home/ll/deploy/vllm-0300/launch.env'
-                        : ((sm.script || '').match(/w4a16/) ? '/home/ll/deploy/flash-next-launch-w4a16.env' : ''));
+        // [sglang-adapt-1003] SGLang 脚本栈：launch.env 在 sglang-18420/ 下（wrapper 每次覆写，
+        // 但本次 plan 未写到的 SG_* 若残留在文件里仍会被 source 出上次的值 → 必须先清）。
+        const envFile = preset.envFile || (sm.scriptSglang && startScript === sm.scriptSglang
+                        ? path.join(path.dirname(sm.scriptSglang), 'launch.env')
+                        : (startScript.match(/0300/) ? '/home/ll/deploy/vllm-0300/launch.env'
+                        : ((sm.script || '').match(/w4a16/) ? '/home/ll/deploy/flash-next-launch-w4a16.env' : '')));
         if (envFile) { try { fs.writeFileSync(envFile, ''); } catch (e) {} }
-        const child = require('child_process').spawn('bash', ['-c', `${envPrefix}setsid bash ${startScript} >> ${sm.log} 2>&1 < /dev/null & echo $!`], {
+        const child = require('child_process').spawn('bash', ['-c', `${envPrefix}setsid bash ${startScript} >> ${scriptLaunchLog(sm)} 2>&1 < /dev/null & echo $!`], {
           detached: true,
           stdio: ['ignore', 'pipe', 'ignore'],
           env: Object.assign({}, process.env, plan.env),
@@ -9887,7 +10961,7 @@ const server = http.createServer(async (req, res) => {
           MODEL_ALIASES[sm.key] = plan.served;
           (sm.dirNames || []).forEach(dn => { MODEL_ALIASES[dn] = plan.served; });
           if (global.__GPU_INSTANCES && typeof global.__GPU_INSTANCES.set === 'function') {
-            global.__GPU_INSTANCES.set(plan.port, { port: plan.port, gpuId: 0, gpuCount: (sm.base && sm.base.pp) || 2, runtime: 'vllm', model: sm.key, startedAt: Date.now() });
+            global.__GPU_INSTANCES.set(plan.port, { port: plan.port, gpuId: 0, gpuCount: plan.gpuCount || (sm.base && sm.base.pp) || 2, runtime: plan.runtime || 'vllm', model: sm.key, startedAt: Date.now() });
           }
           console.log(`[quickstart-script] ${sm.key} port=${plan.port} served=${plan.served} pid=${pid} :: ${plan.summary}`);
           done({ success: true, script: true, pid, port: plan.port, served: plan.served, summary: plan.summary, warnings: plan.warnings });
@@ -10817,7 +11891,12 @@ const server = http.createServer(async (req, res) => {
 
   // === Internal API: Raw metrics ===
   if (pathname === '/v1/internal/metrics') {
-    const rawReq = http.get(`${vllmBaseUrl}/metrics`, (proxyRes) => {
+    // [sglang-adapt-1003] ?port= 支持按实例抓 /metrics（SGLang 独立页 /sglang.html 需要非主端口实例；
+    // 缺省主端口，端口自愈后仍跟随 config.vllmPort 而非启动时快照）
+    const mpM = (req.url.split('?')[1] || '').match(/(?:^|&)port=(\d+)/);
+    const mq = mpM ? parseInt(mpM[1], 10) : NaN;
+    const mPort = (!isNaN(mq) && mq > 0) ? mq : config.vllmPort;
+    const rawReq = http.get(`http://${config.vllmHost}:${mPort}/metrics`, (proxyRes) => {
       let data = '';
       proxyRes.on('data', chunk => data += chunk);
       proxyRes.on('error', () => {
@@ -10827,7 +11906,9 @@ const server = http.createServer(async (req, res) => {
         } catch (e) {}
       });
       proxyRes.on('end', () => {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        // [sglang-adapt-1003] 透传上游状态码：sglang 不带 --enable-metrics 时 /metrics 是
+        // 404，旧版一律转 200 → 前端把「指标端点不存在」误当「指标全 0」。现在把 404/5xx 原样带出。
+        res.writeHead(proxyRes.statusCode === 200 ? 200 : (proxyRes.statusCode || 502), { 'Content-Type': 'text/plain' });
         res.end(data);
       });
     }).on('error', () => {
@@ -11921,6 +13002,22 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       res.writeHead(404);
       res.end('cpu.html not found');
+    }
+    return;
+  }
+
+  // === Serve SGLang monitor UI（[sglang-adapt-1003]「SGLang」标签的内嵌页，纯只读监控）===
+  if (pathname === '/sglang.html' || pathname === '/sglang') {
+    const sglPath = path.join(__dirname, 'sglang.html');
+    try {
+      const content = fs.readFileSync(sglPath, 'utf8');
+      const etag = 'W/"' + Buffer.byteLength(content) + '-' + fs.statSync(sglPath).mtimeMs.toString(36) + '"';
+      if (req.headers['if-none-match'] === etag) { res.writeHead(304); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', 'ETag': etag });
+      res.end(content);
+    } catch (e) {
+      res.writeHead(404);
+      res.end('sglang.html not found');
     }
     return;
   }

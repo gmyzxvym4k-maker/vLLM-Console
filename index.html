@@ -723,6 +723,8 @@
             <div class="nav-tab" onclick="switchTab('usage')">用量统计</div>
             <div class="nav-tab" onclick="switchTab('bench')">基准测试</div>
             <div class="nav-tab" onclick="switchTab('cpuctl')">CPU 控制</div>
+            <div class="nav-tab" onclick="switchTab('strata')">Strata</div>
+            <div class="nav-tab" onclick="switchTab('sglang')">SGLang</div>
         </div>
     </nav>
 
@@ -1725,6 +1727,187 @@
             <iframe id="cpuFrame" title="CPU Control" style="width:100%;height:calc(100vh - 200px);min-height:640px;border:1px solid var(--border);border-radius:14px;background:var(--bg-card)"></iframe>
         </div>
 
+        <!-- ==================== SGLang 引擎监控（[sglang-adapt-1003] 内嵌 /sglang.html，纯只读） ==================== -->
+        <div id="tab-sglang" class="tab-content hidden">
+            <div class="dash-header">
+                <div class="dash-title">SGLang</div>
+                <div class="dash-meta">
+                    <span style="font-size:12px;color:var(--text-tertiary)">SGLang 实例专属监控 · radix 缓存 / NEXTN 投机 / PP 阶段 / 指标端点诊断 · 每 2s 自动刷新</span>
+                    <button class="btn" onclick="reloadSglangFrame()">重载页面</button>
+                </div>
+            </div>
+            <iframe id="sglangFrame" title="SGLang Monitor" style="width:100%;height:calc(100vh - 200px);min-height:640px;border:1px solid var(--border);border-radius:14px;background:var(--bg-card)"></iframe>
+        </div>
+
+        <!-- ==================== Strata 引擎管理（后端见 server.js STRATA 模块 · 契约 STRATA-API.md） ==================== -->
+        <div id="tab-strata" class="tab-content hidden">
+            <div class="section-title">
+                <span>Strata</span>
+                <div style="font-size:12px;color:var(--text-tertiary)">每 2 秒自动刷新 · <span id="strataTimestamp">--</span></div>
+            </div>
+
+            <!-- 状态条：三盏灯 + 运行指标 + last_error 黄条 -->
+            <div class="card" style="padding:var(--space-5) var(--space-6);margin-bottom:16px">
+                <div style="display:flex;flex-wrap:wrap;gap:24px;align-items:center">
+                    <div style="display:flex;gap:18px;flex-wrap:wrap" id="strataLights">
+                        <span style="font-size:13px;color:var(--text-secondary)">加载中…</span>
+                    </div>
+                    <div style="flex:1;min-width:220px;font-size:12px;color:var(--text-tertiary);text-align:right" id="strataMeta">--</div>
+                </div>
+                <div id="strataErrBar" style="display:none;margin-top:12px;padding:10px 14px;border-radius:8px;background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.45);color:var(--orange);font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all"></div>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6" style="align-items:start">
+                <!-- 启动卡 -->
+                <div class="card" style="padding:var(--space-5) var(--space-6)">
+                    <div style="font-size:14px;font-weight:700;margin-bottom:var(--space-4);display:flex;align-items:center;gap:8px">
+                        <span style="display:inline-block;width:3px;height:14px;border-radius:2px;background:var(--accent)"></span>
+                        启动 Strata
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div class="config-field">
+                            <label class="config-label">模型档位</label>
+                            <select id="strataModel" class="config-input" style="padding:8px 12px"></select>
+                        </div>
+                        <div class="config-field">
+                            <label class="config-label">上下文长度</label>
+                            <select id="strataContext" class="config-input" style="padding:8px 12px">
+                                <option value="8192">8192</option>
+                                <option value="32768" selected>32768</option>
+                                <option value="65536">65536</option>
+                                <option value="131072">131072</option>
+                                <option value="262144">262144</option>
+                            </select>
+                        </div>
+                        <div class="config-field">
+                            <label class="config-label">Vision</label>
+                            <select id="strataVision" class="config-input" style="padding:8px 12px">
+                                <option value="no" selected>关闭</option>
+                                <option value="yes">开启</option>
+                            </select>
+                        </div>
+                        <div class="config-field">
+                            <label class="config-label">端口</label>
+                            <input id="strataPort" type="number" min="1024" max="65535" value="8080" class="config-input" style="padding:8px 12px">
+                        </div>
+                        <div class="config-field">
+                            <label class="config-label">显存方案</label>
+                            <select id="strataVramPlan" class="config-input" style="padding:8px 12px" onchange="strataVramChange()">
+                                <option value="default" selected>默认（吃满整卡显存，推荐）</option>   <!-- [DEFAULT_FULL_VRAM_V1] -->
+                                <option value="strict8g">严格 GPU0 ≤8GB</option>
+                                <option value="single8g">旧方案（勿用）·8GB 单卡·专家全内存</option>
+                                <option value="custom">自定义…</option>
+                            </select>
+                        </div>
+                    </div>
+                    <!-- 高级输入区：仅「自定义…」方案展开；字段名与后端契约对齐 vram_mb/gpus/expert_cache/mmap_experts/max_context -->
+                    <div id="strataAdvBox" style="display:none;margin:-4px 0 14px;padding:12px 14px;border:1px dashed var(--border);border-radius:10px;background:var(--bg-primary)">
+                        <div style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:10px">高级显存/专家配置（自定义）</div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div class="config-field" style="margin-bottom:10px">
+                                <label class="config-label">显存预留 MiB</label>
+                                <input id="strataVramMb" type="number" min="1024" max="65536" placeholder="7168" class="config-input" style="padding:8px 12px">
+                            </div>
+                            <div class="config-field" style="margin-bottom:10px">
+                                <label class="config-label">使用显卡（留空=自动）</label>
+                                <input id="strataGpus" type="number" min="0" max="1" placeholder="0 / 1" class="config-input" style="padding:8px 12px">
+                            </div>
+                            <div class="config-field" style="margin-bottom:10px">
+                                <label class="config-label">专家缓存（auto / 0 / 数字）</label>
+                                <input id="strataExpertCache" type="text" placeholder="auto" class="config-input" style="padding:8px 12px">
+                            </div>
+                            <div class="config-field" style="margin-bottom:10px">
+                                <label class="config-label">最大上下文</label>
+                                <input id="strataMaxContext" type="number" min="1024" placeholder="如 32768" class="config-input" style="padding:8px 12px">
+                            </div>
+                        </div>
+                        <label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--text-secondary);cursor:pointer">
+                            <input type="checkbox" id="strataMmapExperts"> 专家 mmap 不拷内存（省 RAM，查表稍慢）
+                        </label>
+                    </div>
+                    <!-- 严格 GPU0 ≤8GB 方案参数区：显存预留/专家缓存/显卡由后端固定，仅保留最大上下文（缺省 32768） -->
+                    <div id="strataStrictBox" style="display:block;margin:-4px 0 14px;padding:12px 14px;border:1px dashed var(--border);border-radius:10px;background:var(--bg-primary)">
+                        <div style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:10px">严格 GPU0 ≤8GB 方案（显存预留 / 专家缓存 / 显卡由后端固定，不可调）</div>
+                        <div class="config-field" style="margin-bottom:0">
+                            <label class="config-label">最大上下文</label>
+                            <input id="strataStrictMaxContext" type="number" min="1024" value="32768" class="config-input" style="padding:8px 12px">
+                        </div>
+                        <div style="font-size:11px;color:var(--text-tertiary);margin-top:8px;line-height:1.6">仅使用 GPU0（显存硬上限 8GB），GPU1 完全禁用；专家权重全部驻留内存。</div>
+                    </div>
+                    <div class="config-field">
+                        <label class="config-label">监听地址</label>
+                        <div style="display:flex;gap:16px;font-size:13px;color:var(--text-secondary);align-items:center">
+                            <label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="radio" name="strataHost" value="127.0.0.1" checked onchange="strataToggleHost()"> 仅本机 127.0.0.1</label>
+                            <label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="radio" name="strataHost" value="0.0.0.0" onchange="strataToggleHost()"> 局域网 0.0.0.0</label>
+                        </div>
+                        <div id="strataApiKeyRow" style="display:none;margin-top:10px">
+                            <label class="config-label">API Key（局域网模式必填）</label>
+                            <input id="strataApiKey" type="text" placeholder="局域网暴露必须设置访问密钥" class="config-input" style="padding:8px 12px">
+                        </div>
+                    </div>
+                    <div id="strataStartMsg" style="font-size:12px;color:var(--red);min-height:16px;margin-bottom:8px;white-space:pre-wrap;word-break:break-all"></div>
+                    <button class="btn" id="strataStartBtn" style="width:100%;justify-content:center;background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600" onclick="strataStartClick()">启动 Strata</button>
+                    <div style="font-size:11px;color:var(--text-tertiary);margin-top:10px;line-height:1.6">与 18420 生产实例互斥：默认方案需双卡空闲显存与 ≥80GB 可用内存；8GB 单卡方案仅需单卡 ~8GB 显存、专家权重驻留内存（IQ2_XS 约 42GB RAM）。</div>
+                </div>
+
+                <!-- 运行卡（running 时显示） -->
+                <div class="card" id="strataRunCard" style="padding:var(--space-5) var(--space-6);display:none">
+                    <div style="font-size:14px;font-weight:700;margin-bottom:var(--space-4);display:flex;align-items:center;gap:8px">
+                        <span style="display:inline-block;width:3px;height:14px;border-radius:2px;background:var(--green)"></span>
+                        运行中
+                        <span id="strataRunPid" style="font-size:11px;color:var(--text-tertiary);font-weight:400;margin-left:auto"></span>
+                    </div>
+                    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:var(--space-3);margin-bottom:var(--space-4)">
+                        <div style="background:var(--bg-primary);border:1px solid var(--border-light);border-radius:var(--radius-sm);padding:var(--space-3) var(--space-4);text-align:center">
+                            <div style="font-size:10px;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:0.05em;font-weight:600">阶段</div>
+                            <div style="font-weight:800;font-size:18px;margin-top:4px" id="strataPhase">--</div>
+                        </div>
+                        <div style="background:var(--bg-primary);border:1px solid var(--border-light);border-radius:var(--radius-sm);padding:var(--space-3) var(--space-4);text-align:center">
+                            <div style="font-size:10px;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:0.05em;font-weight:600">吞吐</div>
+                            <div style="font-weight:800;font-size:18px;margin-top:4px;font-variant-numeric:tabular-nums;color:var(--blue)" id="strataTps">--</div>
+                            <div style="font-size:10px;color:var(--text-tertiary)">tok/s</div>
+                        </div>
+                        <div style="background:var(--bg-primary);border:1px solid var(--border-light);border-radius:var(--radius-sm);padding:var(--space-3) var(--space-4);text-align:center">
+                            <div style="font-size:10px;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:0.05em;font-weight:600">已生成</div>
+                            <div style="font-weight:800;font-size:18px;margin-top:4px;font-variant-numeric:tabular-nums;color:var(--orange)" id="strataTokens">--</div>
+                            <div style="font-size:10px;color:var(--text-tertiary)">tokens</div>
+                        </div>
+                    </div>
+                    <div id="strataProgWrap" style="display:none;margin-bottom:var(--space-4)">
+                        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-tertiary);margin-bottom:4px"><span id="strataProgLabel">进度</span><span id="strataProgVal"></span></div>
+                        <div class="progress" style="height:6px"><div class="progress-bar" id="strataProgBar" style="width:0%;background:var(--accent)"></div></div>
+                    </div>
+                    <!-- 显存监控条（后端 status.vram_watch：limit_mib/peak_mib/current_mib/violated）；字段缺失整块隐藏 -->
+                    <div id="strataVramWatchWrap" style="display:none;margin-bottom:var(--space-4)">
+                        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-tertiary);margin-bottom:4px">
+                            <span id="strataVramWatchLabel">显存监控</span>
+                            <span id="strataVramWatchVal"></span>
+                        </div>
+                        <div class="progress" style="height:6px"><div class="progress-bar" id="strataVramWatchBar" style="width:0%;background:var(--green)"></div></div>
+                        <div id="strataVramWatchPeak" style="font-size:11px;color:var(--text-tertiary);margin-top:4px"></div>
+                        <div id="strataVramWatchAlarm" style="display:none;margin-top:6px;padding:8px 12px;border-radius:8px;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.45);color:var(--red);font-size:12px;line-height:1.6">已保护性停止（显存超限）</div>
+                    </div>
+                    <!-- effective_args 摘要徽标（后端 status.effective_args：vram_reserve/expert_cache/mmap/gpu/context） -->
+                    <div id="strataEffWrap" style="display:none;margin-bottom:var(--space-4)">
+                        <div style="font-size:10px;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:0.05em;font-weight:600;margin-bottom:5px">生效参数</div>
+                        <div id="strataEffBadges" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+                    </div>
+                    <button class="btn" style="width:100%;justify-content:center;color:var(--red);border-color:var(--red);font-weight:600" onclick="strataStopClick()">停止 Strata</button>
+                </div>
+            </div>
+
+            <!-- 日志卡 -->
+            <div class="card" style="padding:var(--space-5) var(--space-6)">
+                <div style="font-size:14px;font-weight:700;margin-bottom:var(--space-3);display:flex;align-items:center;gap:8px">
+                    <span style="display:inline-block;width:3px;height:14px;border-radius:2px;background:var(--accent)"></span>
+                    引擎日志
+                    <button class="btn" style="margin-left:auto;padding:5px 14px;font-size:12px" onclick="strataLoadLogs(true)">刷新</button>
+                    <label style="display:flex;gap:5px;align-items:center;font-size:12px;color:var(--text-tertiary);font-weight:400;cursor:pointer"><input type="checkbox" id="strataAutoScroll" checked> 自动滚底</label>
+                </div>
+                <pre id="strataLogBox" style="background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;padding:12px 14px;font-family:var(--font-mono,'JetBrains Mono',ui-monospace,monospace);font-size:11.5px;line-height:1.55;color:var(--text-secondary);height:340px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;margin:0">加载中…</pre>
+            </div>
+        </div>
+
     </main>
 
     <footer style="border-top:1px solid var(--border);margin-top:40px;padding:20px 0;text-align:center;font-size:12px;color:var(--text-tertiary)">
@@ -1817,7 +2000,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20261006-r6'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20261006-r7'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -1854,10 +2037,13 @@ function switchTab(tab) {
     document.getElementById('tab-' + tab).classList.remove('hidden');
     // Find and activate the correct tab
     const tabs = document.querySelectorAll('.nav-tab');
-    const map = { dashboard: 0, models: 1, energy: 2, storage: 3, usage: 4, bench: 5, cpuctl: 6 };
+    const map = { dashboard: 0, models: 1, energy: 2, storage: 3, usage: 4, bench: 5, cpuctl: 6, strata: 7, sglang: 8 };
     if (tabs[map[tab]]) tabs[map[tab]].classList.add('active');
     if (tab === 'bench') initBenchTab();
     if (tab === 'cpuctl') initCpuTab();
+    if (tab === 'sglang') initSglangTab();
+    if (tab === 'strata') strataInit();
+    if (tab !== 'strata') strataStopPolling();
     if (tab === 'dashboard' && isConnected) refreshDashboard();
     if (tab === 'models') { loadVllmLogs(); loadModels(); loadQuickStart(); if (autoRefreshLogs && !logRefreshInterval) logRefreshInterval = setInterval(loadVllmLogs, 2000); }
     if (tab === 'energy') startEnergyPolling();
@@ -1886,6 +2072,17 @@ function initCpuTab() {
 function reloadCpuFrame() {
     const f = document.getElementById('cpuFrame');
     if (f) f.setAttribute('src', '/cpu.html?r=' + Date.now());
+}
+
+// ====== SGLang 引擎监控标签（[sglang-adapt-1003] 内嵌 /sglang.html，后端 metrics?port= 按实例取数） ======
+// 懒加载口径同 bench/cpu：首次激活才拉页；页内 2s 轮询自带后台门控与看门狗，切标签不重复起。
+function initSglangTab() {
+    const f = document.getElementById('sglangFrame');
+    if (f && !f.getAttribute('src')) f.setAttribute('src', '/sglang.html');
+}
+function reloadSglangFrame() {
+    const f = document.getElementById('sglangFrame');
+    if (f) f.setAttribute('src', '/sglang.html?r=' + Date.now());
 }
 
 function updateTimestamp() {
@@ -2717,6 +2914,15 @@ async function _doRefreshDashboard() {
                         + (_memG != null ? '\n驻留主值 = /dev/shm（tmpfs）实测已用 ' + _koMem.used_gb.toFixed(1) + ' GiB / ' + _koMem.total_gb + ' GiB（本机 tmpfs 仅 vLLM offload 使用，单实例口径）' : '')
                         + '\n命中=CPU→GPU 回载免重算的 prompt token（与 GPU 前缀缓存命中互补）\n存=GPU→CPU 累计写入（含被驱逐的重复写入）；次=传输任务数'
                         + (_isFill ? '' : '\n钉住=上游 cpu_cache_usage_perc 口径：被在飞传输占住的 CPU 档比例，非已存数据量（本栈无驻留 gauge，主值改用 /dev/shm 实测）');
+                } else if (Array.isArray(s.instances) && s.instances.length && s.instances[0] && s.instances[0].runtime === 'sglang') {
+                    // [sglang-adapt-1003] SGLang 主实例：本卡口径（vLLM OffloadingConnector）不适用。
+                    // SGLang 的前缀缓存 = 显存 radix cache（仪表盘「前缀缓存命中率」已是其口径），
+                    // 常驻显示「不适用」而不是假装引擎未运行。
+                    if (_koVal) _koVal.innerHTML = '<span style="opacity:.6">不适用</span>';
+                    if (_koHint) _koHint.textContent = 'SGLang·显存 radix cache';
+                    _koCard.title = '当前主实例为 SGLang（端口 ' + (s.instances[0].port || '?') + '）\n'
+                        + '本卡为 vLLM CPU KV 二级缓存（OffloadingConnector）专属口径，SGLang 无对应机制。\n'
+                        + 'SGLang 的前缀缓存是显存内 radix cache，命中率看仪表盘「前缀缓存命中率」卡。';
                 } else if (_koAll.length) {
                     // 有受管实例但引擎没配内存档 → 常驻灰态，明确「未启用」而不是让卡消失
                     if (_koVal) _koVal.innerHTML = '<span style="opacity:.65">未启用</span>';
@@ -3000,10 +3206,15 @@ async function loadModels() {
                         <span style="font-size:11px;flex-shrink:0;padding:2px 8px;border-radius:6px;${inst.runtime === 'sglang' ? 'background:var(--violet-bg);color:var(--violet)' : 'background:var(--blue-bg);color:var(--blue)'}">${inst.runtime === 'sglang' ? 'sglang' : 'vllm'}</span>
                         <span style="font-size:12px;color:var(--text-tertiary);flex-shrink:0">端口 ${inst.port} · GPU ${inst.gpu !== null && inst.gpu !== undefined ? inst.gpu : '?'} · PID ${inst.pid || '--'}</span>
                     </div>
-                    <button class="btn" style="font-size:12px;padding:4px 12px;flex-shrink:0" onclick="stopVllmPort(${inst.port}, '${esc((inst.model || '')).replace(/'/g, '')}')">
+                    ${(inst.port === 18420)
+                        ? `<button class="btn" style="font-size:12px;padding:4px 12px;flex-shrink:0;border-color:var(--red,#ef4444);color:var(--red,#ef4444);font-weight:600" onclick="close127Click(this)">
+                        <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12"/></svg>
+                        ■ 关闭 127
+                    </button>`
+                        : `<button class="btn" style="font-size:12px;padding:4px 12px;flex-shrink:0" onclick="stopVllmPort(${inst.port}, '${esc((inst.model || '')).replace(/'/g, '')}')">
                         <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12"/></svg>
                         停止
-                    </button>
+                    </button>`}
                 </div>`).join('');
         } else {
             statusEl.innerHTML = `<div class="flex items-center gap-3 justify-center">
@@ -3150,6 +3361,7 @@ let logRefreshInterval = null;
 let lastLogLen = 0;
 
 let __recentReqs = [];       // 最近 30 条（分组重渲染用，免重拉）
+let __recentSgExportOff = null; // [sglang-adapt-1003] 在跑 sglang 实例缺 --export-metrics-to-file 的端口列表（后端回传）
 
 // GPU0 / GPU1 各自独立的显示行数（不再共用一个总行数）
 const RECENT_ROW_OPTS = [5, 10, 15, 20, 25, 30, 50, 100, 200];
@@ -3178,7 +3390,7 @@ function loadRecentRequests() {
     const limit = Math.min(200, recentRowsFor(0) + recentRowsFor(1) + recentCrossRowsMax() + 20);
     _fetchWithTimeout('/v1/internal/recent-requests?limit=' + limit, null, 8000)
         .then(r => r.json())
-        .then(d => { __recentReqs = (d && d.requests) || []; renderRecentRequests(); })
+        .then(d => { __recentReqs = (d && d.requests) || []; __recentSgExportOff = (d && d.sglang_export_off) || null; renderRecentRequests(); })
         .catch(() => {});
 }
 
@@ -3350,9 +3562,9 @@ function buildRecentTable(rows) {
         const mtpColor = hasMtp ? (r.mtp_hit_rate >= 30 ? 'var(--green)' : (r.mtp_hit_rate >= 15 ? 'var(--orange)' : 'var(--text-tertiary)')) : 'var(--text-tertiary)';
         const mtpTip = hasMtp
             ? (r.runtime === 'sglang'
-                ? ('DFLASH 草稿 ' + (r.mtp_drafted || 0) + ' / 接受 ' + (r.mtp_accepted || 0) + ' · 精确值（每请求独立统计）')
+                ? ('投机（NEXTN/DFLASH）草稿 ' + (r.mtp_drafted || 0) + ' / 接受 ' + (r.mtp_accepted || 0) + ' · 精确值（每请求独立统计）')
                 : ('草稿 ' + (r.mtp_drafted || 0) + ' / 接受 ' + (r.mtp_accepted || 0) + ' token · ' + (r.mtp_exact ? '精确值：该时段仅本请求在投机' : '近似值：与并发请求混合')))
-            : (r.runtime === 'sglang' ? 'DFLASH 未开启或无投机数据' : 'MTP 未开启或无投机数据');
+            : (r.runtime === 'sglang' ? '投机（NEXTN/DFLASH）未开启，或该 sglang 实例未启用逐请求导出' : 'MTP 未开启或无投机数据');
         // GPU0 单卡行加浅色底色（与 GPU0 蓝色徽标同色系），一眼区分该卡的数据
         // 跨卡请求（gpus>1）不加底色：它自成一组，用组头绿色徽标标识即可
         const rowBg = (gList.length === 1 && r.gpu === 0) ? 'background:var(--blue-bg);' : '';
@@ -3379,8 +3591,17 @@ function renderRecentRequests() {
     const el = document.getElementById('recentRequests');
     if (!el) return;
     const reqs = __recentReqs;
+    // [sglang-adapt-1003] 在跑 sglang 实例未启用 --export-metrics-to-file 时，本表只可能是
+    // 其他实例（vLLM 时代）的历史残留行——时间旧、归因不到卡，看起来像「面板显示假数据」。
+    // 后端回传 sglang_export_off 旗标：无 sglang 行时直接隐藏残留表格并说明原因。
+    const off = (Array.isArray(__recentSgExportOff) && __recentSgExportOff.length) ? __recentSgExportOff : null;
+    const offBar = off ? '<div style="font-size:12px;line-height:1.6;padding:8px 12px;margin:6px 0;border-radius:8px;background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.45);color:var(--orange)">⚠ SGLang 实例（端口 ' + off.join(' / ') + '）启动时未带 <b>--export-metrics-to-file</b>，引擎不落盘逐请求记录，本表无法显示它的实测数据。<br>逐请求总量/速度看仪表盘 KPI（来自 /metrics，不受影响）；要补本表需在启动参数中加该 flag 并重启实例。</div>' : '';
+    if (off && !reqs.some(r => r.runtime === 'sglang')) {
+        el.innerHTML = offBar + '<div style="font-size:12px;color:var(--text-tertiary);padding:4px 0">已隐藏 ' + reqs.length + ' 条历史残留记录（非当前实例数据）。</div>';
+        return;
+    }
     if (!reqs.length) {
-        el.innerHTML = '<div style="font-size:12px;color:var(--text-tertiary);padding:8px 0">暂无记录（请求完成后出现）</div>';
+        el.innerHTML = offBar + '<div style="font-size:12px;color:var(--text-tertiary);padding:8px 0">暂无记录（请求完成后出现）</div>';
         return;
     }
     // 按归属分组（reqs 已按完成时间倒序）：跨卡（PP/TP 双卡）请求单独成组，只出一份数据
@@ -3841,7 +4062,7 @@ function startConfigDefaults(modelName, suggestPort, suggestGpu) {
             // [mtp-default 0923] 投机缺省镜像后端 scriptModelDefaults（唯一真源）：
             // W4A16 档缺省 MTP 开（=生产 MTP4），NVFP4 档缺省关（该镜像 PP2+MTP 不稳）。
             mtp: smd.mtp === '1' ? '1' : '0', dflash: '0', dspark: '0', mtpTokens: smd.mtpTokens || 6,
-            kvCacheQuant: 'auto', retention: '', runtime: 'vllm',
+            kvCacheQuant: 'auto', retention: '', runtime: smd.runtime || 'vllm', // [sglang-adapt-1003] SGLang 脚本栈哨兵在位时后端回 'sglang'，弹窗直接开对面板
             // [kvoff-toggle 09-22][sync 09-23] 脚本化模型（Flash-Next W4A16）：二级缓存=生产现状（开，96GiB，c5a 后命中已通）
             kvOff: String(smd.kvoff || 'simple'), kvOffGiB: Number(smd.kvoffGiB || smd.kvOffGiB) || 96, // 0927 生产定版=SimpleCPU 96GiB
             // [ple-field 0923] PLE 表精度=生产现状（INT8 磁盘驻留；选 BF16 则下发 FN_PLE_INT8=0）
@@ -4246,7 +4467,7 @@ function startModalFieldsHtml(modelName, suggestPort, suggestGpu) {
                         ${segOpt('modalRuntime', 'vllm', 'vLLM', true, 'syncRuntime()', '生产默认，MTP / DFlash2 投机均可', '生产默认')}
                         ${segOpt('modalRuntime', 'sglang', 'SGLang', false, 'syncRuntime()', 'main 快照，DFLASH 投机（仅 qwen3.8-27b）', 'main 快照')}
                     </div>
-                    <span style="font-size:11px;color:var(--text-tertiary);margin-left:10px" id="runtimeHint">sglang 仅支持 DFLASH 投机（无 MTP）</span>
+                    <span style="font-size:11px;color:var(--text-tertiary);margin-left:10px" id="runtimeHint">sglang 投机 = NEXTN（内置 MTP/EAGLE）或 DFLASH/DSpark 草稿；qwen3.8-27b 系列</span>
                 </div>
                 <div class="sc-mini-grid" style="margin-top:12px">
                     <div class="config-field" data-tip="多卡并行模式（启用显卡数量&gt;1 时生效）：TP=张量并行（每层切分到多卡，默认，推荐）；PP=流水线并行（按层分阶段，单卡显存更宽裕时可选）。"><label class="config-label">并行模式</label><select id="modalParallelMode" class="config-input"><option value="tp">TP 张量并行（默认）</option><option value="pp">PP 流水线并行</option></select></div>
@@ -4685,6 +4906,30 @@ async function execModelAction(params) {
         alert('请求失败: ' + e.message);
     }
 }
+
+// [__close127_btn_1006__] 关闭 127（18420 Flash-Next）：走专用端点 → 宿主停止脚本
+// （SIGTERM 优雅退出，等净后才兜底；停止约需 1~2.5 分钟，按钮期间禁用防重入）。
+async function close127Click(btn) {
+    if (!confirm('确定关闭 127 实例（端口 18420，qwen3.8-flash-next）？\n会走优雅停止（SIGTERM，最长等 90 秒，绝不 SIGKILL），期间服务不可用，整个过程约 1~3 分钟。')) return;
+    const old = btn ? btn.innerHTML : '';
+    if (btn) { btn.disabled = true; btn.innerHTML = '关闭中…'; }
+    try {
+        const resp = await fetch('/v1/internal/close-127', { method: 'POST' });
+        const result = await resp.json();
+        if (result.success) {
+            alert('127 实例（端口 ' + (result.port || 18420) + '）已关闭' + (result.output ? '\n' + result.output.slice(-200) : ''));
+        } else {
+            alert('关闭失败: ' + (result.error || '未知错误') + (result.output ? '\n' + String(result.output).slice(-200) : ''));
+        }
+        loadModels();
+        refreshDashboard();
+    } catch (e) {
+        alert('请求失败: ' + e.message);
+    } finally {
+        if (btn && document.body.contains(btn)) { btn.disabled = false; btn.innerHTML = old; }
+    }
+}
+// ===== [__close127_btn_1006__] end =====
 
 async function stopVllmPort(port, name) {
     if (!confirm(`确定停止模型 ${name || ''}（端口 ${port}）？`)) return;
@@ -6052,13 +6297,19 @@ function syncGpuMemHint() {
 function syncRuntime() {
     const rt = (document.querySelector('input[name="modalRuntime"]:checked')?.value) || 'vllm';
     const isSgl = rt === 'sglang';
+    // [sglang-adapt-1003] 脚本化模型（18420 SGLang 栈）：启动参数由后端脚本对（sglang-inner.sh）
+    // 固定构造，「SGLang 启动参数」区块的托管字段不生效（后端 plan 会警告并忽略）→ 隐藏该区块，
+    // 避免用户在无效字段上调参。常用字段（端口/并发/显存比例/采样/思考/投机开关）仍生效。
+    const isScript = !!window.__scriptModel;
     const hint = document.getElementById('runtimeHint');
     if (hint) hint.textContent = isSgl
-        ? 'SGLang 支持 MTP / DFLASH / DSpark 投机；草稿仅 qwen3.8-27b'
+        ? (isScript
+            ? '脚本模型 · SGLang 栈：常用字段生效；二级缓存/PLE/block 等 vLLM 专属项将被忽略（后端会警告）'
+            : 'SGLang 支持 MTP / DFLASH / DSpark 投机；草稿仅 qwen3.8-27b')
         : 'vLLM：MTP / DFlash2 / DSpark 均可（生产默认）';
-    // SGLang 附加启动参数区块：仅 sglang 运行时显示
+    // SGLang 附加启动参数区块：仅 sglang 运行时显示（脚本化模型除外，见上注）
     const extraSec = document.getElementById('sglangExtraSection');
-    if (extraSec) extraSec.style.display = isSgl ? '' : 'none';
+    if (extraSec) extraSec.style.display = (isSgl && !isScript) ? '' : 'none';
     // 最优配置提示条：仅 sglang 运行时显示（最优配置是 SGLang 的）
     const optHint = document.getElementById('optimalCfgHint');
     if (optHint) optHint.style.display = isSgl ? '' : 'none';
@@ -7140,6 +7391,534 @@ function startHdrGpuPolling() {
     window.addEventListener('scroll', hide, true);
     window.addEventListener('resize', hide);
 })();
+
+// ============================================================================
+// ====== Strata 引擎管理标签页（后端见 server.js STRATA 模块 · 契约 STRATA-API.md） ======
+// 铁律：本文件多会话并写，同名 function 后者静默覆盖前者——全部函数/全局变量带 strata 前缀。
+// 轮询仅在标签激活时进行：strataInit() 开、switchTab 切走时 strataStopPolling() 停。
+// ============================================================================
+let strataStatusTimer = null;   // status+metrics 轮询（2s）
+let strataLogTimer = null;      // logs 轮询（3s）
+let strataOptionsLoaded = false;
+let strataLastLines = '';       // 日志增量渲染基线（内容变化才重排 DOM）
+let strataBusy = false;         // 启动/停止请求防重入
+// 显存方案表：内置兜底（后端 vram_presets 只覆盖同名 key，未覆盖项保留）。
+// key=default 不发任何 vram 字段；其余项的 fields 直接并入 POST /start body。
+// strict8g（推荐、缺省选中）：稳定实测档 CUDA_VISIBLE_DEVICES=0 + expert-cache 300 + vram-reserve 1024 + max-context 32768
+//   实测 GPU0 峰值 6260 MiB（<8192）、GPU1 全程 0 MiB；显存预留/专家缓存/显卡由后端固定，前端只发 strict_8g + max_context。
+// single8g：旧方案（勿用），仍会发 vram_mb（后端已废弃该字段语义），仅为兼容历史预保留。
+var STRATA_VRAM_PLANS = {
+    default:  {},                                                              // 默认：不发任何 vram 字段
+    strict8g: { strict_8g: true, max_context: 32768 },                          // 严格 GPU0 ≤8GB（推荐）
+    single8g: { vram_mb: 7168, gpus: 0, expert_cache: 'auto' },                // 旧方案（勿用）·8GB 单卡·专家全内存
+};
+
+function strataInit() {
+    strataLoadOptions();
+    strataLoadStatus();
+    strataLoadLogs(false);
+    if (!strataStatusTimer) {
+        strataStatusTimer = setInterval(function () {
+            const tab = document.getElementById('tab-strata');
+            if (!tab || tab.classList.contains('hidden')) return;
+            strataLoadStatus();
+        }, 2000);
+    }
+    if (!strataLogTimer) {
+        strataLogTimer = setInterval(function () {
+            const tab = document.getElementById('tab-strata');
+            if (!tab || tab.classList.contains('hidden')) return;
+            strataLoadLogs(false);
+        }, 3000);
+    }
+}
+
+function strataStopPolling() {
+    if (strataStatusTimer) { clearInterval(strataStatusTimer); strataStatusTimer = null; }
+    if (strataLogTimer) { clearInterval(strataLogTimer); strataLogTimer = null; }
+}
+
+// ---- 选项（模型档位 / 引擎信息 / 显存方案预设 / 缺省值）：首次激活拉一次即可 ----
+// vram_presets：后端 options 若返回则优先用它渲染「显存方案」下拉；
+// 每项约定 { key, label, fields:{vram_mb,gpus,expert_cache,mmap_experts,max_context} }，
+// 字段名宽容取值（label/name/text、fields/params/args/vram），不认识的结构跳过不报错。
+function strataRenderVramPresets(presets) {
+    if (!Array.isArray(presets) || presets.length === 0) return;
+    const sel = document.getElementById('strataVramPlan');
+    if (!sel) return;
+    // 内置兜底档（strict8g 为推荐缺省）：后端 vram_presets 按 key/value 覆盖同名项，未覆盖的保留。
+    // [DEFAULT_FULL_VRAM_V1] 缺省档=default（吃满整卡）；strict8g 保留为可选严格档
+    const order = ['default', 'strict8g', 'single8g'];
+    const labelOf = {
+        default: '默认（吃满整卡显存，推荐）',
+        strict8g: '严格 GPU0 ≤8GB',
+        single8g: '旧方案（勿用）·8GB 单卡·专家全内存',
+    };
+    let defaultKey = 'default';
+    const planMap = Object.assign({}, STRATA_VRAM_PLANS);
+    let added = false;
+    presets.forEach((p, i) => {
+        if (!p || typeof p !== 'object') return;
+        // key 宽容取 key/id/name/value，label 宽容取 label/name/text/title（与后端回写字段名对齐前双兼容）
+        const key = String(p.key != null ? p.key : (p.id != null ? p.id : (p.name != null ? p.name : (p.value != null ? p.value : 'preset' + i))));
+        const label = String(p.label != null ? p.label : (p.text != null ? p.text : (p.title != null ? p.title : (p.name != null ? p.name : key))));
+        // [DEFAULT_FULL_VRAM_V1] 字段提取双兼容：fields{} 优先，取不到则从 preset 顶层平铺按白名单取
+        const fields = p.fields || p.params || p.args || p.vram || p;
+        const pick = {};
+        for (const k of ['strict_8g', 'vram_mb', 'gpus', 'expert_cache', 'mmap_experts', 'max_context', 'prefill', 'layer_split', 'kv_resident']   /* [DUAL_170HX_PATCH_V1] */) {
+            if (fields[k] !== undefined && fields[k] !== null) pick[k] = fields[k];
+        }
+        planMap[key] = pick;
+        if (p.is_default === true) defaultKey = key;
+        if (order.indexOf(key) < 0) order.push(key);
+        labelOf[key] = label;
+        added = true;
+    });
+    if (!added) return;
+    // [DEFAULT_FULL_VRAM_V1] 缺省选中=defaultKey（后端 is_default 指定，缺省 default=吃满整卡）
+    const opts = order.filter(k => k !== 'custom').map(k =>
+        '<option value="' + esc(k) + '"' + (k === defaultKey ? ' selected' : '') + '>' + esc(labelOf[k] || k) + '</option>');
+    opts.push('<option value="custom">自定义…</option>');
+    sel.innerHTML = opts.join('');
+    sel.value = defaultKey;        // 缺省选中档由 is_default 决定
+    STRATA_VRAM_PLANS = planMap;   // 覆盖内置兜底方案表（已并入 strict8g/single8g 内置项）
+    strataVramChange();            // 同步高级区/严格区显隐
+}
+function strataLoadOptions() {
+    if (strataOptionsLoaded) return;
+    fetch('/v1/internal/strata/options').then(r => r.ok ? r.json() : null).then(d => {
+        if (!d || !Array.isArray(d.models)) return;
+        strataOptionsLoaded = true;
+        const sel = document.getElementById('strataModel');
+        if (sel && sel.childElementCount === 0) {
+            sel.innerHTML = d.models.map(m =>
+                '<option value="' + esc(m.name) + '"' + (m.ready ? '' : ' disabled') + '>' +
+                esc(m.name) + ' · ' + (m.gb != null ? m.gb.toFixed(1) : '?') + ' GB' +
+                (m.ready ? '' : '（未下载完）') + '</option>').join('');
+            // 缺省选第一个 ready 的档位
+            const firstReady = d.models.find(m => m.ready);
+            if (firstReady) sel.value = firstReady.name;
+        }
+        if (d.defaults) {
+            const ctx = document.getElementById('strataContext');
+            if (ctx && d.defaults.context != null) ctx.value = String(d.defaults.context);
+            const vis = document.getElementById('strataVision');
+            if (vis && d.defaults.vision != null) vis.value = String(d.defaults.vision);
+            const port = document.getElementById('strataPort');
+            if (port && d.defaults.port != null) port.value = String(d.defaults.port);
+        }
+        // 显存方案预设（后端新增字段，未返回时保留内置兜底两项）
+        if (Array.isArray(d.vram_presets)) strataRenderVramPresets(d.vram_presets);
+    }).catch(() => {});
+}
+
+// ---- 状态轮询：status 渲染 + 运行时顺带取 metrics ----
+function strataLoadStatus() {
+    fetch('/v1/internal/strata/status').then(r => r.ok ? r.json() : null).then(d => {
+        const ts = document.getElementById('strataTimestamp');
+        if (ts) ts.textContent = new Date().toLocaleTimeString('zh-CN');
+        if (!d || typeof d !== 'object') {
+            const lights = document.getElementById('strataLights');
+            if (lights) lights.innerHTML = '<span style="font-size:13px;color:var(--text-tertiary)">后端接口不可用（/v1/internal/strata/status 无响应）</span>';
+            return;
+        }
+        strataRenderStatus(d);
+        if (d.running) strataLoadMetrics();
+    }).catch(() => {
+        const lights = document.getElementById('strataLights');
+        if (lights) lights.innerHTML = '<span style="font-size:13px;color:var(--text-tertiary)">状态请求失败</span>';
+    });
+}
+
+function strataLightHtml(label, ok) {
+    const c = ok ? 'var(--green)' : 'var(--red)';
+    return '<span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--text-secondary)">' +
+        '<span style="width:9px;height:9px;border-radius:50%;background:' + c + ';display:inline-block"></span>' +
+        esc(label) + '</span>';
+}
+
+function strataRenderStatus(d) {
+    const lights = document.getElementById('strataLights');
+    if (lights) {
+        lights.innerHTML =
+            strataLightHtml('已安装', !!d.installed) +
+            strataLightHtml('引擎就绪', !!d.engine_ready) +
+            strataLightHtml('模型就绪', !!d.model_ready) +
+            strataLightHtml('运行中', !!d.running);
+    }
+    const meta = document.getElementById('strataMeta');
+    if (meta) {
+        const bits = [];
+        if (d.running) {
+            if (d.pid) bits.push('pid ' + d.pid);
+            if (d.port) bits.push(':' + d.port + (d.host ? ' @ ' + d.host : ''));
+            if (d.uptime_s != null) bits.push('已运行 ' + strataFmtUptime(d.uptime_s));
+            if (d.health && d.health.ok === false) bits.push('health 异常');
+            if (d.config && d.config.model) bits.push(d.config.model + ' · ctx ' + (d.config.context || '?'));
+        } else if (d.last_error) {
+            bits.push('未运行');
+        } else {
+            bits.push('未运行');
+        }
+        meta.textContent = bits.join(' · ');
+    }
+    const errBar = document.getElementById('strataErrBar');
+    if (errBar) {
+        if (d.last_error) {
+            errBar.style.display = 'block';
+            errBar.textContent = '最近错误：' + d.last_error;
+        } else {
+            errBar.style.display = 'none';
+            errBar.textContent = '';
+        }
+    }
+    const runCard = document.getElementById('strataRunCard');
+    if (runCard) runCard.style.display = d.running ? 'block' : 'none';
+    const pidEl = document.getElementById('strataRunPid');
+    if (pidEl) pidEl.textContent = d.running ? ('pid ' + (d.pid || '--') + ' · ' + (d.uptime_s != null ? strataFmtUptime(d.uptime_s) : '')) : '';
+    const startBtn = document.getElementById('strataStartBtn');
+    if (startBtn) {
+        startBtn.disabled = !!d.running || strataBusy;
+        startBtn.style.opacity = startBtn.disabled ? '0.55' : '1';
+        startBtn.style.cursor = startBtn.disabled ? 'not-allowed' : 'pointer';
+    }
+    // activity 即时渲染（metrics 到达时会被更精确值覆盖）
+    if (d.running) strataRenderActivity(d.activity);
+    // 显存监控条（status.vram_watch；字段缺失整块隐藏，后端未上线不报错）
+    strataRenderVramWatch(d.running ? d.vram_watch : null);
+    // effective_args 摘要徽标（后端 status.effective_args：vram_reserve/expert_cache/mmap/gpu/context）
+    strataRenderEffective(d.running ? d.effective_args : null);
+}
+
+// 生效参数徽标：字段宽容取值（vram_reserve/vram_mb、gpu/gpus、context/max_context），
+// 值为空/未提供则跳过该项；全空则隐藏整块。
+function strataRenderEffective(ea) {
+    const wrap = document.getElementById('strataEffWrap');
+    const box = document.getElementById('strataEffBadges');
+    if (!wrap || !box) return;
+    if (!ea || typeof ea !== 'object') { wrap.style.display = 'none'; box.innerHTML = ''; return; }
+    const badges = [];
+    const chip = (txt) => '<span style="display:inline-block;font-size:11px;line-height:1;padding:3px 8px;border-radius:4px;background:var(--bg-card-hover);color:var(--text-secondary);border:1px solid var(--border-light)">' + esc(txt) + '</span>';
+    const vram = ea.vram_reserve != null ? ea.vram_reserve : ea.vram_mb;
+    if (vram != null && vram !== '') badges.push(chip('显存 ' + vram + ' MiB'));
+    const gpu = ea.gpu != null ? ea.gpu : ea.gpus;
+    if (gpu != null && gpu !== '') badges.push(chip('GPU' + gpu));
+    if (ea.expert_cache != null && ea.expert_cache !== '') badges.push(chip('专家缓存 ' + ea.expert_cache));
+    if (ea.mmap) badges.push(chip('专家 mmap'));
+    const ctx = ea.context != null ? ea.context : ea.max_context;
+    if (ctx != null && ctx !== '') badges.push(chip('ctx ' + ctx));
+    if (badges.length === 0) { wrap.style.display = 'none'; box.innerHTML = ''; return; }
+    wrap.style.display = 'block';
+    box.innerHTML = badges.join('');
+}
+
+// 显存监控条：status.vram_watch = {limit_mib, peak_mib, current_mib, violated}
+// 整块字段缺失/结构非法 → 隐藏不报错（后端可能稍后才上线）；current/limit >90% 转橙，violated=true 转红并提示保护性停止。
+function strataRenderVramWatch(vw) {
+    const wrap = document.getElementById('strataVramWatchWrap');
+    if (!wrap) return;
+    const hide = function () {
+        wrap.style.display = 'none';
+        const alarm = document.getElementById('strataVramWatchAlarm');
+        if (alarm) alarm.style.display = 'none';
+    };
+    if (!vw || typeof vw !== 'object') { hide(); return; }
+    const num = function (x) {
+        if (x === null || x === undefined || x === '') return null;
+        return isFinite(Number(x)) ? Number(x) : null;
+    };
+    const limit = num(vw.limit_mib);
+    const current = num(vw.current_mib);
+    const peak = num(vw.peak_mib);
+    if (limit === null && current === null && peak === null) { hide(); return; }
+    const cap = (limit !== null && limit > 0) ? limit : 8192;
+    const violated = vw.violated === true;
+    const pct = current !== null ? Math.max(0, Math.min(100, current / cap * 100)) : 0;
+    const labelEl = document.getElementById('strataVramWatchLabel');
+    if (labelEl) labelEl.textContent = '显存监控 · 上限 ' + cap + ' MiB';
+    const valEl = document.getElementById('strataVramWatchVal');
+    if (valEl) {
+        valEl.textContent = '当前 ' + (current !== null ? current + ' MiB' : '--') +
+            ' / 峰值 ' + (peak !== null ? peak + ' MiB' : '--');
+    }
+    const bar = document.getElementById('strataVramWatchBar');
+    if (bar) {
+        bar.style.width = pct.toFixed(1) + '%';
+        bar.style.background = violated ? 'var(--red)' : (pct > 90 ? 'var(--orange)' : 'var(--green)');
+    }
+    const peakEl = document.getElementById('strataVramWatchPeak');
+    if (peakEl) {
+        const bits = [];
+        if (peak !== null) bits.push('峰值 ' + peak + ' MiB（占上限 ' + (peak / cap * 100).toFixed(1) + '%）');
+        if (current !== null) bits.push('当前 ' + pct.toFixed(1) + '%');
+        peakEl.textContent = bits.join(' · ');
+    }
+    const alarm = document.getElementById('strataVramWatchAlarm');
+    if (alarm) alarm.style.display = violated ? 'block' : 'none';
+    wrap.style.display = 'block';
+}
+
+function strataFmtUptime(sec) {
+    sec = Math.floor(Number(sec) || 0);
+    if (sec <= 0) return '0s';
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    if (h > 0) return h + 'h' + m + 'm';
+    if (m > 0) return m + 'm' + s + 's';
+    return s + 's';
+}
+
+function strataRenderActivity(act) {
+    const ph = document.getElementById('strataPhase');
+    if (ph) ph.textContent = (act && act.phase) ? String(act.phase) : '--';
+    const tps = document.getElementById('strataTps');
+    if (tps) {
+        const v = act && (act.tps != null ? act.tps : (act.raw && act.raw.tps));
+        tps.textContent = (v != null && isFinite(Number(v))) ? Number(v).toFixed(1) : '--';
+    }
+    const tok = document.getElementById('strataTokens');
+    if (tok) {
+        const v = act && (act.tokens != null ? act.tokens : (act.raw && (act.raw.generated_tokens != null ? act.raw.generated_tokens : act.raw.tokens)));
+        tok.textContent = (v != null && isFinite(Number(v))) ? Number(v).toLocaleString() : '--';
+    }
+    const wrap = document.getElementById('strataProgWrap');
+    if (wrap) {
+        const done = act && (act.progress_done != null ? act.progress_done : (act.raw && (act.raw.prompt_done != null ? act.raw.prompt_done : act.raw.done)));
+        const total = act && (act.progress_total != null ? act.progress_total : (act.raw && (act.raw.prompt_total != null ? act.raw.prompt_total : act.raw.total)));
+        if (done != null && total != null && Number(total) > 0) {
+            wrap.style.display = 'block';
+            const pct = Math.min(100, Math.round(Number(done) / Number(total) * 100));
+            const bar = document.getElementById('strataProgBar');
+            if (bar) bar.style.width = pct + '%';
+            const val = document.getElementById('strataProgVal');
+            if (val) val.textContent = Number(done).toLocaleString() + ' / ' + Number(total).toLocaleString() + '（' + pct + '%）';
+        } else {
+            wrap.style.display = 'none';
+        }
+    }
+}
+
+// ---- metrics（引擎 /metrics 透传，尽力解析 tps/进度，缺字段不报错）----
+function strataLoadMetrics() {
+    fetch('/v1/internal/strata/metrics').then(r => r.ok ? r.json() : null).then(m => {
+        if (!m || m.ok === false) return;
+        const act = {};
+        if (m.tps != null) act.tps = m.tps;
+        if (m.tokens != null) act.tokens = m.tokens;
+        if (m.phase != null) act.phase = m.phase;
+        if (m.progress_done != null) act.progress_done = m.progress_done;
+        if (m.progress_total != null) act.progress_total = m.progress_total;
+        if (Object.keys(act).length) strataRenderActivity(act);
+    }).catch(() => {});
+}
+
+// ---- 启动：确认弹窗（含 force 勾选 + 显存方案）→ POST start；409 显示 reason ----
+// 显存方案 → 契约字段映射（strict8g 发 strict_8g + max_context；自定义发 vram_mb/gpus/expert_cache/mmap_experts/max_context；空值不发）
+// strict8g：显存预留/专家缓存/显卡由后端固定，前端只保留「最大上下文」输入。
+function strataVramChange() {
+    const sel = document.getElementById('strataVramPlan');
+    const plan = sel ? sel.value : 'default';
+    const adv = document.getElementById('strataAdvBox');
+    const strict = document.getElementById('strataStrictBox');
+    if (adv) adv.style.display = (plan === 'custom') ? 'block' : 'none';
+    if (strict) strict.style.display = (plan === 'strict8g') ? 'block' : 'none';
+}
+// 收集当前显存方案对应要并入 start body 的字段（含校验，非法时返回 {error}）
+function strataCollectVram() {
+    const sel = document.getElementById('strataVramPlan');
+    const plan = sel ? sel.value : 'default';
+    // strict8g：显存预留/专家缓存/显卡由后端固定 → 只收集 strict_8g + max_context（绝不发 vram_mb）
+    if (plan === 'strict8g') {
+        const out = { strict_8g: true };
+        const raw = ((document.getElementById('strataStrictMaxContext') || {}).value || '').trim();
+        const n = raw === '' ? 32768 : Number(raw);
+        if (!isFinite(n) || n < 1024) return { error: '最大上下文需为 ≥1024 的数字' };
+        out.max_context = Math.round(n);
+        return out;
+    }
+    if (plan === 'custom') {
+        const out = {};
+        const vmb = ((document.getElementById('strataVramMb') || {}).value || '').trim();
+        const gpus = ((document.getElementById('strataGpus') || {}).value || '').trim();
+        const ec = ((document.getElementById('strataExpertCache') || {}).value || '').trim();
+        const mx = ((document.getElementById('strataMaxContext') || {}).value || '').trim();
+        const mmap = !!(document.getElementById('strataMmapExperts') || {}).checked;
+        if (vmb !== '') {
+            const n = Number(vmb);
+            if (!isFinite(n) || n < 1024) return { error: '显存预留需为 ≥1024 的数字（MiB）' };
+            out.vram_mb = Math.round(n);
+        }
+        if (gpus !== '') {
+            const n = Number(gpus);
+            if (n !== 0 && n !== 1) return { error: '使用显卡只能是 0 或 1（留空=自动）' };
+            out.gpus = n;
+        }
+        if (ec !== '') {
+            if (ec !== 'auto' && !/^\d+$/.test(ec)) return { error: '专家缓存只能是 auto / 0 / 正整数' };
+            out.expert_cache = ec;
+        }
+        if (mx !== '') {
+            const n = Number(mx);
+            if (!isFinite(n) || n < 1024) return { error: '最大上下文需为 ≥1024 的数字' };
+            out.max_context = Math.round(n);
+        }
+        if (mmap) out.mmap_experts = true;
+        return out;
+    }
+    return Object.assign({}, STRATA_VRAM_PLANS[plan] || {});
+}
+// 确认弹窗里的方案描述行（含 8GB 方案的专项提示）
+function strataVramSummary(planKey, vram) {
+    if (planKey === 'strict8g') {
+        return '<div style="margin-top:12px;padding:10px 14px;border-radius:8px;background:rgba(34,197,94,.10);border:1px solid rgba(34,197,94,.45);font-size:12.5px;color:var(--text-secondary);line-height:1.7">' +
+            '<b style="color:var(--green)">严格 GPU0 ≤8GB 方案</b>：仅使用 GPU0，显存硬上限 8GB；GPU1 完全禁用；专家权重全部驻留内存（IQ2_XS 约 42GB RAM）；系统每 2 秒监控显存，超过 8GB 会立即保护性停止实例。' +
+            (vram && vram.max_context != null ? '<br>最大上下文 <b>' + esc(String(vram.max_context)) + '</b>' : '') +
+            '</div>';
+    }
+    if (planKey === 'single8g') {
+        return '<div style="margin-top:12px;padding:10px 14px;border-radius:8px;background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.4);font-size:12.5px;color:var(--text-secondary);line-height:1.7">' +
+            '<b style="color:var(--accent)">8GB 单卡方案</b>：单卡 GPU' + (vram.gpus != null ? vram.gpus : '0') +
+            '，显存预算 ~8GB，专家权重全部驻留内存（IQ2_XS 需 ~42GB RAM），加载期机器卡顿 1-3 分钟。</div>';
+    }
+    if (planKey === 'custom') {
+        const bits = [];
+        if (vram.vram_mb != null) bits.push('显存预留 ' + vram.vram_mb + ' MiB');
+        if (vram.gpus != null) bits.push('GPU' + vram.gpus);
+        if (vram.expert_cache != null) bits.push('专家缓存 ' + vram.expert_cache);
+        if (vram.mmap_experts) bits.push('专家 mmap 不拷内存');
+        if (vram.max_context != null) bits.push('最大上下文 ' + vram.max_context);
+        if (!bits.length) return '';
+        return '<div style="margin-top:12px;padding:10px 14px;border-radius:8px;background:var(--bg-primary);border:1px solid var(--border);font-size:12.5px;color:var(--text-secondary);line-height:1.7">' +
+            '<b>自定义显存方案</b>：' + esc(bits.join(' · ')) + '</div>';
+    }
+    return '';
+}
+function strataStartClick() {
+    const msg = document.getElementById('strataStartMsg');
+    if (msg) msg.textContent = '';
+    const model = (document.getElementById('strataModel') || {}).value || 'IQ2_XS';
+    const context = (document.getElementById('strataContext') || {}).value || '32768';
+    const vision = (document.getElementById('strataVision') || {}).value || 'no';
+    const port = (document.getElementById('strataPort') || {}).value || '8080';
+    const hostRadio = document.querySelector('input[name="strataHost"]:checked');
+    const host = hostRadio ? hostRadio.value : '127.0.0.1';
+    const apiKey = ((document.getElementById('strataApiKey') || {}).value || '').trim();
+    if (host === '0.0.0.0' && !apiKey) {
+        if (msg) msg.textContent = '局域网模式必须填写 API Key';
+        return;
+    }
+    const planSel = document.getElementById('strataVramPlan');
+    const planKey = planSel ? planSel.value : 'default';
+    const vram = strataCollectVram();
+    if (vram.error) {
+        if (msg) msg.textContent = '显存方案：' + vram.error;
+        return;
+    }
+    delete vram.error;
+    const vramNote = (planKey === 'single8g' || planKey === 'custom')
+        ? '（显存方案=自定义/单卡档，按右列参数检查）' : '';
+    // 严格 GPU0 ≤8GB 方案只需单卡：门禁口径与默认双卡方案不同，逐方案给出正确提示
+    const needText = (planKey === 'strict8g')
+        ? '① 严格 GPU0 ≤8GB 方案只需 <b>GPU0 空闲显存 ≥8GB</b>（GPU1 完全禁用）与 <b>≥48GB 可用内存</b>'
+        : '① 默认方案需要<b>双卡空闲显存</b>与 <b>≥80GB 可用内存</b>' + vramNote;
+    const body =
+        '<div style="font-size:13px;line-height:1.9;color:var(--text-secondary)">' +
+        '档位 <b>' + esc(model) + '</b> · 上下文 <b>' + esc(context) + '</b> · Vision <b>' + esc(vision) + '</b> · 端口 <b>' + esc(port) + '</b> · 监听 <b>' + esc(host) + '</b>' +
+        '</div>' +
+        strataVramSummary(planKey, vram) +
+        '<div style="margin-top:12px;padding:10px 14px;border-radius:8px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.35);font-size:12.5px;color:var(--red);line-height:1.7">' +
+        '启动前请确认：<br>' + needText + '；<br>② 与 18420 生产实例（vLLM Flash-Next）<b>资源互斥</b>，请先停掉生产实例。</div>' +
+        '<label style="display:flex;gap:8px;align-items:center;margin-top:12px;font-size:12.5px;color:var(--text-tertiary);cursor:pointer">' +
+        '<input type="checkbox" id="strataForceChk"> 跳过资源门禁强制启动（force，不推荐；跳过显存/内存检查，仍检查端口与已有进程）</label>';
+    showModal('启动 Strata 引擎', body, [
+        { label: '取消', cls: 'btn', action: 'closeModal()' },
+        { label: '确认启动', cls: 'btn', action: function () {
+            const force = !!(document.getElementById('strataForceChk') || {}).checked;
+            closeModal();
+            const payload = { model: model, context: Number(context), vision: vision, host: host, api_key: host === '0.0.0.0' ? apiKey : null, port: Number(port), force: force };
+            // 显存方案字段并进 body（default 方案不并任何字段；strict8g 只并 strict_8g + max_context）
+            for (const k of ['strict_8g', 'vram_mb', 'gpus', 'expert_cache', 'mmap_experts', 'max_context']) {
+                if (vram[k] !== undefined && vram[k] !== null && vram[k] !== '') payload[k] = vram[k];
+            }
+            strataDoStart(payload);
+        } },
+    ]);
+}
+
+function strataDoStart(payload) {
+    if (strataBusy) return;
+    strataBusy = true;
+    const btn = document.getElementById('strataStartBtn');
+    const msg = document.getElementById('strataStartMsg');
+    if (btn) { btn.disabled = true; btn.textContent = '启动中…'; }
+    if (msg) msg.textContent = '';
+    fetch('/v1/internal/strata/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    }).then(async r => {
+        let d = null;
+        try { d = await r.json(); } catch (e) {}
+        if (r.ok && d && d.ok) {
+            if (msg) { msg.style.color = 'var(--green)'; msg.textContent = '已启动（pid ' + (d.pid || '?') + '），引擎加载中…'; }
+        } else {
+            const reason = (d && d.reason) ? d.reason : ('HTTP ' + r.status);
+            if (msg) { msg.style.color = 'var(--red)'; msg.textContent = '启动被拒绝：' + reason; }
+        }
+    }).catch(e => {
+        if (msg) { msg.style.color = 'var(--red)'; msg.textContent = '启动请求失败：' + e; }
+    }).finally(() => {
+        strataBusy = false;
+        if (btn) btn.textContent = '启动 Strata';
+        strataLoadStatus();
+    });
+}
+
+// ---- 停止 ----
+function strataStopClick() {
+    if (!confirm('确定停止 Strata 引擎？\nSIGTERM 优雅退出（最长等 60 秒），在飞请求将中断。')) return;
+    const btn = document.querySelector('#strataRunCard button.btn');
+    if (btn) btn.disabled = true;
+    fetch('/v1/internal/strata/stop', { method: 'POST' }).then(async r => {
+        let d = null;
+        try { d = await r.json(); } catch (e) {}
+        if (r.ok && d && d.ok) {
+            strataLoadStatus();
+        } else {
+            alert('停止失败：' + ((d && d.reason) ? d.reason : 'HTTP ' + r.status));
+        }
+    }).catch(e => {
+        alert('停止请求失败：' + e);
+    }).finally(() => {
+        if (btn) btn.disabled = false;
+    });
+}
+
+// ---- 日志：tail=200，3s 轮询，内容变化才重排；自动滚底 ----
+function strataLoadLogs(manual) {
+    fetch('/v1/internal/strata/logs?tail=200').then(r => r.ok ? r.json() : null).then(d => {
+        const box = document.getElementById('strataLogBox');
+        if (!box) return;
+        if (!d || !Array.isArray(d.lines)) {
+            if (manual) box.textContent = '日志接口无响应';
+            return;
+        }
+        const text = d.lines.join('\n');
+        if (text === strataLastLines) return;
+        strataLastLines = text;
+        box.textContent = text || '（日志为空）';
+        if ((document.getElementById('strataAutoScroll') || {}).checked !== false) {
+            box.scrollTop = box.scrollHeight;
+        }
+    }).catch(() => {});
+}
+
+// ---- host 单选联动 api_key 输入框 ----
+function strataToggleHost() {
+    const radio = document.querySelector('input[name="strataHost"]:checked');
+    const row = document.getElementById('strataApiKeyRow');
+    if (row) row.style.display = (radio && radio.value === '0.0.0.0') ? 'block' : 'none';
+}
+// ====== Strata 标签页结束 ======
 </script>
 <script>setTimeout(function(){try{switchTab("storage")}catch(e){}},700)</script>
 </body>

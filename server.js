@@ -7788,10 +7788,38 @@ function gpuNum(v) {
 }
 const GPU_STATIC_FIELDS = 'index,name,uuid,pci.bus_id,driver_version,vbios_version,compute_cap,pcie.link.gen.max,pcie.link.width.max,power.limit,power.min_limit,power.max_limit';
 const GPU_LIVE_FIELDS = 'index,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,temperature.memory,power.draw,pstate,clocks.sm,clocks.max.sm,pcie.link.gen.current,pcie.link.width.current,fan.speed';
+// [sm-count 1006] SM 数量：nvidia-smi --query-gpu 无此字段（count.multiProcessorCount 非法），
+// 唯一原生通路 = NVML nvmlDeviceGetNumGpuCores。这里用 ctypes 直调 libnvidia-ml.so.1（不依赖
+// pynvml 包），一次 python 进程枚举全部卡输出 JSON；失败/无 python3 → 返回 {}，前端显示 "--"，
+// 绝不让 GPU 静态信息整体构建失败。结果并入 __gpuStatic 的 5min 缓存，无常离子进程负担。
+function gpuSmCounts() {
+  const { execFileSync } = require('child_process');
+  const py = [
+    'import ctypes,json,sys',
+    'm=ctypes.CDLL("libnvidia-ml.so.1")',
+    'm.nvmlInit_v2()',
+    'n=ctypes.c_uint()',
+    'm.nvmlDeviceGetCount_v2(ctypes.byref(n))',
+    'o={}',
+    'for i in range(n.value):',
+    '    h=ctypes.c_void_p(); c=ctypes.c_uint()',
+    '    try:',
+    '        m.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(h))',
+    '        if m.nvmlDeviceGetNumGpuCores(h, ctypes.byref(c))==0: o[str(i)]=c.value',
+    '    except Exception: pass',
+    'print(json.dumps(o))',
+  ].join('\n');
+  try {
+    const out = execFileSync('python3', ['-c', py], { timeout: 5000, encoding: 'utf8' });
+    const j = JSON.parse(out.trim().split('\n').pop());
+    return (j && typeof j === 'object') ? j : {};
+  } catch (e) { return {}; }
+}
 function buildGpuStatic() {
   const out = { supported: false, gpus: [], driver_version: null };
   let rows;
   try { rows = gpuParseRows(gpuSmi(GPU_STATIC_FIELDS)); } catch (e) { out.error = 'nvidia-smi 不可用: ' + (e && e.message || e); return out; }
+  const smMap = gpuSmCounts(); // [sm-count 1006]
   for (const r of rows) {
     // [index,name,uuid,bus_id,driver,vbios,cc,gen_max,width_max,pl,pl_min,pl_max]
     const g = {
@@ -7799,6 +7827,7 @@ function buildGpuStatic() {
       driver_version: r[4] || null, vbios: r[5] || null, compute_cap: r[6] || null,
       gen_max: gpuNum(r[7]), width_max: gpuNum(r[8]),
       power_limit: gpuNum(r[9]), power_min_limit: gpuNum(r[10]), power_max_limit: gpuNum(r[11]),
+      sm_count: smMap[String(gpuNum(r[0]))] != null ? gpuNum(smMap[String(gpuNum(r[0]))]) : null, // [sm-count 1006]
     };
     if (g.index == null) continue;
     out.gpus.push(g);

@@ -1457,11 +1457,11 @@
                             <thead><tr>
                                 <th>GPU / 型号</th><th>PCI 地址 / UUID</th><th style="text-align:center">PCIe 链路（当前 → 能力）</th><th style="text-align:right">PCIe 流量 / 占用</th>
                                 <th style="text-align:right">显存</th><th style="text-align:right">利用率 (GPU/MEM)</th><th style="text-align:right">温度 核心/显存</th>
-                                <th style="text-align:right">功耗 / 限值</th><th style="text-align:right">SM 频率</th><th style="text-align:center">P 状态</th>
+                                <th style="text-align:right">功耗 / 限值</th><th style="text-align:right">SM 频率</th><th style="text-align:center">SM 数量</th><th style="text-align:center">P 状态</th>
                                 <th>驱动 / VBIOS</th><th style="text-align:center">计算能力</th>
                             </tr></thead>
                             <tbody id="storageGpuRows">
-                                <tr><td colspan="12" style="text-align:center;padding:24px;color:var(--text-tertiary)">加载中...</td></tr>
+                                <tr><td colspan="13" style="text-align:center;padding:24px;color:var(--text-tertiary)">加载中...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -2033,7 +2033,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20261006-r10'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20261006-r11'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -5793,7 +5793,7 @@ function renderStorageGpuCard(d) {
     }
     if (!gpus.length) {
         kpiBox.innerHTML = '<div style="color:var(--text-tertiary);font-size:12px;padding:4px 0">' + esc((d && d.error) || 'nvidia-smi 不可用或无 NVIDIA GPU') + '</div>';
-        rows.innerHTML = '<tr><td colspan="12" style="text-align:center;padding:24px;color:var(--text-tertiary)">无 GPU 数据</td></tr>';
+        rows.innerHTML = '<tr><td colspan="13" style="text-align:center;padding:24px;color:var(--text-tertiary)">无 GPU 数据</td></tr>';
         return;
     }
     const kpiCard = (label, value, sub, color, subColor) =>
@@ -5832,7 +5832,7 @@ function renderStorageGpuCard(d) {
         const bwColor = (g.rx_pct == null && g.tx_pct == null) ? 'var(--text-tertiary)' : (bwPeak >= 80 ? 'var(--red)' : (bwPeak >= 50 ? 'var(--orange)' : 'var(--blue)'));
         return `<div style="border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px">
             <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:6px">
-                <div style="font-size:12px;font-weight:600">GPU ${g.index} · ${esc(g.name || '--')}</div>
+                <div style="font-size:12px;font-weight:600">GPU ${g.index} · ${esc(g.name || '--')}${g.sm_count != null ? (' <span style="font-weight:400;color:var(--text-tertiary);font-size:11px">· ' + g.sm_count + ' SM</span>') : ''}</div>
                 <div style="font-size:10px;color:var(--text-tertiary);font-family:monospace">${esc(g.pci_bus_id || '')}${g.fan != null ? (' · 风扇 ' + g.fan + '%') : ''}</div>
             </div>
             <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-7 gap-2">
@@ -5859,6 +5859,8 @@ function renderStorageGpuCard(d) {
         const theoTxtR = g.pcie_theo_mbs != null ? (g.pcie_theo_mbs >= 1024 ? (g.pcie_theo_mbs / 1024).toFixed(1) + ' GB/s' : g.pcie_theo_mbs + ' MB/s') : '--';
         const bwPeakR = Math.max(g.rx_pct || 0, g.tx_pct || 0);
         const bwColorR = (g.rx_pct == null && g.tx_pct == null) ? 'var(--blue)' : (bwPeakR >= 80 ? 'var(--red)' : (bwPeakR >= 50 ? 'var(--orange)' : 'var(--blue)'));
+        // [sm-count 1006] SM 数量（NVML nvmlDeviceGetNumGpuCores，后端静态缓存 sm_count；取不到显示 --）
+        const smCntTxt = g.sm_count != null ? String(g.sm_count) : '--';
         const degNote = (wDeg || gDeg)
             ? ' <span style="color:var(--orange)">⚠ 链路降级' + (wDeg ? '（x' + g.width_max + '→x' + g.width_current + '）' : '') + (gDeg ? '（Gen' + g.gen_max + '→Gen' + g.gen_current + '）' : '') + '</span>'
             : ' <span style="color:var(--green)">无降级</span>';
@@ -5876,6 +5878,7 @@ function renderStorageGpuCard(d) {
             <td style="text-align:right;font-variant-numeric:tabular-nums;color:${tempColor(g.temp)}">${g.temp != null ? g.temp.toFixed(0) + ' °C' : '--'}<div style="font-size:11px;color:${g.temp_mem != null ? tempMemColor(g.temp_mem) : 'var(--text-tertiary)'}">显存 ${g.temp_mem != null ? g.temp_mem.toFixed(0) + ' °C' : '--'}</div></td>
             <td style="text-align:right;font-variant-numeric:tabular-nums;font-size:12px">${g.power_draw != null ? g.power_draw.toFixed(1) + ' W' : '--'}<div style="font-size:11px;color:var(--text-tertiary)">限值 ${g.power_limit != null ? g.power_limit.toFixed(0) : '--'} W${(g.power_min_limit != null && g.power_max_limit != null) ? ' (' + g.power_min_limit.toFixed(0) + '–' + g.power_max_limit.toFixed(0) + ')' : ''}</div></td>
             <td style="text-align:right;font-variant-numeric:tabular-nums;font-size:12px">${g.sm_clock != null ? g.sm_clock + ' MHz' : '--'}<div style="font-size:11px;color:var(--text-tertiary)">最大 ${g.sm_clock_max != null ? g.sm_clock_max + ' MHz' : '--'}</div></td>
+            <td style="text-align:center;font-variant-numeric:tabular-nums;font-size:12px">${smCntTxt}</td>
             <td style="text-align:center;font-size:12px;font-family:monospace">${esc(g.pstate || '--')}</td>
             <td style="font-size:11px">${esc(g.driver_version || '--')}<div style="color:var(--text-tertiary);font-family:monospace">VBIOS ${esc(g.vbios || '--')}</div></td>
             <td style="text-align:center;font-size:12px;font-family:monospace">${esc(g.compute_cap || '--')}</td>

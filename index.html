@@ -2033,7 +2033,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20261006-r12'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20261006-r13'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -5832,7 +5832,7 @@ function renderStorageGpuCard(d) {
         const bwColor = (g.rx_pct == null && g.tx_pct == null) ? 'var(--text-tertiary)' : (bwPeak >= 80 ? 'var(--red)' : (bwPeak >= 50 ? 'var(--orange)' : 'var(--blue)'));
         return `<div style="border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px">
             <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:6px">
-                <div style="font-size:12px;font-weight:600">GPU ${g.index} · ${esc(g.name || '--')}${g.sm_count != null ? (' <span style="font-weight:400;color:var(--text-tertiary);font-size:11px" title="SM 数 = CUDA 核数 ' + g.cuda_cores + ' ÷ 每 SM 核数（按计算能力折算）">' + g.sm_count + ' SM</span>') : ''}</div>
+                <div style="font-size:12px;font-weight:600">GPU ${g.index} · ${esc(g.name || '--')}${g.sm_count != null ? (' <span style="font-weight:400;color:var(--text-tertiary);font-size:11px" title="真实 SM 数（CUDA 属性直读，含 SM-RECONFIG 解锁态）；CUDA 核数为 NVML 静态表">' + g.sm_count + ' SM</span>') : ''}</div>
                 <div style="font-size:10px;color:var(--text-tertiary);font-family:monospace">${esc(g.pci_bus_id || '')}${g.fan != null ? (' · 风扇 ' + g.fan + '%') : ''}</div>
             </div>
             <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-7 gap-2">
@@ -5859,8 +5859,8 @@ function renderStorageGpuCard(d) {
         const theoTxtR = g.pcie_theo_mbs != null ? (g.pcie_theo_mbs >= 1024 ? (g.pcie_theo_mbs / 1024).toFixed(1) + ' GB/s' : g.pcie_theo_mbs + ' MB/s') : '--';
         const bwPeakR = Math.max(g.rx_pct || 0, g.tx_pct || 0);
         const bwColorR = (g.rx_pct == null && g.tx_pct == null) ? 'var(--blue)' : (bwPeakR >= 80 ? 'var(--red)' : (bwPeakR >= 50 ? 'var(--orange)' : 'var(--blue)'));
-        // [sm-count 1006 rev2] SM 数 = NVML CUDA 核数 ÷ 每 SM 核数（后端按计算能力折算，sm_count）；
-        // 副值显示 CUDA 核数原始值 cuda_cores，折算不了（除不尽/cc 未知）时主值退回核数并标注
+        // [sm-count 1006 rev3] sm_count = CUDA 属性直读真实 SM 数（含 SM-RECONFIG 解锁态）；
+        // 副值 cuda_cores = NVML 固件静态表核数（不随解锁变化，仅规格参考）
         const smCntMain = g.sm_count != null ? String(g.sm_count) : (g.cuda_cores != null ? (g.cuda_cores + ' 核') : '--');
         const smCntSub = g.sm_count != null && g.cuda_cores != null ? (g.cuda_cores + ' CUDA核') : '';
         const degNote = (wDeg || gDeg)

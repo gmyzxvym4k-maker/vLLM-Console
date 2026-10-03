@@ -7788,32 +7788,44 @@ function gpuNum(v) {
 }
 const GPU_STATIC_FIELDS = 'index,name,uuid,pci.bus_id,driver_version,vbios_version,compute_cap,pcie.link.gen.max,pcie.link.width.max,power.limit,power.min_limit,power.max_limit';
 const GPU_LIVE_FIELDS = 'index,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,temperature.memory,power.draw,pstate,clocks.sm,clocks.max.sm,pcie.link.gen.current,pcie.link.width.current,fan.speed';
-// [sm-count 1006 rev2] SM 数量：nvidia-smi --query-gpu 无此字段，NVML 也没有直接的 SM 数 API——
-// nvmlDeviceGetNumGpuCores 的语义是 **CUDA 核心数**（文档原文 "Retrieve the number of CUDA cores"），
-// 直接显示会得到 4736 这种误导值。正确口径 = CUDA 核数 ÷ 每 SM 核数，每 SM 核数按计算能力查表：
-//   cc<2.0=32；2.x Fermi=48/32；3.x Kepler=192/96；5.x Maxwell GM2xx=128；6.x Pascal=64；
-//   7.x Volta/Turing=64；8.x Ampere 桌面与专业卡(GA10x)=128、GH100/Ada(8.9)=128；9.x Hopper/Blackwell=128。
-// 采集用 python3 ctypes 直调 libnvidia-ml.so.1（不依赖 pynvml 包），一次进程枚举全部卡输出 JSON；
-// 失败/无 python3 → 返回 {}，前端显示 "--"，绝不让 GPU 静态信息整体构建失败。
+// [sm-count 1006 rev3] SM 数量：唯一权威源 = CUDA Driver API cuDeviceGetAttribute(
+// CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT=16)——直读驱动当前生效的 SM 拓扑，能反映
+// cmpunlocker SM-RECONFIG 解锁（本机 10-03 实测：解锁后该属性=74）。
+// 走过的弯路（勿再犯）：① rev1 把 NVML nvmlDeviceGetNumGpuCores 当 SM 数显示 → 它是 CUDA
+// 核数（4736）；② rev2 按「cc 查表每 SM 核数」折算 → GA102 每 SM 实为 64 核（74×64=4736，
+// 我误按 128 折成 37），且该字段是固件静态表、解锁前后纹丝不动，折算思路根本不成立。
+// 采集用 python3 ctypes 直调 libcuda.so.1（不依赖 torch/pynvml），一次进程枚举全部卡输出
+// JSON；失败/无 python3 → 返回 {}，前端显示 "--"，绝不让 GPU 静态信息整体构建失败。
 // 结果并入 __gpuStatic 的 5min 缓存，无常离子进程负担。
-const GPU_CORES_PER_SM = (cc) => {
-  if (!cc) return null;
-  const [mj, mn] = String(cc).split('.').map((v) => parseInt(v, 10));
-  if (!Number.isFinite(mj)) return null;
-  if (mj >= 9) return 128;
-  if (mj === 8) return mn >= 0 ? 128 : null; // GH100(8.9)/Ada(8.9)/GA10x(8.6) 桌面专业均 128；8.0 A100=108 也是 128/SM
-  if (mj === 7) return 64;                   // Volta / Turing
-  if (mj === 6) return 64;                   // Pascal
-  if (mj === 5) return 128;                  // Maxwell GM2xx（GM10x=32 罕见，不细究）
-  if (mj === 3) return mn === 5 ? 192 : 96;  // Kepler
-  if (mj === 2) return mn === 0 ? 48 : 32;   // Fermi
-  if (mj === 1) return 32;
-  return null;
-};
-function gpuSmCounts() {
+// 注意：cuInit 会建 CUDA 上下文（轻量、毫秒级、不占显存池），只在静态缓存重建时发生（5min 一次）。
+function gpuPyCollect(py) {
   const { execFileSync } = require('child_process');
-  const py = [
-    'import ctypes,json,sys',
+  try {
+    const out = execFileSync('python3', ['-c', py], { timeout: 5000, encoding: 'utf8' });
+    const j = JSON.parse(out.trim().split('\n').pop());
+    return (j && typeof j === 'object') ? j : {};
+  } catch (e) { return {}; }
+}
+function gpuSmCounts() {
+  return gpuPyCollect([
+    'import ctypes,json',
+    'cu=ctypes.CDLL("libcuda.so.1")',
+    'cu.cuInit(0)',
+    'n=ctypes.c_int()',
+    'cu.cuDeviceGetCount(ctypes.byref(n))',
+    'o={}',
+    'for i in range(n.value):',
+    '    v=ctypes.c_int()',
+    '    try:',
+    '        if cu.cuDeviceGetAttribute(ctypes.byref(v), 16, i)==0: o[str(i)]=v.value',
+    '    except Exception: pass',
+    'print(json.dumps(o))',
+  ].join('\n'));
+}
+// NVML 固件静态表的 CUDA 核数（仅作规格参考，不随 SM-RECONFIG 解锁变化）
+function gpuCoresNVML() {
+  return gpuPyCollect([
+    'import ctypes,json',
     'm=ctypes.CDLL("libnvidia-ml.so.1")',
     'm.nvmlInit_v2()',
     'n=ctypes.c_uint()',
@@ -7826,18 +7838,14 @@ function gpuSmCounts() {
     '        if m.nvmlDeviceGetNumGpuCores(h, ctypes.byref(c))==0: o[str(i)]=c.value',
     '    except Exception: pass',
     'print(json.dumps(o))',
-  ].join('\n');
-  try {
-    const out = execFileSync('python3', ['-c', py], { timeout: 5000, encoding: 'utf8' });
-    const j = JSON.parse(out.trim().split('\n').pop());
-    return (j && typeof j === 'object') ? j : {};
-  } catch (e) { return {}; }
+  ].join('\n'));
 }
 function buildGpuStatic() {
   const out = { supported: false, gpus: [], driver_version: null };
   let rows;
   try { rows = gpuParseRows(gpuSmi(GPU_STATIC_FIELDS)); } catch (e) { out.error = 'nvidia-smi 不可用: ' + (e && e.message || e); return out; }
-  const smMap = gpuSmCounts(); // [sm-count 1006]
+  const smMap = gpuSmCounts(); // [sm-count 1006 rev3] CUDA 属性直读真实 SM 数
+  const coreMap = gpuCoresNVML(); // [sm-count 1006 rev3] NVML 静态 CUDA 核数表
   for (const r of rows) {
     // [index,name,uuid,bus_id,driver,vbios,cc,gen_max,width_max,pl,pl_min,pl_max]
     const g = {
@@ -7845,13 +7853,10 @@ function buildGpuStatic() {
       driver_version: r[4] || null, vbios: r[5] || null, compute_cap: r[6] || null,
       gen_max: gpuNum(r[7]), width_max: gpuNum(r[8]),
       power_limit: gpuNum(r[9]), power_min_limit: gpuNum(r[10]), power_max_limit: gpuNum(r[11]),
-      // [sm-count 1006 rev2] cuda_cores=NVML 原始值；sm_count=折算 SM 数（除不尽时为 null，只显核数）
-      cuda_cores: smMap[String(gpuNum(r[0]))] != null ? gpuNum(smMap[String(gpuNum(r[0]))]) : null,
-      sm_count: (() => {
-        const cores = smMap[String(gpuNum(r[0]))] != null ? gpuNum(smMap[String(gpuNum(r[0]))]) : null;
-        const cps = GPU_CORES_PER_SM(r[6]);
-        return (cores != null && cps && cores % cps === 0) ? cores / cps : null;
-      })(),
+      // [sm-count 1006 rev3] sm_count = CUDA 属性直读（真实拓扑，含 SM-RECONFIG 解锁）；
+      // cuda_cores = NVML 固件静态表（不随解锁变化，仅作规格参考）
+      sm_count: smMap[String(gpuNum(r[0]))] != null ? gpuNum(smMap[String(gpuNum(r[0]))]) : null,
+      cuda_cores: coreMap[String(gpuNum(r[0]))] != null ? gpuNum(coreMap[String(gpuNum(r[0]))]) : null,
     };
     if (g.index == null) continue;
     out.gpus.push(g);

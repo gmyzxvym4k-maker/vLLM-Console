@@ -4470,7 +4470,28 @@ function v3TouchRow(lv, st) {
   // g 冻结 >2.5s（客户端断连/被抢占/引擎停顿，行未 done 但不再产出）：
   // 均值钉住在最后活跃值——否则分母随时间增长把显示稀释成假低速（实测 117→16）。
   const gAge = Date.now() / 1000 - (st.gLastT || st.obsT || 0);
-  if (gAge > 2.5) { lv.v3seenAt = Date.now(); return; }
+  if (gAge > 2.5) {
+    // [v3avg-pin-1003] 钉住 = 把最后活跃时刻算出的均值固化为终值（v3AvgFrozen），
+    // 此后不再重算。旧版只"跳过赋值"，留下两个数值缺陷：
+    //  ① 冻结前最后一次赋值用的是冻结瞬间的分母，之后 g 已终、行滞留期间
+    //     （gauge 滞后 + goneAt 冻结显示 ≤15s）任何再进本函数的路径都会让
+    //     分母继续增长 → 显示被稀释成十几 tok/s 的假低速；
+    //  ② 行被别的 rid 接管复用（bindRow 换绑）时旧 v3Avg 残留显示。
+    // 缺 v3AvgFrozen（首轮即冻结：接管时 g 已停）→ 回落最后活跃时刻口径。
+    if (lv.v3AvgFrozen === undefined) {
+      const tEnd = st.gLastT || st.obsT || (Date.now() / 1000);
+      if (st.firstT) {
+        const den = tEnd - st.firstT;
+        lv.v3AvgFrozen = den >= 0.5 ? st.g / den : undefined;
+      } else {
+        const den = tEnd - st.obsT;
+        lv.v3AvgFrozen = den >= 0.5 ? Math.max(0, st.g - st.g0) / den : undefined;
+      }
+    }
+    lv.v3Avg = lv.v3AvgFrozen;
+    lv.v3seenAt = Date.now();
+    return;
+  }
   if (st.firstT) {
     lv.decodeStart = Math.round(st.firstT * 1000);
     const den = (Date.now() - lv.decodeStart) / 1000;
@@ -4482,6 +4503,7 @@ function v3TouchRow(lv, st) {
     const den = (Date.now() / 1000 - st.obsT);
     lv.v3Avg = den >= 0.5 ? Math.max(0, st.g - st.g0) / den : undefined;
   }
+  lv.v3AvgFrozen = undefined; // 活跃期清除钉住值，恢复实时重算
   lv.v3seenAt = Date.now();
 }
 
@@ -4866,7 +4888,9 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
       lv.v3rid = st.rid; lv.v3Exact = !!exact;
       // 接管过的行（曾是别的已完成请求）复位旧身份钉与 decode 起点，再按
       // 新 rid 重钉——否则 elapsed 继承旧行虚高、avg_speed 分母错。
-      if (lv.v3goneAt || (lv.v3born && lv.tokens === 0)) { lv.v3born = false; lv.decodeStart = null; }
+      // [v3avg-pin-1003] 换绑必须同时清钉住均值：否则旧请求冻结的 v3Avg 会
+      // 在新 rid 首轮活跃赋值前被显示（接管瞬间闪现别人的速度）。
+      if (lv.v3goneAt || (lv.v3born && lv.tokens === 0)) { lv.v3born = false; lv.decodeStart = null; lv.v3Avg = undefined; lv.v3AvgFrozen = undefined; }
       if (st.arrival > 0 && !lv.v3born) { lv.startedAt = Math.round(st.arrival * 1000); lv.v3born = true; } // 引擎真实进队时刻，钉一次
       // 断开 v2 时代残留的 tee 绑定（字符估算源），v3 行数值只认引擎真值
       lv.boundLive = null; lv.boundLiveId = null; lv.boundSpd = undefined;
@@ -4883,7 +4907,7 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
         // gauge 滞后会让完成行滞留数秒、avg_speed 被继续的时间分母稀释）
         lv.v3done = true;
       }
-      else { lv.v3goneAt = nowV3; lv.v3rid = null; lv.v3Exact = false; }
+      else { lv.v3goneAt = nowV3; lv.v3rid = null; lv.v3Exact = false; lv.v3AvgFrozen = undefined; } // [v3avg-pin-1003] rid 消失≠请求完成：清钉住值，行若重新绑回同一 rid（流瞬断恢复）继续实时重算
     }
     // ② 精确认领（代理流量）：taskId→crid→SSE id→rid
     for (const lv of rt.live) {

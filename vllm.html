@@ -297,65 +297,6 @@ function renderInstance(inst, mt, params, kvDet) {
   }
   html += '</div>';
 
-  // ---- MTP 投机 ----
-  html += '<div class="card"><h2>MTP 投机解码 <span class="tag">:' + port + ' · ' + esc(gpuTxt) + '</span></h2>';
-  if (drafts != null || accepted != null) {
-    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:4px 26px">'
-      + '<table><tr><th>接受率</th><th>接受长度</th><th>草稿步</th><th>草稿 token</th><th>接受 token</th></tr>'
-      + '<tr><td>' + (accRate != null ? pct(accRate) : '--') + '</td>'
-      + '<td>' + (accLen != null ? fmt(accLen, 2) : '--') + '</td>'
-      + '<td>' + fmtInt(drafts) + '</td>'
-      + '<td>' + fmtInt(draftTokens) + '</td>'
-      + '<td>' + fmtInt(accepted) + '</td></tr></table>'
-      + '<table><tr><th>TTFT 均值</th><th>TTFT P95</th><th>TPOT</th><th>E2E</th><th>排队</th></tr>'
-      + '<tr><td>' + (ttft != null ? fmt(ttft * 1000, 0) + ' ms' : '--') + '</td>'
-      + '<td>' + (ttftP95 != null ? fmt(ttftP95 * 1000, 0) + ' ms' : '--') + '</td>'
-      + '<td>' + (tpot != null ? fmt(tpot * 1000, 1) + ' ms' : '--') + '</td>'
-      + '<td>' + (e2e != null ? fmt(e2e, 2) + ' s' : '--') + '</td>'
-      + '<td>' + (qt != null ? fmt(qt * 1000, 0) + ' ms' : '--') + '</td></tr></table>'
-      + '<table><tr><th>Prefill 耗时</th><th>Decode 耗时</th><th>抢占次数</th><th>MM 缓存命中</th></tr>'
-      + '<tr><td>' + (pfT != null ? fmt(pfT * 1000, 0) + ' ms' : '--') + '</td>'
-      + '<td>' + (deT != null ? fmt(deT, 2) + ' s' : '--') + '</td>'
-      + '<td style="color:' + (preempt > 0 ? 'var(--orange)' : 'inherit') + '">' + fmtInt(preempt) + '</td>'
-      + '<td>' + (mmQ ? fmtInt(mmHits) + ' / ' + fmtInt(mmQ) : '--') + '</td></tr></table>'
-      + '</div>';
-    if (perPos.length) {
-      html += '<div style="font-size:11px;color:var(--text-tertiary);margin-top:10px">逐位接受率（position 0 = 第一步草稿；'
-        + '分母=草稿步数 ' + fmtInt(drafts) + '）</div><div class="posbar">';
-      for (var pi = 0; pi < perPos.length; pi++) {
-        var pp2 = perPos[pi];
-        var rate = drafts > 0 ? Math.min(1, pp2.v / drafts) : null;
-        html += '<div class="pb"><div class="pl"><span>pos ' + pp2.pos + '</span><span>'
-          + (rate != null ? pct(rate, 1) : '--') + '</span></div>'
-          + '<div class="pt"><i style="width:' + (rate == null ? 0 : (rate * 100).toFixed(1)) + '%"></i></div></div>';
-      }
-      html += '</div>';
-    }
-  } else {
-    html += '<div style="font-size:12px;color:var(--text-tertiary)">本实例未启用投机解码（无 spec_decode_* 指标）</div>';
-  }
-  html += '</div>';
-
-  // ---- 累计吞吐 ----
-  html += '<div class="card"><h2>累计吞吐（输入按来源拆分 + 请求成败）</h2>';
-  html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:4px 26px">'
-    + '<table><tr><th>Prompt 总量</th><th>本地重算</th><th>显存命中</th><th>二级档回载</th></tr>'
-    + '<tr><td>' + fmtInt(cur.prompt) + ' tok</td>'
-    + '<td>' + fmtInt(cur.compute) + (cur.prompt > 0 && cur.compute != null ? '（' + fmt(cur.compute / cur.prompt * 100, 1) + '%）' : '') + '</td>'
-    + '<td>' + fmtInt(cur.cacheHit) + (cur.prompt > 0 && cur.cacheHit != null ? '（' + fmt(cur.cacheHit / cur.prompt * 100, 1) + '%）' : '') + '</td>'
-    + '<td>' + fmtInt(cur.extHit) + '</td></tr></table>'
-    + '<table><tr><th>生成总量</th><th>成功(stop)</th><th>截断(length)</th><th>中止/错误</th></tr>'
-    + '<tr><td>' + fmtInt(cur.gen) + ' tok</td>'
-    + '<td>' + fmtInt(okStop) + '</td>'
-    + '<td style="color:' + (okLen > 0 ? 'var(--orange)' : 'inherit') + '">' + fmtInt(okLen) + '</td>'
-    + '<td style="color:' + ((okAbort + okErr) > 0 ? 'var(--red)' : 'inherit') + '">' + fmtInt(okAbort) + ' / ' + fmtInt(okErr) + '</td></tr></table>'
-    + '<table><tr><th>请求总数</th><th>平均输出/请求</th><th>GPU 估算 FLOPs</th><th>估算读/写</th></tr>'
-    + '<tr><td>' + fmtInt(done) + '</td>'
-    + '<td>' + (done > 0 ? fmt(cur.gen / done, 0) + ' tok' : '--') + '</td>'
-    + '<td>' + (flops != null ? (flops / 1e15).toFixed(2) + ' PFLOP' : '--') + '</td>'
-    + '<td>' + (rdBytes != null ? (rdBytes / 1e9).toFixed(1) + ' / ' + (wrBytes != null ? (wrBytes / 1e9).toFixed(1) : '--') + ' GB' : '--') + '</td></tr></table>'
-    + '</div></div>';
-
   // ---- 二级缓存（vLLM 专属：CPU KV offload，详细数据源 /v1/internal/kv-detail）----
   // 概览条 = 容量/驻留/命中率；明细表 = 配置 / 驻留与内存 / 命中与流量 / 速率。
   // kvDet 缺失（接口异常/首轮未到）时退回 external_prefix_cache 计数简表，不留白。
@@ -448,6 +389,66 @@ function renderInstance(inst, mt, params, kvDet) {
     }
     html += '</div>';
   }
+
+  // ---- MTP 投机 ----
+  html += '<div class="card"><h2>MTP 投机解码 <span class="tag">:' + port + ' · ' + esc(gpuTxt) + '</span></h2>';
+  if (drafts != null || accepted != null) {
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:4px 26px">'
+      + '<table><tr><th>接受率</th><th>接受长度</th><th>草稿步</th><th>草稿 token</th><th>接受 token</th></tr>'
+      + '<tr><td>' + (accRate != null ? pct(accRate) : '--') + '</td>'
+      + '<td>' + (accLen != null ? fmt(accLen, 2) : '--') + '</td>'
+      + '<td>' + fmtInt(drafts) + '</td>'
+      + '<td>' + fmtInt(draftTokens) + '</td>'
+      + '<td>' + fmtInt(accepted) + '</td></tr></table>'
+      + '<table><tr><th>TTFT 均值</th><th>TTFT P95</th><th>TPOT</th><th>E2E</th><th>排队</th></tr>'
+      + '<tr><td>' + (ttft != null ? fmt(ttft * 1000, 0) + ' ms' : '--') + '</td>'
+      + '<td>' + (ttftP95 != null ? fmt(ttftP95 * 1000, 0) + ' ms' : '--') + '</td>'
+      + '<td>' + (tpot != null ? fmt(tpot * 1000, 1) + ' ms' : '--') + '</td>'
+      + '<td>' + (e2e != null ? fmt(e2e, 2) + ' s' : '--') + '</td>'
+      + '<td>' + (qt != null ? fmt(qt * 1000, 0) + ' ms' : '--') + '</td></tr></table>'
+      + '<table><tr><th>Prefill 耗时</th><th>Decode 耗时</th><th>抢占次数</th><th>MM 缓存命中</th></tr>'
+      + '<tr><td>' + (pfT != null ? fmt(pfT * 1000, 0) + ' ms' : '--') + '</td>'
+      + '<td>' + (deT != null ? fmt(deT, 2) + ' s' : '--') + '</td>'
+      + '<td style="color:' + (preempt > 0 ? 'var(--orange)' : 'inherit') + '">' + fmtInt(preempt) + '</td>'
+      + '<td>' + (mmQ ? fmtInt(mmHits) + ' / ' + fmtInt(mmQ) : '--') + '</td></tr></table>'
+      + '</div>';
+    if (perPos.length) {
+      html += '<div style="font-size:11px;color:var(--text-tertiary);margin-top:10px">逐位接受率（position 0 = 第一步草稿；'
+        + '分母=草稿步数 ' + fmtInt(drafts) + '）</div><div class="posbar">';
+      for (var pi = 0; pi < perPos.length; pi++) {
+        var pp2 = perPos[pi];
+        var rate = drafts > 0 ? Math.min(1, pp2.v / drafts) : null;
+        html += '<div class="pb"><div class="pl"><span>pos ' + pp2.pos + '</span><span>'
+          + (rate != null ? pct(rate, 1) : '--') + '</span></div>'
+          + '<div class="pt"><i style="width:' + (rate == null ? 0 : (rate * 100).toFixed(1)) + '%"></i></div></div>';
+      }
+      html += '</div>';
+    }
+  } else {
+    html += '<div style="font-size:12px;color:var(--text-tertiary)">本实例未启用投机解码（无 spec_decode_* 指标）</div>';
+  }
+  html += '</div>';
+
+  // ---- 累计吞吐 ----
+  html += '<div class="card"><h2>累计吞吐（输入按来源拆分 + 请求成败）</h2>';
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:4px 26px">'
+    + '<table><tr><th>Prompt 总量</th><th>本地重算</th><th>显存命中</th><th>二级档回载</th></tr>'
+    + '<tr><td>' + fmtInt(cur.prompt) + ' tok</td>'
+    + '<td>' + fmtInt(cur.compute) + (cur.prompt > 0 && cur.compute != null ? '（' + fmt(cur.compute / cur.prompt * 100, 1) + '%）' : '') + '</td>'
+    + '<td>' + fmtInt(cur.cacheHit) + (cur.prompt > 0 && cur.cacheHit != null ? '（' + fmt(cur.cacheHit / cur.prompt * 100, 1) + '%）' : '') + '</td>'
+    + '<td>' + fmtInt(cur.extHit) + '</td></tr></table>'
+    + '<table><tr><th>生成总量</th><th>成功(stop)</th><th>截断(length)</th><th>中止/错误</th></tr>'
+    + '<tr><td>' + fmtInt(cur.gen) + ' tok</td>'
+    + '<td>' + fmtInt(okStop) + '</td>'
+    + '<td style="color:' + (okLen > 0 ? 'var(--orange)' : 'inherit') + '">' + fmtInt(okLen) + '</td>'
+    + '<td style="color:' + ((okAbort + okErr) > 0 ? 'var(--red)' : 'inherit') + '">' + fmtInt(okAbort) + ' / ' + fmtInt(okErr) + '</td></tr></table>'
+    + '<table><tr><th>请求总数</th><th>平均输出/请求</th><th>GPU 估算 FLOPs</th><th>估算读/写</th></tr>'
+    + '<tr><td>' + fmtInt(done) + '</td>'
+    + '<td>' + (done > 0 ? fmt(cur.gen / done, 0) + ' tok' : '--') + '</td>'
+    + '<td>' + (flops != null ? (flops / 1e15).toFixed(2) + ' PFLOP' : '--') + '</td>'
+    + '<td>' + (rdBytes != null ? (rdBytes / 1e9).toFixed(1) + ' / ' + (wrBytes != null ? (wrBytes / 1e9).toFixed(1) : '--') + ' GB' : '--') + '</td></tr></table>'
+    + '</div></div>';
+
 
   // ---- 运行时参数 ----
   html += '<div class="card"><h2>运行时参数（来自启动命令 / vLLM 0.30.0）</h2>';

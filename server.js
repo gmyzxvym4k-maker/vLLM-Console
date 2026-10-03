@@ -7788,10 +7788,28 @@ function gpuNum(v) {
 }
 const GPU_STATIC_FIELDS = 'index,name,uuid,pci.bus_id,driver_version,vbios_version,compute_cap,pcie.link.gen.max,pcie.link.width.max,power.limit,power.min_limit,power.max_limit';
 const GPU_LIVE_FIELDS = 'index,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,temperature.memory,power.draw,pstate,clocks.sm,clocks.max.sm,pcie.link.gen.current,pcie.link.width.current,fan.speed';
-// [sm-count 1006] SM 数量：nvidia-smi --query-gpu 无此字段（count.multiProcessorCount 非法），
-// 唯一原生通路 = NVML nvmlDeviceGetNumGpuCores。这里用 ctypes 直调 libnvidia-ml.so.1（不依赖
-// pynvml 包），一次 python 进程枚举全部卡输出 JSON；失败/无 python3 → 返回 {}，前端显示 "--"，
-// 绝不让 GPU 静态信息整体构建失败。结果并入 __gpuStatic 的 5min 缓存，无常离子进程负担。
+// [sm-count 1006 rev2] SM 数量：nvidia-smi --query-gpu 无此字段，NVML 也没有直接的 SM 数 API——
+// nvmlDeviceGetNumGpuCores 的语义是 **CUDA 核心数**（文档原文 "Retrieve the number of CUDA cores"），
+// 直接显示会得到 4736 这种误导值。正确口径 = CUDA 核数 ÷ 每 SM 核数，每 SM 核数按计算能力查表：
+//   cc<2.0=32；2.x Fermi=48/32；3.x Kepler=192/96；5.x Maxwell GM2xx=128；6.x Pascal=64；
+//   7.x Volta/Turing=64；8.x Ampere 桌面与专业卡(GA10x)=128、GH100/Ada(8.9)=128；9.x Hopper/Blackwell=128。
+// 采集用 python3 ctypes 直调 libnvidia-ml.so.1（不依赖 pynvml 包），一次进程枚举全部卡输出 JSON；
+// 失败/无 python3 → 返回 {}，前端显示 "--"，绝不让 GPU 静态信息整体构建失败。
+// 结果并入 __gpuStatic 的 5min 缓存，无常离子进程负担。
+const GPU_CORES_PER_SM = (cc) => {
+  if (!cc) return null;
+  const [mj, mn] = String(cc).split('.').map((v) => parseInt(v, 10));
+  if (!Number.isFinite(mj)) return null;
+  if (mj >= 9) return 128;
+  if (mj === 8) return mn >= 0 ? 128 : null; // GH100(8.9)/Ada(8.9)/GA10x(8.6) 桌面专业均 128；8.0 A100=108 也是 128/SM
+  if (mj === 7) return 64;                   // Volta / Turing
+  if (mj === 6) return 64;                   // Pascal
+  if (mj === 5) return 128;                  // Maxwell GM2xx（GM10x=32 罕见，不细究）
+  if (mj === 3) return mn === 5 ? 192 : 96;  // Kepler
+  if (mj === 2) return mn === 0 ? 48 : 32;   // Fermi
+  if (mj === 1) return 32;
+  return null;
+};
 function gpuSmCounts() {
   const { execFileSync } = require('child_process');
   const py = [
@@ -7827,7 +7845,13 @@ function buildGpuStatic() {
       driver_version: r[4] || null, vbios: r[5] || null, compute_cap: r[6] || null,
       gen_max: gpuNum(r[7]), width_max: gpuNum(r[8]),
       power_limit: gpuNum(r[9]), power_min_limit: gpuNum(r[10]), power_max_limit: gpuNum(r[11]),
-      sm_count: smMap[String(gpuNum(r[0]))] != null ? gpuNum(smMap[String(gpuNum(r[0]))]) : null, // [sm-count 1006]
+      // [sm-count 1006 rev2] cuda_cores=NVML 原始值；sm_count=折算 SM 数（除不尽时为 null，只显核数）
+      cuda_cores: smMap[String(gpuNum(r[0]))] != null ? gpuNum(smMap[String(gpuNum(r[0]))]) : null,
+      sm_count: (() => {
+        const cores = smMap[String(gpuNum(r[0]))] != null ? gpuNum(smMap[String(gpuNum(r[0]))]) : null;
+        const cps = GPU_CORES_PER_SM(r[6]);
+        return (cores != null && cps && cores % cps === 0) ? cores / cps : null;
+      })(),
     };
     if (g.index == null) continue;
     out.gpus.push(g);

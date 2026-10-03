@@ -84,7 +84,14 @@
 //  · cache_config_info 是「标签承载配置」的 gauge，配置要从标签字典读，不是从值读。
 
 var POLL_MS = 2000;
+// model-manager 超时：后端已加缓存（正常 <100ms），但仍可能被引擎重载/GPU 采样拖慢。
+// 取 12s（> 后端实测最差 6.2s）以免「后端其实有数据、前端先放弃」造成的假空态。
+var MM_TIMEOUT_MS = 12000;
 var _timer = null, _busy = false, _lastTickAt = 0;
+var _lastGood = [];        // 上一次成功发现的实例列表（取数失败时保留画面用）
+var _lastGoodAt = 0;       // 上一次成功取数的时刻
+var _emptySince = 0;       // 「后端返回空列表」起始时刻（宽限期判抖动用，0=未在观察）
+var EMPTY_GRACE_MS = 6000; // 空列表连续这么久才认定为「实例已停止」
 var _prev = {};          // port -> { t, gen, promptCompute, ... }（差值用）
 var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); };
 
@@ -484,7 +491,7 @@ function renderInstance(inst, mt, params, kvDet) {
   return html;
 }
 
-function render(mmInsts, metricMap, paramMap, kvMap, mmErr) {
+function render(mmInsts, metricMap, paramMap, kvMap, mmErr, stale) {
   var body = document.getElementById('body');
   var bar = document.getElementById('instBar');
   var notes = document.getElementById('notes');
@@ -497,7 +504,11 @@ function render(mmInsts, metricMap, paramMap, kvMap, mmErr) {
       }).join('')
       + mmInsts.filter(function (i) { return i.runtime !== 'vllm'; })
         .map(function (i) { return '<span class="inst-badge off">' + esc(i.runtime || '?') + ' :' + i.port + '</span>'; }).join('')
-      : '<span class="inst-badge off">无运行中实例</span>';
+      : (stale
+        // 取数失败 ≠ 没有实例：保留上一帧的实例徽章语义，这里只在徽章位说明状态，
+        // 正文由下方 stale 分支保留旧内容（10-03 修复：原先此处直接打「无运行中实例」）
+        ? '<span class="inst-badge off">数据获取失败 · 保留上次画面</span>'
+        : '<span class="inst-badge off">无运行中实例</span>');
   });
   safeRun(function () {
     var n = '';
@@ -510,6 +521,17 @@ function render(mmInsts, metricMap, paramMap, kvMap, mmErr) {
     notes.innerHTML = n;
   });
   if (!vlInsts.length) {
+    if (stale) {
+      // 本轮没拿到可信数据：正文保持上一帧原样（绝不能用空 metricMap/paramMap 重渲染，
+      // parseMetrics(undefined) 会抛错把整轮 tick 打死、时间戳也停更）。
+      // 若从未成功过（无上一帧），显示明确的「取不到数据」占位，而不是「无运行中实例」。
+      if (!document.getElementById('body').innerHTML) {
+        document.getElementById('body').innerHTML =
+          '<div class="empty"><div class="big">⚠️</div>暂时取不到实例数据（model-manager 超时或未响应）。'
+          + '<div style="margin-top:6px;font-size:12px">页面每 2s 自动重试，恢复后自动显示。</div></div>';
+      }
+      return;
+    }
     body.innerHTML = '<div class="empty"><div class="big">🟦</div>当前没有运行中的 vLLM 实例。'
       + '<div style="margin-top:6px;font-size:12px">在「模型管理」把运行时选为 vLLM 启动实例后，本页自动出现其专属指标。</div>'
       + '<button onclick="try{parent.switchTab(\'models\')}catch(e){}">去模型管理</button></div>';
@@ -525,12 +547,34 @@ function render(mmInsts, metricMap, paramMap, kvMap, mmErr) {
   body.innerHTML = html;
 }
 
+// 保留上一帧画面的降级渲染：正文一律不动（避免用空数据重渲染抛错打死整轮 tick），
+// 只更新徽章与提示条，时间戳改标「上次成功」时刻。
+function renderStale(msg) {
+  safeRun(function () {
+    var bar = document.getElementById('instBar');
+    if (_lastGood.length) {
+      bar.innerHTML = _lastGood.filter(function (i) { return i.runtime === 'vllm'; }).map(function (i) {
+        return '<span class="inst-badge off">vllm :' + i.port + ' · ' + esc(i.model || '?') + ' · 数据暂不可用</span>';
+      }).join('');
+    }
+    var notes = document.getElementById('notes');
+    notes.innerHTML = '<div class="note warn">' + esc(msg) + '</div>';
+  });
+  document.getElementById('stamp').textContent = '数据获取失败 · 上次成功 '
+    + (_lastGoodAt ? new Date(_lastGoodAt).toLocaleTimeString() : '--');
+}
+function stampFresh() {
+  document.getElementById('stamp').textContent = '更新于 ' + new Date().toLocaleTimeString() + ' · 每 ' + (POLL_MS / 1000) + 's';
+}
+
 function tick() {
   if (_busy) { return; }
   _busy = true;
-  fetchT('/v1/internal/model-manager', 8000).then(function (r) { return r.json(); }).catch(function () { return null; })
+  fetchT('/v1/internal/model-manager', MM_TIMEOUT_MS).then(function (r) { return r.json(); })
+    .catch(function (e) { console.warn('[vllm-page] model-manager failed:', (e && e.name) || e); return null; })
     .then(function (mm) {
       var insts = (mm && mm.instances) || [];
+      var gotData = !!(mm && Array.isArray(mm.instances));
       var vls = insts.filter(function (i) { return i.runtime === 'vllm'; });
       var metricMap = {}, paramMap = {}, kvMap = {};
       var jobs = [];
@@ -553,12 +597,39 @@ function tick() {
         })(vls[i].port);
       }
       return Promise.all(jobs).then(function () {
-        return { insts: insts, metricMap: metricMap, paramMap: paramMap, kvMap: kvMap, err: mm ? null : 'model-manager 不可达' };
+        return { insts: insts, metricMap: metricMap, paramMap: paramMap, kvMap: kvMap, gotData: gotData };
       });
     })
     .then(function (res) {
-      if (res) render(res.insts, res.metricMap, res.paramMap, res.kvMap, res.err);
-      document.getElementById('stamp').textContent = '更新于 ' + new Date().toLocaleTimeString() + ' · 每 ' + (POLL_MS / 1000) + 's';
+      if (!res) { return; }
+      if (!res.gotData) {
+        // 取数失败（超时/截断/后端忙）：绝不当成「没有实例」，保留上一帧
+        renderStale('model-manager 本轮不可达（超时或响应不完整），已保留上次画面');
+      } else if (res.insts.length) {
+        // 成功且有实例：更新缓存与画面
+        _lastGood = res.insts;
+        _lastGoodAt = Date.now();
+        render(res.insts, res.metricMap, res.paramMap, res.kvMap, null, false);
+        stampFresh();
+      } else if (!_lastGood.length) {
+        // 成功且后端明确说一个实例都没有，且以前也没见过实例：正常空态
+        render([], res.metricMap, res.paramMap, res.kvMap, null, false);
+        stampFresh();
+      } else {
+        // 成功但实例列表变空，而上一次还看得见实例：先保留画面，连续 EMPTY_GRACE_MS
+        // 都为空才认定为「真的停止了」。这样能挡住后端单轮抖动（例如 /v1/models 探测
+        // 超时被 getVllmInstances 的空 catch 吞掉 → instances 少一项），又不会把真实的
+        // 停止状态永久藏起来。
+        if (!_emptySince) { _emptySince = Date.now(); }
+        if (Date.now() - _emptySince >= EMPTY_GRACE_MS) {
+          _emptySince = 0; _lastGood = [];
+          render([], res.metricMap, res.paramMap, res.kvMap, null, false);
+          stampFresh();
+        } else {
+          renderStale('本轮实例发现返回空列表（疑似上游探测抖动），保留上次实例；连续 '
+            + Math.ceil((EMPTY_GRACE_MS - (Date.now() - _emptySince)) / 1000) + 's 仍为空则判定已停止');
+        }
+      }
     })
     .catch(function (e) { console.warn('[vllm-page] tick failed:', e); })
     .then(function () { _busy = false; _lastTickAt = Date.now(); schedule(); });

@@ -731,6 +731,49 @@ function loadFlashNextScheme170hx() {
     return JSON.parse(fs.readFileSync(FLASHNEXT_SCHEME_FILE, 'utf8'));
   } catch (e) { return null; }
 }
+// [mm-perf-1003] 模型 revision 探测（分片数 + index.json 的 metadata.total_size），带缓存。
+// 为什么要专门优化这一步（10-03 实锤）：为了拿一个 total_size，旧代码把
+// model.safetensors.index.json 整个读进来再 JSON.parse —— 本机该文件 34MB / 744 分片，
+// 实测单次 267~390ms，而 schemeReadiness 的 tep2 与 script 两个分支各做一次，
+// flashNextSchemes() 又对每个脚本模型卡片各调一遍 ⇒ /v1/internal/model-manager 单请求
+// 1.5~6.2s，全程同步按住 node 事件循环，同进程其它接口跟着变慢；前端 vllm.html 的
+// 8s 超时被吃掉后就 catch→null→instances=[]，把「这次没取到数据」渲染成「无运行中实例」。
+// 分片清单与 total_size 只在换权重时才变：按目录 mtime + TTL 缓存，且只流式读文件头部。
+const __modelRevisionProbeCache = new Map();   // mp -> { at, mtimeMs, shards, bytes }
+const MODEL_REVISION_PROBE_TTL = 120000;       // 2 分钟；目录 mtime 变化立即失效
+function probeModelRevision(mp) {
+  let mtimeMs = 0;
+  try { mtimeMs = fs.statSync(mp).mtimeMs; } catch (e) { return { shards: 0, bytes: null }; }
+  const now = Date.now();
+  const hit = __modelRevisionProbeCache.get(mp);
+  if (hit && hit.mtimeMs === mtimeMs && now - hit.at < MODEL_REVISION_PROBE_TTL) {
+    return { shards: hit.shards, bytes: hit.bytes };
+  }
+  let shards = 0;
+  try {
+    shards = fs.readdirSync(mp).filter(f => f.endsWith('.safetensors')).length;
+  } catch (e) {}
+  let bytes = null;
+  try {
+    // total_size 位于文件开头的 metadata 段：分块读、命中即停，不解析整个索引
+    const fd = fs.openSync(mp + '/model.safetensors.index.json', 'r');
+    try {
+      let buf = '', pos = 0, guard = 0;
+      while (guard++ < 64) {
+        const chunk = Buffer.alloc(65536);
+        const n = fs.readSync(fd, chunk, 0, chunk.length, pos);
+        if (n <= 0) break;
+        pos += n;
+        buf += chunk.toString('utf8', 0, n);
+        const m = /"total_size"\s*:\s*(\d+)/.exec(buf);
+        if (m) { bytes = parseInt(m[1]); break; }
+        if (buf.length > 4194304) break;   // 保险丝：4MB 内找不到就当无该字段
+      }
+    } finally { fs.closeSync(fd); }
+  } catch (e2) {}
+  __modelRevisionProbeCache.set(mp, { at: now, mtimeMs, shards, bytes });
+  return { shards, bytes };
+}
 // 方案二前置条件探测（Docker / GDS / PLE GDS 数据 / 镜像 / 模型 revision）
 function schemeReadiness(scheme) {
   const r = { docker: false, image: false, cufile: false, nvidia_fs: false, pleArtifact: false, model: false };
@@ -740,13 +783,10 @@ function schemeReadiness(scheme) {
     try { r.inner = fs.existsSync(scheme.launcher.inner); } catch (e) { r.inner = false; }
     try {
       const mp = scheme.launcher.model || '/media/ll/data/models/Qwen3.8-Flash-Next-NVFP4';
-      const files = fs.readdirSync(mp);
-      const shards = files.filter(f => f.endsWith('.safetensors')).length;
-      let bytes = null;
-      try { bytes = JSON.parse(fs.readFileSync(mp + '/model.safetensors.index.json', 'utf8')).metadata.total_size; } catch (e2) {}
+      const pv = probeModelRevision(mp);
       const want = scheme.launcher.modelBytes || 135195303851;
-      r.model = shards >= 200 && (bytes === null || Math.abs(bytes - want) / want < 0.01);
-      r.modelShards = shards; r.modelBytes = bytes || null;
+      r.model = pv.shards >= 200 && (pv.bytes === null || Math.abs(pv.bytes - want) / want < 0.01);
+      r.modelShards = pv.shards; r.modelBytes = pv.bytes || null;
     } catch (e) { r.model = false; }
     return r;
   }
@@ -773,22 +813,24 @@ function schemeReadiness(scheme) {
   try { r.pleArtifact = fs.existsSync('/media/ll/data/ple-gds/CURRENT'); } catch (e) {}
   // 模型：目录存在 + 分片数量 + index total_size 与上游 revision 期望值比对（容许 1% 差异）
   try {
-    const mp = '/media/ll/data/models/Qwen3.8-Flash-Next-NVFP4';
-    const files = fs.readdirSync(mp);
-    const shards = files.filter(f => f.endsWith('.safetensors')).length;
-    let bytes = null;
-    try {
-      const idx = JSON.parse(fs.readFileSync(mp + '/model.safetensors.index.json', 'utf8'));
-      bytes = idx && idx.metadata && idx.metadata.total_size;
-    } catch (e2) {}
-    r.modelShards = shards;
-    r.modelBytes = bytes || null;
+    const pv = probeModelRevision('/media/ll/data/models/Qwen3.8-Flash-Next-NVFP4');
+    r.modelShards = pv.shards;
+    r.modelBytes = pv.bytes || null;
     const want = (scheme && scheme.launcher && scheme.launcher.modelBytes) || 135195303851;
-    r.model = shards >= 200 && (bytes === null || Math.abs(bytes - want) / want < 0.01);
+    r.model = pv.shards >= 200 && (pv.bytes === null || Math.abs(pv.bytes - want) / want < 0.01);
   } catch (e) { r.model = false; }
   return r;
 }
+// [mm-perf-1003] 整套方案就绪度的短缓存：schemeReadiness 除模型 revision 外还要 spawn
+// docker 两次（command -v + image inspect，实测 ~30ms），叠加后 flashNextSchemes() 单次
+// ~300ms。这类前置条件（装了没装 Docker、镜像在不在、权重对不对）分钟级都不会变，
+// 而 model-manager 是前端 2s 轮询的热点接口 ⇒ 缓存 5s，既保住「刚装好就能看见」的实时感，
+// 又把重复开销摊薄到近乎为零。
+const __schemesCache = { at: 0, list: null };
+const SCHEMES_CACHE_TTL = 5000;
 function flashNextSchemes() {
+  const now = Date.now();
+  if (__schemesCache.list && now - __schemesCache.at < SCHEMES_CACHE_TTL) return __schemesCache.list;
   const out = [{
     key: 'chroot-pp2',
     name: '当前生产（chroot 镜像 + PP2 + PLE mmap，无投机）',
@@ -817,6 +859,8 @@ function flashNextSchemes() {
       readiness: rdL, missing: missingL, ready: missingL.length === 0,
     });
   }
+  __schemesCache.list = out;
+  __schemesCache.at = Date.now();
   return out;
 }
 // 弹窗参数 → chroot 启动环境变量（FN_*）；与基准相同的项不产生额外 flag。

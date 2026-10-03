@@ -1468,6 +1468,26 @@
                 </div>
             </div>
 
+            <!-- GPU 功耗/频率调节（[gpu-ctl 1003] 硬件监视页；后端 /v1/internal/gpu-ctl，提权走 gpu-ctl 白名单脚本） -->
+            <div class="card mb-3" id="storageGpuCtlCard">
+                <div class="card-header" style="display:flex;align-items:baseline;justify-content:space-between;gap:12px">
+                    <h3 style="font-size:14px;font-weight:600">GPU 功耗 / 频率调节</h3>
+                    <span style="font-size:11px;color:var(--text-tertiary)" id="gpuCtlHint">读取中…</span>
+                </div>
+                <div class="card-body" style="padding:10px 14px">
+                    <div id="gpuCtlRows" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:10px"></div>
+                    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;padding-top:8px;border-top:1px solid var(--border-light)">
+                        <span style="font-size:11px;color:var(--text-tertiary)">应用到：</span>
+                        <select id="gpuCtlScope" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:12px">
+                            <option value="all" selected>全部卡</option>
+                        </select>
+                        <span style="font-size:11px;color:var(--text-tertiary)">快捷功耗档：</span>
+                        <span id="gpuCtlPresets" style="display:inline-flex;gap:4px;flex-wrap:wrap"></span>
+                        <span style="font-size:11px;color:var(--text-tertiary);margin-left:auto" id="gpuCtlMsg">重启后功耗上限由 gpu-power-limit.service 的 PL 决定（控制台设置会自动同步该值）；频率锁重启自动解除。</span>
+                    </div>
+                </div>
+            </div>
+
             <!-- PCIe 通道拓扑 / 占用（lspci LnkSta 解析） -->
             <div class="card mb-3" id="storagePcieTopoCard">
                 <div class="card-header" style="display:flex;align-items:baseline;justify-content:space-between;gap:12px">
@@ -2013,7 +2033,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20261006-r9'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20261006-r10'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -5920,6 +5940,148 @@ function loadGpuData() {
     }).catch(() => {});
 }
 
+// ==== GPU 功耗/频率调节卡（[gpu-ctl 1003]，数据源 /v1/internal/gpu-ctl，写走 POST .../cmd）====
+// 设计：状态 2s 轮询（后台门控走 startStoragePolling 统一管）；渲染只在「卡集合签名」
+// 变化时重建 DOM（防打掉用户正在输入的数值），每拍只更新数字；命令执行中禁按钮防双击。
+// 口径提示：SM 频率上限 1470 是本卡 VBIOS 实际 boost 顶（1695 是芯片能力表，09-26 定档）；
+// 功耗上限改动即时生效且同步写开机持久化 drop-in；频率锁重启自动解除。
+let gpuCtlTimer = null, gpuCtlBusy = false, gpuCtlSig = '';
+function loadGpuCtl() {
+    apiFetch('/v1/internal/gpu-ctl').then((d) => {
+        if (!d) return;
+        if (d.ok === false) { renderGpuCtlErr(d.error || 'gpu-ctl 状态获取失败'); return; }
+        renderGpuCtlCard(d.state || d);
+    }).catch(() => {});
+}
+function renderGpuCtlErr(msg) {
+    const box = document.getElementById('gpuCtlRows');
+    const hint = document.getElementById('gpuCtlHint');
+    if (hint) hint.textContent = '不可用';
+    if (box && box.dataset.sig !== 'err:' + msg) {
+        box.dataset.sig = 'err:' + msg;
+        box.innerHTML = '<div style="color:var(--text-tertiary);font-size:12px;padding:4px 0">' + esc(msg) +
+            '<div style="margin-top:4px">需要 root 提权脚本 /usr/local/bin/gpu-ctl（安装：ops/install-gpu-ctl-127.sh）</div></div>';
+    }
+}
+function renderGpuCtlCard(st) {
+    const box = document.getElementById('gpuCtlRows');
+    const hint = document.getElementById('gpuCtlHint');
+    if (!box) return;
+    const gpus = (st && st.gpus) || [];
+    if (!gpus.length) { renderGpuCtlErr('未检测到 GPU（gpu-ctl status 无卡）'); return; }
+    if (hint) hint.textContent = gpus.length + ' 卡 · gpu-ctl · 每 2s 刷新';
+    const sig = gpus.map(g => g.index).join(',');
+    const scopeSel = document.getElementById('gpuCtlScope');
+    if (sig !== box.dataset.sig) {
+        box.dataset.sig = sig;
+        box.innerHTML = gpus.map((g) => {
+            const limLo = g.power_min_limit != null ? g.power_min_limit : 100;
+            const limHi = g.power_max_limit != null ? g.power_max_limit : 300;
+            return `<div style="border:1px solid var(--border);border-radius:8px;padding:10px 12px" data-gpu="${g.index}">
+                <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+                    <div style="font-size:12px;font-weight:600">GPU ${g.index} · ${esc(g.name || '--')}</div>
+                    <div style="font-size:11px;color:var(--text-tertiary)" id="gpuCtlLive_${g.index}">--</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+                    <span style="font-size:12px;color:var(--text-secondary);min-width:56px">功耗上限</span>
+                    <input type="number" id="gpuCtlPl_${g.index}" min="${limLo}" max="${limHi}" step="5" value="${g.power_limit != null ? Math.round(g.power_limit) : ''}"
+                        style="width:70px;padding:4px 6px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:12px;text-align:right">
+                    <span style="font-size:11px;color:var(--text-tertiary)">W（可调 ${limLo}–${limHi}，默认 ${g.power_default_limit != null ? Math.round(g.power_default_limit) : '--'}）</span>
+                    <button class="btn" style="font-size:11px;padding:3px 10px" onclick="gpuCtlCmd('pl',${g.index})">应用</button>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                    <span style="font-size:12px;color:var(--text-secondary);min-width:56px">SM 频率锁</span>
+                    <input type="number" id="gpuCtlLo_${g.index}" min="100" max="4000" step="15" placeholder="min"
+                        style="width:62px;padding:4px 6px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:12px;text-align:right">
+                    <span style="font-size:11px;color:var(--text-tertiary)">–</span>
+                    <input type="number" id="gpuCtlHi_${g.index}" min="100" max="4000" step="15" placeholder="max"
+                        style="width:62px;padding:4px 6px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);font-size:12px;text-align:right">
+                    <span style="font-size:11px;color:var(--text-tertiary)">MHz（boost 顶约 1470）</span>
+                    <button class="btn" style="font-size:11px;padding:3px 10px" onclick="gpuCtlCmd('lock',${g.index})">锁定</button>
+                    <button class="btn" style="font-size:11px;padding:3px 10px" onclick="gpuCtlCmd('unlock',${g.index})">解锁</button>
+                </div>
+            </div>`;
+        }).join('');
+        // 卡号下拉同步（应用到=全部卡时按卡逐一执行由后端 gpu=all 承担）
+        if (scopeSel) {
+            scopeSel.innerHTML = '<option value="all" selected>全部卡</option>' + gpus.map(g => `<option value="${g.index}">仅 GPU ${g.index}</option>`).join('');
+        }
+        const presets = document.getElementById('gpuCtlPresets');
+        if (presets && !presets.dataset.built) {
+            presets.dataset.built = '1';
+            presets.innerHTML = [150, 180, 210, 250, 300].map(w =>
+                `<button class="btn" style="font-size:11px;padding:3px 8px" onclick="gpuCtlPreset(${w})">${w}W</button>`).join('');
+        }
+    }
+    // 每拍只刷数值行（当前功耗/频率/温度/限频原因），不动输入框
+    for (const g of gpus) {
+        const el = document.getElementById('gpuCtlLive_' + g.index);
+        if (!el) continue;
+        const cap = g.sw_power_cap ? ' · <span style="color:var(--orange)">⚡功耗墙</span>' : '';
+        const hs = g.hw_slowdown ? ' · <span style="color:var(--red)">热墙</span>' : '';
+        el.innerHTML = '当前 ' + (g.power_draw != null ? g.power_draw.toFixed(0) : '--') + ' W · SM ' + (g.sm_clock != null ? g.sm_clock : '--') + '/' + (g.sm_clock_max != null ? g.sm_clock_max : '--') +
+            ' MHz · 显存 ' + (g.mem_clock != null ? g.mem_clock : '--') + ' MHz · ' + (g.temp != null ? g.temp + '°C' : '--') + cap + hs;
+    }
+}
+function gpuCtlSetBusy(on) {
+    gpuCtlBusy = on;
+    document.querySelectorAll('#storageGpuCtlCard button').forEach(b => { b.disabled = on; });
+}
+function gpuCtlMsg(t, bad) {
+    const el = document.getElementById('gpuCtlMsg');
+    if (el) { el.textContent = t; el.style.color = bad ? 'var(--red)' : 'var(--text-tertiary)'; }
+}
+async function gpuCtlPost(payload) {
+    const r = await fetch('/v1/internal/gpu-ctl/cmd', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    });
+    return r.json().catch(() => ({ ok: false, msg: '响应解析失败 HTTP ' + r.status }));
+}
+async function gpuCtlCmd(action, idx) {
+    if (gpuCtlBusy) return;
+    gpuCtlSetBusy(true);
+    const t = new Date().toLocaleTimeString('zh-CN');
+    try {
+        let payload = { action, gpu: String(idx) };
+        if (action === 'pl') {
+            const v = parseInt((document.getElementById('gpuCtlPl_' + idx) || {}).value, 10);
+            if (!isFinite(v)) { gpuCtlMsg('[' + t + '] 请先填写功耗瓦数', true); return; }
+            payload.watt = v;
+        } else if (action === 'lock') {
+            const lo = parseInt((document.getElementById('gpuCtlLo_' + idx) || {}).value, 10);
+            const hi = parseInt((document.getElementById('gpuCtlHi_' + idx) || {}).value, 10);
+            if (!isFinite(lo) || !isFinite(hi)) { gpuCtlMsg('[' + t + '] 锁频需同时填 min 与 max（MHz）', true); return; }
+            payload.lo = lo; payload.hi = hi;
+        }
+        gpuCtlMsg('[' + t + '] 执行中：' + action + ' GPU' + idx + ' …');
+        const d = await gpuCtlPost(payload);
+        gpuCtlMsg('[' + t + '] ' + action + ' GPU' + idx + ' → ' + (d.msg || (d.ok ? '完成' : '失败')), !d.ok);
+        loadGpuCtl();
+    } catch (e) {
+        gpuCtlMsg('[' + t + '] 请求失败：' + e, true);
+    } finally {
+        gpuCtlSetBusy(false);
+    }
+}
+// 快捷功耗档：按「应用到」下拉的目标执行（全部卡 = 后端 gpu=all 一次设齐）
+async function gpuCtlPreset(w) {
+    if (gpuCtlBusy) return;
+    const scope = (document.getElementById('gpuCtlScope') || {}).value || 'all';
+    gpuCtlSetBusy(true);
+    const t = new Date().toLocaleTimeString('zh-CN');
+    try {
+        gpuCtlMsg('[' + t + '] 执行中：全部 → ' + w + 'W …');
+        const d = await gpuCtlPost({ action: 'pl', watt: w, gpu: scope });
+        gpuCtlMsg('[' + t + '] 设为 ' + w + 'W（' + (scope === 'all' ? '全部卡' : 'GPU' + scope) + '）→ ' + (d.msg || (d.ok ? '完成' : '失败')), !d.ok);
+        // 回填各卡输入框显示
+        loadGpuCtl();
+    } catch (e) {
+        gpuCtlMsg('[' + t + '] 请求失败：' + e, true);
+    } finally {
+        gpuCtlSetBusy(false);
+    }
+}
+
 // ==== 内存带宽卡（数据源 /v1/internal/membw：perf uncore IMC CAS 计数，1s/点）====
 function loadMembwData() {
     apiFetch('/v1/internal/membw').then((d) => {
@@ -6172,6 +6334,7 @@ function startStoragePolling() {
     if (!cpuTimer) { loadCpuData(); cpuTimer = setInterval(loadCpuData, 2000); }
     if (!netTimer) { loadNetData(); netTimer = setInterval(loadNetData, 2000); }
     if (!gpuTimer) { loadGpuData(); gpuTimer = setInterval(loadGpuData, 1000); } // 显卡卡 1 秒刷新
+    if (!gpuCtlTimer) { loadGpuCtl(); gpuCtlTimer = setInterval(() => { if (!document.hidden) loadGpuCtl(); }, 2000); } // GPU 功耗/频率调节卡 2 秒刷新（后台停）
     if (!pcieTopoTimer) { loadPcieTopoData(); pcieTopoTimer = setInterval(loadPcieTopoData, 10000); }
     if (!membwTimer) { loadMembwData(); membwTimer = setInterval(loadMembwData, 1000); } // 内存带宽卡 1 秒刷新
     if (!diskTrendTimer) { renderDiskTrendWinBtns(); loadDiskTrendData(); diskTrendTimer = setInterval(loadDiskTrendData, 2000); } // 磁盘读写速度走势 2 秒刷新

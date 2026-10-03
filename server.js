@@ -1791,12 +1791,17 @@ const POWER_CONFIG_PATH = path.join(__dirname, 'power-config.json');
 function loadPowerConfig() {
   try {
     const c = JSON.parse(fs.readFileSync(POWER_CONFIG_PATH, 'utf8'));
-    return { offsetW: Math.max(0, Math.min(1000, parseFloat(c.offsetW) || 0)) };
+    const out = { offsetW: Math.max(0, Math.min(1000, parseFloat(c.offsetW) || 0)) };
+    // [gpu-ctl 1003] 控制台最近一次设置的 GPU 功耗上限（记录用途；生效值以 nvidia-smi 现查为准）
+    if (c.gpuPlW != null) { const g = parseInt(c.gpuPlW, 10); if (g >= 50 && g <= 500) out.gpuPlW = g; }
+    return out;
   } catch (e) {}
   return { offsetW: 0 };
 }
 function savePowerConfig(c) {
-  fs.writeFileSync(POWER_CONFIG_PATH, JSON.stringify(c, null, 2));
+  const out = { offsetW: c.offsetW };
+  if (c.gpuPlW != null) out.gpuPlW = c.gpuPlW;
+  fs.writeFileSync(POWER_CONFIG_PATH, JSON.stringify(out, null, 2));
 }
 
 {
@@ -1872,6 +1877,19 @@ function readMemInfo() {
     }
   } catch (e) {}
   return _lastMemInfo;
+}
+
+// ====== [gpu-ctl 1003] GPU 功耗/频率调节（硬件监视页）======
+// 开机持久化联动：gpu-power-limit.service 开机按 drop-in 的 Environment=PL=<W> 设功耗上限
+// （09-26 铁律：只敲 nvidia-smi -pl 不改 PL，重启必被打回）。控制台设完功耗后同步改写
+// drop-in，让「控制台设的值 = 重启后的值」。drop-in 属 root，写入走 gpu-ctl 的
+// persist-pl 子命令（脚本内部已是 root，见 syncGpuPlDropin）。
+// 撤销联动：sudo rm -f /etc/systemd/system/gpu-power-limit.service.d/pl-console.conf && sudo systemctl daemon-reload
+async function syncGpuPlDropin(watt) {
+  // gpuCtlRun 永不 reject（内部消化错误），返回 {ok,output}
+  const r = await gpuCtlRun(['persist-pl', String(watt)], 20000);
+  if (!r.ok) return String(r.output || 'persist-pl 失败').slice(0, 300);
+  return null;
 }
 
 function buildEnergyInfo() {
@@ -9810,6 +9828,112 @@ async function cpuCtlHandle(req, res, urlObj) {
   return reply(404, { ok: false, msg: 'cpuctl: 未知路由' });
 }
 
+// ====== [gpu-ctl 1003] GPU 功耗/频率控制模块（硬件监视页，模式对齐 CPU CTL）======
+// 提权边界：只 execFile 固定路径 /usr/local/bin/gpu-ctl（root:root 0755，sudoers 单命令白名单），
+// 参数全部白名单 action + 正则数值校验，杜绝注入；nvidia-smi 本体不放行 sudo。
+// 铁律（09-20）：execFile + 自身 timeout，绝不 execSync；gpu-ctl 内部所有 nvidia-smi
+// 再包一层 timeout 8，双保险。连续失败不熔断（低频人工操作），但失败原样回显给用户。
+const GPU_CTL = process.env.GPU_CTL || '/usr/local/bin/gpu-ctl';
+const GPU_W_RE = /^([5-9][0-9]|[1-4][0-9][0-9]|500)$/;   // 50-500 整数瓦（真实区间再按驱动 min/max 收窄）
+const GPU_MHZ_RE = /^([1-9][0-9]{2}|[1-3][0-9]{3}|4000)$/; // 100-4000 整数 MHz
+const GPU_IDX_RE = /^(all|[0-7])$/;
+
+function gpuCtlRun(args, timeoutMs) {
+  return new Promise((resolve) => {
+    require('child_process').execFile(GPU_CTL, args.map(String), { timeout: timeoutMs || 20000, maxBuffer: 2 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        const out = String(stdout || '').trim();
+        const errText = String(stderr || '').trim();
+        resolve({ ok: !err, output: out || errText || (err ? String(err.message || err) : '(无输出)'), killed: !!(err && err.killed) });
+      });
+  });
+}
+
+// 状态短缓存：UI 1s 轮询（多标签页叠发），TTL 1.5s + 单飞。sudo+python 一趟 ~200ms，
+// 命令成功后调用方带 force=true 绕缓存拿即时回显。
+let __gpuCtlCache = null; // { t, state }
+let __gpuCtlFly = null;
+function gpuCtlStatus(force) {
+  if (!force && __gpuCtlCache && Date.now() - __gpuCtlCache.t < 1500) {
+    return Promise.resolve({ ok: true, state: __gpuCtlCache.state });
+  }
+  if (__gpuCtlFly) return __gpuCtlFly;
+  __gpuCtlFly = gpuCtlRun(['status', '--json'], 15000).then((r) => {
+    __gpuCtlFly = null;
+    if (!r.ok) return { ok: false, error: r.output };
+    try {
+      const state = JSON.parse(r.output);
+      if (state && state.supported) __gpuCtlCache = { t: Date.now(), state };
+      return { ok: true, state };
+    } catch (e) {
+      return { ok: false, error: 'gpu-ctl status 输出无法解析：' + String(r.output).slice(0, 200) };
+    }
+  }).catch((e) => { __gpuCtlFly = null; return { ok: false, error: String((e && e.message) || e) }; });
+  return __gpuCtlFly;
+}
+
+// action 白名单 → gpu-ctl 参数（返回 null = 非法）
+function gpuCtlAction(body) {
+  const a = String(body.action || '');
+  const gi = (s) => (GPU_IDX_RE.test(String(s == null ? 'all' : s)) ? String(s == null ? 'all' : s) : null);
+  switch (a) {
+    case 'pl': {
+      const w = String(body.watt == null ? '' : body.watt);
+      if (!GPU_W_RE.test(w)) return null;
+      const g = gi(body.gpu);
+      if (!g) return null;
+      return { args: ['pl', w, g], timeout: 20000, watt: parseInt(w, 10) };
+    }
+    case 'lock': {
+      const lo = String(body.lo == null ? '' : body.lo);
+      const hi = String(body.hi == null ? '' : body.hi);
+      if (!GPU_MHZ_RE.test(lo) || !GPU_MHZ_RE.test(hi)) return null;
+      if (parseInt(lo, 10) > parseInt(hi, 10)) return null;
+      const g = gi(body.gpu);
+      if (!g) return null;
+      return { args: ['lock', lo, hi, g], timeout: 20000 };
+    }
+    case 'unlock': {
+      const g = gi(body.gpu);
+      if (!g) return null;
+      return { args: ['unlock', g], timeout: 20000 };
+    }
+    default: return null;
+  }
+}
+
+async function gpuCtlHandle(req, res, urlObj) {
+  const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  const sub = urlObj.pathname.slice('/v1/internal/gpu-ctl'.length);
+  if (req.method === 'GET' && sub === '') {
+    return reply(200, await gpuCtlStatus());
+  }
+  if (req.method === 'POST' && sub === '/cmd') {
+    const body = await cpuCtlReadBody(req);
+    if (!body) return reply(400, { ok: false, msg: '请求体不是合法 JSON' });
+    const act = gpuCtlAction(body);
+    if (!act) return reply(400, { ok: false, msg: '非法参数或不在白名单内（pl 50-500W / lock 100-4000MHz / gpu=all|0-7）' });
+    const r = await gpuCtlRun(act.args, act.timeout);
+    let persist = null;
+    if (r.ok && act.watt) {
+      // 功耗上限联动开机持久化（09-26 铁律）：gpu-ctl persist-pl 写 drop-in + daemon-reload。
+      // 失败不回滚运行时值（已生效），只在 msg 里如实说明持久化状态。
+      persist = await syncGpuPlDropin(act.watt);
+      if (!persist) savePowerConfig(Object.assign(loadPowerConfig(), { gpuPlW: act.watt }));
+    }
+    const st = await gpuCtlStatus(true); // 命令改过状态，强制绕缓存补拉
+    const note = act.watt ? (persist ? ('（运行时已生效；开机持久化失败：' + persist + '）') : '（运行时已生效，并已写入开机持久化 pl-console.conf）') : null;
+    return reply(200, {
+      ok: r.ok,
+      msg: r.ok ? (r.output + (note || '')) : (r.output + (r.killed ? '（超时被放弃）' : '')),
+      persisted: act.watt ? !persist : null,
+      state: st.ok ? st.state : null,
+      error: st.ok ? null : st.error,
+    });
+  }
+  return reply(404, { ok: false, msg: 'gpu-ctl: 未知路由' });
+}
+
 const server = http.createServer(async (req, res) => {
 
   let urlObj;
@@ -11894,7 +12018,7 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ success: false, error: '补偿值需为 0-1000 之间的数字（瓦特）' }));
           return;
         }
-        savePowerConfig({ offsetW: Math.round(offsetW * 10) / 10 });
+        savePowerConfig({ offsetW: Math.round(offsetW * 10) / 10, gpuPlW: loadPowerConfig().gpuPlW });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, offsetW: Math.round(offsetW * 10) / 10 }));
       } catch (e) {
@@ -12202,6 +12326,18 @@ const server = http.createServer(async (req, res) => {
       history: (global.__gpuPcieHistory || []).slice(-180), // ~1.2s/点 ≈ 3.6 分钟窗口，前端截近 3 分钟（150 点）
     })));
     return;
+  }
+
+  // === Internal API: GPU 控制（[gpu-ctl 1003] 硬件监视页：功耗上限 / SM 频率锁）===
+  // GET  /v1/internal/gpu-ctl          状态（gpu-ctl status --json，1.5s TTL 缓存+单飞）
+  // POST /v1/internal/gpu-ctl/cmd      {action:'pl'|'lock'|'unlock', watt?, lo?, hi?, gpu?}
+  //   白名单 + 正则校验（同 cpuctl 铁律）；nvidia-smi 需 root → 走 /usr/local/bin/gpu-ctl
+  //   （root:root 0755 + sudoers.d/ll-gpu-ctl 单命令白名单，ops/install-gpu-ctl-127.sh 安装）。
+  //   pl 成功后同步改写 gpu-power-limit.service 的 drop-in（09-26 铁律：不改 PL 重启必被打回）。
+  if (pathname === '/v1/internal/gpu-ctl' || pathname.startsWith('/v1/internal/gpu-ctl/')) {
+    return gpuCtlHandle(req, res, urlObj).catch((e) => {
+      try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}
+    });
   }
 
   // === Internal API: 内存带宽（硬件监视页 RAM 带宽卡；perf uncore IMC CAS 计数，1s 采样）===

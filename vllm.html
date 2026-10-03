@@ -88,7 +88,8 @@ var POLL_MS = 2000;
 // 取 12s（> 后端实测最差 6.2s）以免「后端其实有数据、前端先放弃」造成的假空态。
 var MM_TIMEOUT_MS = 12000;
 var _timer = null, _busy = false, _lastTickAt = 0;
-var _lastGood = [];        // 上一次成功发现的实例列表（取数失败时保留画面用）
+var _lastGood = [];        // 上一次成功发现的vllm实例（取数失败时保留画面用；
+                         // 只存本运行时的实例，空态判定才不会把「另一种引擎在跑」误当自己有实例）
 var _lastGoodAt = 0;       // 上一次成功取数的时刻
 var _emptySince = 0;       // 「后端返回空列表」起始时刻（宽限期判抖动用，0=未在观察）
 var EMPTY_GRACE_MS = 6000; // 空列表连续这么久才认定为「实例已停止」
@@ -605,30 +606,29 @@ function tick() {
       if (!res.gotData) {
         // 取数失败（超时/截断/后端忙）：绝不当成「没有实例」，保留上一帧
         renderStale('model-manager 本轮不可达（超时或响应不完整），已保留上次画面');
-      } else if (res.insts.length) {
-        // 成功且有实例：更新缓存与画面
-        _lastGood = res.insts;
-        _lastGoodAt = Date.now();
+        return;
+      }
+      var mine = res.insts.filter(function (i) { return i.runtime === 'vllm'; });
+      if (mine.length) {
+        // 成功且有 vLLM 实例：更新缓存与画面
+        _lastGood = mine; _lastGoodAt = Date.now(); _emptySince = 0;
         render(res.insts, res.metricMap, res.paramMap, res.kvMap, null, false);
         stampFresh();
       } else if (!_lastGood.length) {
-        // 成功且后端明确说一个实例都没有，且以前也没见过实例：正常空态
-        render([], res.metricMap, res.paramMap, res.kvMap, null, false);
+        // 成功且本来就没有 vLLM 实例（从未见过）：正常空态
+        render(res.insts, res.metricMap, res.paramMap, res.kvMap, null, false);
+        stampFresh();
+      } else if (Date.now() - _emptySince >= EMPTY_GRACE_MS) {
+        // vLLM 实例消失且持续超过宽限期：认定为已停止（不藏真实停止状态）
+        _emptySince = 0; _lastGood = [];
+        render(res.insts, res.metricMap, res.paramMap, res.kvMap, null, false);
         stampFresh();
       } else {
-        // 成功但实例列表变空，而上一次还看得见实例：先保留画面，连续 EMPTY_GRACE_MS
-        // 都为空才认定为「真的停止了」。这样能挡住后端单轮抖动（例如 /v1/models 探测
-        // 超时被 getVllmInstances 的空 catch 吞掉 → instances 少一项），又不会把真实的
-        // 停止状态永久藏起来。
+        // 刚刚消失：可能是后端单轮抖动（如 /v1/models 探测超时被 getVllmInstances 的
+        // 空 catch 吞掉 → 该实例从 instances 里少一项）。先保留画面并倒计时。
         if (!_emptySince) { _emptySince = Date.now(); }
-        if (Date.now() - _emptySince >= EMPTY_GRACE_MS) {
-          _emptySince = 0; _lastGood = [];
-          render([], res.metricMap, res.paramMap, res.kvMap, null, false);
-          stampFresh();
-        } else {
-          renderStale('本轮实例发现返回空列表（疑似上游探测抖动），保留上次实例；连续 '
-            + Math.ceil((EMPTY_GRACE_MS - (Date.now() - _emptySince)) / 1000) + 's 仍为空则判定已停止');
-        }
+        renderStale('本轮未发现 vLLM 实例（疑似上游探测抖动），保留上次画面；连续 '
+          + Math.ceil((EMPTY_GRACE_MS - (Date.now() - _emptySince)) / 1000) + 's 仍为空则判定已停止');
       }
     })
     .catch(function (e) { console.warn('[vllm-page] tick failed:', e); })

@@ -74,7 +74,15 @@
 //        + /v1/internal/model-params?port=（引擎参数）+ /v1/internal/recent-requests（导出诊断）。
 
 var POLL_MS = 2000;
+// model-manager 超时：后端已加缓存（正常 <100ms），取 12s 大于后端最差耗时，
+// 避免「后端有数据、前端先放弃」被误判成无实例（10-03 vllm.html 同修）。
+var MM_TIMEOUT_MS = 12000;
 var _timer = null, _busy = false, _lastTickAt = 0;
+var _lastGood = [];        // 上一次成功发现的sglang实例（取数失败时保留画面用；
+                         // 只存本运行时的实例，空态判定才不会把「另一种引擎在跑」误当自己有实例）
+var _lastGoodAt = 0;       // 上一次成功取数的时刻
+var _emptySince = 0;       // 「后端返回空列表」起始时刻（宽限期判抖动用，0=未在观察）
+var EMPTY_GRACE_MS = 6000; // 空列表连续这么久才认定为「实例已停止」
 var _prev = {};          // port -> { t, ppInput, gen, prompt, cached, idle, verify }（差值用）
 var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); };
 
@@ -286,7 +294,7 @@ function renderInstance(inst, mt, params, exportOff) {
   return html;
 }
 
-function render(mmInsts, metricMap, paramMap, exportOff, mmErr) {
+function render(mmInsts, metricMap, paramMap, exportOff, mmErr, stale) {
   var body = document.getElementById('body');
   var bar = document.getElementById('instBar');
   var notes = document.getElementById('notes');
@@ -295,7 +303,10 @@ function render(mmInsts, metricMap, paramMap, exportOff, mmErr) {
     bar.innerHTML = sgInsts.length
       ? sgInsts.map(function (i) { return '<span class="inst-badge">sglang :' + i.port + ' · ' + esc(i.model || '?') + (i.gpu != null && i.gpu !== '' ? ' · GPU' + esc(i.gpu) : '') + '</span>'; }).join('')
         + mmInsts.filter(function (i) { return i.runtime !== 'sglang'; }).map(function (i) { return '<span class="inst-badge off">' + esc(i.runtime || '?') + ' :' + i.port + '</span>'; }).join('')
-      : '<span class="inst-badge off">无运行中实例</span>';
+      : (stale
+        // 取数失败 ≠ 没有实例（10-03 修复：原先此处直接打「无运行中实例」）
+        ? '<span class="inst-badge off">数据获取失败 · 保留上次画面</span>'
+        : '<span class="inst-badge off">无运行中实例</span>');
   });
   safeRun(function () {
     var n = '';
@@ -306,6 +317,15 @@ function render(mmInsts, metricMap, paramMap, exportOff, mmErr) {
     notes.innerHTML = n;
   });
   if (!sgInsts.length) {
+    if (stale) {
+      // 本轮没拿到可信数据：正文保持上一帧原样（不能用空 metricMap 重渲染，
+      // parseMetrics(undefined) 会抛错把整轮 tick 打死、时间戳也停更）。
+      if (!body.innerHTML) {
+        body.innerHTML = '<div class="empty"><div class="big">⚠️</div>暂时取不到实例数据（model-manager 超时或未响应）。'
+          + '<div style="margin-top:6px;font-size:12px">页面每 2s 自动重试，恢复后自动显示。</div></div>';
+      }
+      return;
+    }
     body.innerHTML = '<div class="empty"><div class="big">🟣</div>当前没有运行中的 SGLang 实例。'
       + '<div style="margin-top:6px;font-size:12px">在「模型管理」把运行时选为 SGLang 启动实例后，本页自动出现其专属指标。</div>'
       + '<button onclick="try{parent.switchTab(\'models\')}catch(e){}">去模型管理</button></div>';
@@ -320,11 +340,31 @@ function render(mmInsts, metricMap, paramMap, exportOff, mmErr) {
   body.innerHTML = html;
 }
 
+// 保留上一帧画面的降级渲染：正文一律不动，只更新徽章与提示条，
+// 时间戳改标「上次成功」时刻。
+function renderStale(msg) {
+  safeRun(function () {
+    var bar = document.getElementById('instBar');
+    if (_lastGood.length) {
+      bar.innerHTML = _lastGood.filter(function (i) { return i.runtime === 'sglang'; }).map(function (i) {
+        return '<span class="inst-badge off">sglang :' + i.port + ' · ' + esc(i.model || '?') + ' · 数据暂不可用</span>';
+      }).join('');
+    }
+    var notes = document.getElementById('notes');
+    notes.innerHTML = '<div class="note warn">' + esc(msg) + '</div>';
+  });
+  document.getElementById('stamp').textContent = '数据获取失败 · 上次成功 '
+    + (_lastGoodAt ? new Date(_lastGoodAt).toLocaleTimeString() : '--');
+}
+function stampFresh() {
+  document.getElementById('stamp').textContent = '更新于 ' + new Date().toLocaleTimeString() + ' · 每 ' + (POLL_MS / 1000) + 's';
+}
+
 function tick() {
   if (_busy) { return; }
   _busy = true;
   var t0 = Date.now();
-  fetchT('/v1/internal/model-manager', 8000).then(function (r) { return r.json(); }).catch(function () { return null; })
+  fetchT('/v1/internal/model-manager', MM_TIMEOUT_MS).then(function (r) { return r.json(); }).catch(function (e) { console.warn('[sglang-page] model-manager failed:', (e && e.name) || e); return null; })
     .then(function (mm) {
       var insts = (mm && mm.instances) || [];
       var sgs = insts.filter(function (i) { return i.runtime === 'sglang'; });
@@ -345,12 +385,32 @@ function tick() {
       jobs.push(fetchT('/v1/internal/recent-requests?limit=20', 8000).then(function (r) { return r.json(); }, function () { return null; })
         .then(function (d) { window.__sglExportOff = (d && d.sglang_export_off) || null; }));
       return Promise.all(jobs).then(function () {
-        return { insts: insts, metricMap: metricMap, paramMap: paramMap, err: mm ? null : 'model-manager 不可达' };
+        return { insts: insts, metricMap: metricMap, paramMap: paramMap, gotData: !!(mm && Array.isArray(mm.instances)) };
       });
     })
     .then(function (res) {
-      if (res) render(res.insts, res.metricMap, res.paramMap, window.__sglExportOff, res.err);
-      document.getElementById('stamp').textContent = '更新于 ' + new Date().toLocaleTimeString() + ' · 每 ' + (POLL_MS / 1000) + 's';
+      if (!res) { return; }
+      if (!res.gotData) {
+        renderStale('model-manager 本轮不可达（超时或响应不完整），已保留上次画面');
+        return;
+      }
+      var mine = res.insts.filter(function (i) { return i.runtime === 'sglang'; });
+      if (mine.length) {
+        _lastGood = mine; _lastGoodAt = Date.now(); _emptySince = 0;
+        render(res.insts, res.metricMap, res.paramMap, window.__sglExportOff, null, false);
+        stampFresh();
+      } else if (!_lastGood.length) {
+        render(res.insts, res.metricMap, res.paramMap, window.__sglExportOff, null, false);
+        stampFresh();
+      } else if (Date.now() - _emptySince >= EMPTY_GRACE_MS) {
+        _emptySince = 0; _lastGood = [];
+        render(res.insts, res.metricMap, res.paramMap, window.__sglExportOff, null, false);
+        stampFresh();
+      } else {
+        if (!_emptySince) { _emptySince = Date.now(); }
+        renderStale('本轮未发现 SGLang 实例（疑似上游探测抖动），保留上次画面；连续 '
+          + Math.ceil((EMPTY_GRACE_MS - (Date.now() - _emptySince)) / 1000) + 's 仍为空则判定已停止');
+      }
     })
     .catch(function (e) { console.warn('[sglang-page] tick failed:', e); })
     .then(function () { _busy = false; _lastTickAt = Date.now(); schedule(); });

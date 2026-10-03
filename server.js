@@ -1452,6 +1452,117 @@ function kvOffloadPortsInfo() {
   return out;
 }
 
+// [kv-detail-1003] vLLM 标签页「CPU KV 二级缓存」详细数据：按端口聚合
+//   ① 配置真值（引擎 cmdline / cache_config_info 标签）：connector 类型、容量、block、GPU 池
+//   ② 驻留真值（/dev/shm statfs）：tmpfs 已用/上限（SimpleCPU 与经典档都落 tmpfs）
+//   ③ 指标真值（ticker.kvOffload）：查询/命中/命中率、累计存/取字节与次数、回载 token
+//   ④ 速率（本函数内 6s 滑窗差值）：查询/命中 token 每秒、字节存取每秒
+//   ⑤ 系统内存压力（readMemInfo）：整机 used/avail，判断二级缓存是否挤压系统内存
+// 只读、不 spawn、无特权需求；单端口 ?port=，缺省返回全部 vLLM 实例。
+// 返回 Promise<rows[]>（GPU 池要读 /metrics，走 fetchMetricsCached 400ms 缓存+单飞，
+// 与 ticker 每秒采样共享，不给上游加压）。
+function kvDetailInfo(portFilter) {
+  const gib = 1073741824;
+  const out = [];
+  const jobs = [];
+  try {
+    for (const inst of listVllmInstances()) {
+      if (portFilter && inst.port !== portFilter) continue;
+      const rec = {
+        port: inst.port,
+        gpu: inst.gpu,
+        gpus: inst.gpus || (inst.gpu != null ? [inst.gpu] : []),
+        model: inst.servedName || inst.modelPath || '',
+        pid: inst.pid || null,
+        gpu_pool: null,
+      };
+      // GPU 池（cache_config_info 标签，同 buildKvCacheInfo 口径）
+      jobs.push(fetchMetricsCached(`http://${config.vllmHost}:${inst.port}/metrics`, 400, 2500).then((data) => {
+        try {
+          const m = parseMetrics(data);
+          for (const k of Object.keys(m)) {
+            if (k.indexOf('vllm:cache_config_info|') !== 0) continue;
+            const lb = JSON.parse(k.substring(k.indexOf('|') + 1));
+            rec.gpu_pool = {
+              size_tokens: parseInt(lb.kv_cache_size_tokens) || null,
+              num_gpu_blocks: parseInt(lb.num_gpu_blocks) || null,
+              block_size: parseInt(lb.block_size) || null,
+              kv_cache_dtype: lb.cache_dtype || null,
+              gpu_memory_utilization: parseFloat(lb.gpu_memory_utilization) || null,
+            };
+            break;
+          }
+        } catch (e) {}
+      }, () => {}));
+      const tk = global.__tokTickers && global.__tokTickers.get(inst.port);
+      const kv = tk && tk.kvOffload;
+      const capBytes = kvOffloadCapacityBytes(inst.pid);
+      // connector 类型：cmdline 有 --kv-offloading-size → SimpleCPU；有 cpu_bytes_to_use → 经典 OffloadingConnector
+      let connector = null;
+      try {
+        const cmd = fs.readFileSync(`/proc/${inst.pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
+        if (/--kv-offloading-size/.test(cmd)) connector = 'SimpleCPUOffloadConnector';
+        else if (/cpu_bytes_to_use/.test(cmd)) connector = 'OffloadingConnector';
+      } catch (e) {}
+      if (!connector && kv) connector = (kv.metricKind === 'simple') ? 'SimpleCPUOffloadConnector' : 'OffloadingConnector';
+      // 驻留真值：/dev/shm（整机 tmpfs，单实例口径）
+      const shm = kvOffloadShmUsage();
+      // 速率：6s 滑窗差值（查询/命中 token、存/取字节）
+      let rates = null;
+      if (kv) {
+        if (!global.__kvDetailRates) global.__kvDetailRates = new Map();
+        const now = Date.now();
+        let buf = global.__kvDetailRates.get(inst.port);
+        if (!buf) { buf = []; global.__kvDetailRates.set(inst.port, buf); }
+        buf.push({ t: now, q: kv.queries || 0, h: kv.hits || 0, sb: kv.storedBytes || 0, lb: kv.loadedBytes || 0, et: kv.extTokens || 0 });
+        while (buf.length > 2 && now - buf[0].t > 6000) buf.shift();
+        if (buf.length >= 2) {
+          const a = buf[0], b = buf[buf.length - 1];
+          const dt = (b.t - a.t) / 1000;
+          if (dt > 1) {
+            rates = {
+              window_s: +dt.toFixed(1),
+              queries_per_s: Math.max(0, (b.q - a.q) / dt),
+              hits_per_s: Math.max(0, (b.h - a.h) / dt),
+              store_bytes_per_s: Math.max(0, (b.sb - a.sb) / dt),
+              load_bytes_per_s: Math.max(0, (b.lb - a.lb) / dt),
+              ext_tokens_per_s: Math.max(0, (b.et - a.et) / dt),
+            };
+          }
+        }
+      }
+      Object.assign(rec, {
+        enabled: !!(kv || capBytes),
+        connector,
+        metric_kind: kv ? (kv.metricKind || 'fill') : null,
+        capacity_gb: capBytes ? +(capBytes / gib).toFixed(2) : null,
+        // 驻留：fill 口径有真实驻留 GiB；其余用 tmpfs 实测（单实例）
+        resident_gb: (kv && kv.metricKind === 'fill' && capBytes) ? +(kv.fillPerc * capBytes / gib).toFixed(2) : (shm ? +shm.used_gb.toFixed(2) : null),
+        resident_src: (kv && kv.metricKind === 'fill') ? 'metric' : (shm ? 'tmpfs' : null),
+        shm_used_gb: shm ? shm.used_gb : null,
+        shm_total_gb: shm ? shm.total_gb : null,
+        shm_used_pct: shm ? shm.used_pct : null,
+        // 指标累计
+        queries: kv ? Math.round(kv.queries || 0) : 0,
+        hits: kv ? Math.round(kv.hits || 0) : 0,
+        hit_rate: (kv && kv.queries > 0) ? +(kv.hits / kv.queries * 100).toFixed(2) : null,
+        ext_tokens: kv ? Math.round(kv.extTokens || 0) : 0,
+        stored_gb: kv ? +(kv.storedBytes / gib).toFixed(2) : 0,
+        loaded_gb: kv ? +(kv.loadedBytes / gib).toFixed(2) : 0,
+        store_count: kv ? Math.round(kv.storeCount || 0) : 0,
+        load_count: kv ? Math.round(kv.loadCount || 0) : 0,
+        fill_pct: kv ? +(kv.fillPerc * 100).toFixed(1) : null,
+        write_pct: (kv && kv.writePerc != null) ? +(kv.writePerc * 100).toFixed(1) : null,
+        read_pct: (kv && kv.readPerc != null) ? +(kv.readPerc * 100).toFixed(1) : null,
+        rates,
+        system_mem: readMemInfo(),
+      });
+      out.push(rec);
+    }
+  } catch (e) {}
+  return Promise.all(jobs).then(() => out, () => out);
+}
+
 // 09-01 SGLang「理论可命中率」（LCP×8192 网格折算，sglang-theory.service 每 60s 写 json）
 function readSglangTheory(port) {
   try {
@@ -2886,7 +2997,16 @@ function findVllmPidByPort(port) {
       const sgi = listSglangInstances().find(x => x.port === port);
       if (sgi && sgi.pid) return sgi.pid;
     } catch (e) {}
-    const pg = execSync('pgrep -f "[v]llm.entrypoints" 2>/dev/null || true', { encoding: 'utf8', timeout: 3000 }).trim();
+    // [vllm-page-1003] vLLM 侧同款兜底：本栈 vLLM 由 sudo(root) 启动 → ll 的 lsof 看不到
+    // 监听端口；而下面的 pgrep 只认 vllm.entrypoints.*，匹配不到 0.30.0 实跑的
+    // `vllm serve` CLI 形式 → pid=null → runtime=unknown / gpu=null（vLLM 标签页
+    // 与模型管理页实例归因退化的根因）。listVllmInstances 走 /proc cmdline 扫描，
+    // 与 SGLang 的 listSglangInstances 对称，root 进程同样可见。
+    try {
+      const vi = listVllmInstances().find(x => x.port === port);
+      if (vi && vi.pid) return vi.pid;
+    } catch (e) {}
+    const pg = execSync('pgrep -f "[v]llm.entrypoints|[v]llm serve" 2>/dev/null || true', { encoding: 'utf8', timeout: 3000 }).trim();
     for (const pid of pg.split('\n').filter(Boolean)) {
       try {
         const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ');
@@ -2943,17 +3063,31 @@ function getVllmInstances(ports, callback) {
         try {
           const j = JSON.parse(data);
           if (j.data && j.data.length) {
-            const pid = findVllmPidByPort(p);
+            let pid = findVllmPidByPort(p);
             let gpu = gpuIndexForPid(pid);
             let rt = detectRuntimeForPid(pid);
+            let gpus = null;
             // [sglang-adapt-1003] root 起的 sglang：/proc/<pid>/environ 读不到（gpu=null）、
             // 或 pid 兜底未命中（runtime=unknown）→ 用 /proc cmdline 扫描的实例表补归因。
-            if (!rt || gpu == null) {
+            if (!rt || gpu == null || !pid) {
               try {
                 const sgi = listSglangInstances().find(x => x.port === p);
                 if (sgi) {
                   rt = rt || 'sglang';
                   if (gpu == null) gpu = sgi.gpu != null ? String(sgi.gpu) : null;
+                  if (!pid && sgi.pid) pid = sgi.pid;
+                }
+              } catch (e) {}
+              // [vllm-page-1003] vLLM 侧兜底（对称 SGLang）：sudo(root) 启动 + `vllm serve`
+              // CLI 形式让 pid/runtime/gpu 三空 → 「vLLM」标签页按 runtime==='vllm' 筛实例
+              // 会一个都筛不到。listVllmInstances 从 /proc cmdline 拿 pid/gpu/gpus。
+              try {
+                const vi = listVllmInstances().find(x => x.port === p);
+                if (vi) {
+                  rt = rt || 'vllm';
+                  if (gpu == null && vi.gpu != null) gpu = String(vi.gpu);
+                  if (!pid && vi.pid) pid = vi.pid;
+                  if (Array.isArray(vi.gpus) && vi.gpus.length) gpus = vi.gpus;
                 }
               } catch (e) {}
             }
@@ -2962,6 +3096,7 @@ function getVllmInstances(ports, callback) {
               model: j.data[0].id,
               pid,
               gpu,
+              gpus: gpus || (gpu != null && gpu !== '' ? [parseInt(gpu)] : null),
               runtime: rt || 'unknown',
               running: true,
             });
@@ -5640,6 +5775,7 @@ function buildInstanceConcurrency(inst, data) {
     last_second: ticker.lastSecond || null,
     kv: buildKvCacheInfo(m),
     primary: false,
+    runtime: 'vllm',   // [vllm-page-1003] 对称 SGLang 从实例；前端运行时徽标/口径分支的判据
     gen_speed_1s: (ticker.lastSecond && ticker.lastSecond.speed) || 0,
   };
 }
@@ -9667,7 +9803,7 @@ const server = http.createServer(async (req, res) => {
   const pathname = urlObj.pathname;
 
   // 09-20：内部 API/页面/静态资源启用 gzip；代理路径（chat/completions 流式）绝不压缩
-  if (pathname === '/' || pathname === '/index.html' || pathname === '/m' || pathname === '/mobile.html' || pathname === '/bench.html' || pathname === '/cpu.html' || pathname === '/sglang.html'
+  if (pathname === '/' || pathname === '/index.html' || pathname === '/m' || pathname === '/mobile.html' || pathname === '/bench.html' || pathname === '/cpu.html' || pathname === '/sglang.html' || pathname === '/vllm.html'
       || pathname.startsWith('/static/') || pathname.startsWith('/v1/internal/')) {
     installGzip(req, res);
   }
@@ -11562,6 +11698,7 @@ const server = http.createServer(async (req, res) => {
               last_second: result.last_second || null,
               kv: kvCache,
               primary: true,
+              runtime: 'vllm',   // [vllm-page-1003] 对称 _sglPrimaryInst；缺该字段时前端徽标判据拿不到运行时
               gen_speed_1s: (result.last_second && result.last_second.speed) || 0,
             }];
             const otherInsts = vllmInstances.filter(i => i.port !== primaryInst.port);
@@ -11916,6 +12053,21 @@ const server = http.createServer(async (req, res) => {
       res.end('Error fetching metrics');
     });
     rawReq.setTimeout(3000, () => rawReq.destroy(new Error('metrics timeout')));
+    return;
+  }
+
+  // === Internal API: CPU KV 二级缓存详细数据（[kv-detail-1003] vLLM 标签页专属）===
+  // ?port= 单实例；缺省全部 vLLM 实例。只读，无鉴权（GET 只读口径同 stats/metrics）。
+  if (pathname === '/v1/internal/kv-detail') {
+    const dpM = (req.url.split('?')[1] || '').match(/(?:^|&)port=(\d+)/);
+    const dp = dpM ? parseInt(dpM[1], 10) : null;
+    kvDetailInfo(dp).then((rows) => {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ instances: rows }));
+    }).catch(() => {
+      if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end('{"error":"kv-detail failed"}');
+    });
     return;
   }
 
@@ -13018,6 +13170,22 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       res.writeHead(404);
       res.end('sglang.html not found');
+    }
+    return;
+  }
+
+  // === Serve vLLM monitor UI（[vllm-page-1003]「vLLM」标签的内嵌页，纯只读监控）===
+  if (pathname === '/vllm.html' || pathname === '/vllm') {
+    const vlPath = path.join(__dirname, 'vllm.html');
+    try {
+      const content = fs.readFileSync(vlPath, 'utf8');
+      const etag = 'W/"' + Buffer.byteLength(content) + '-' + fs.statSync(vlPath).mtimeMs.toString(36) + '"';
+      if (req.headers['if-none-match'] === etag) { res.writeHead(304); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', 'ETag': etag });
+      res.end(content);
+    } catch (e) {
+      res.writeHead(404);
+      res.end('vllm.html not found');
     }
     return;
   }

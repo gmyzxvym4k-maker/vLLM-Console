@@ -725,6 +725,7 @@
             <div class="nav-tab" onclick="switchTab('cpuctl')">CPU 控制</div>
             <div class="nav-tab" onclick="switchTab('strata')">Strata</div>
             <div class="nav-tab" onclick="switchTab('sglang')">SGLang</div>
+            <div class="nav-tab" onclick="switchTab('vllm')">vLLM</div>
         </div>
     </nav>
 
@@ -1739,6 +1740,18 @@
             <iframe id="sglangFrame" title="SGLang Monitor" style="width:100%;height:calc(100vh - 200px);min-height:640px;border:1px solid var(--border);border-radius:14px;background:var(--bg-card)"></iframe>
         </div>
 
+        <!-- ==================== vLLM 引擎监控（[vllm-page-1003] 内嵌 /vllm.html，纯只读） ==================== -->
+        <div id="tab-vllm" class="tab-content hidden">
+            <div class="dash-header">
+                <div class="dash-title">vLLM</div>
+                <div class="dash-meta">
+                    <span style="font-size:12px;color:var(--text-tertiary)">vLLM 实例专属监控 · MTP 逐位接受率 / KV 池与 block 配置 / 前缀缓存 / CPU 二级缓存 / PP 双卡 · 每 2s 自动刷新</span>
+                    <button class="btn" onclick="reloadVllmFrame()">重载页面</button>
+                </div>
+            </div>
+            <iframe id="vllmFrame" title="vLLM Monitor" style="width:100%;height:calc(100vh - 200px);min-height:640px;border:1px solid var(--border);border-radius:14px;background:var(--bg-card)"></iframe>
+        </div>
+
         <!-- ==================== Strata 引擎管理（后端见 server.js STRATA 模块 · 契约 STRATA-API.md） ==================== -->
         <div id="tab-strata" class="tab-content hidden">
             <div class="section-title">
@@ -2000,7 +2013,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20261006-r7'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20261006-r9'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -2037,11 +2050,12 @@ function switchTab(tab) {
     document.getElementById('tab-' + tab).classList.remove('hidden');
     // Find and activate the correct tab
     const tabs = document.querySelectorAll('.nav-tab');
-    const map = { dashboard: 0, models: 1, energy: 2, storage: 3, usage: 4, bench: 5, cpuctl: 6, strata: 7, sglang: 8 };
+    const map = { dashboard: 0, models: 1, energy: 2, storage: 3, usage: 4, bench: 5, cpuctl: 6, strata: 7, sglang: 8, vllm: 9 };
     if (tabs[map[tab]]) tabs[map[tab]].classList.add('active');
     if (tab === 'bench') initBenchTab();
     if (tab === 'cpuctl') initCpuTab();
     if (tab === 'sglang') initSglangTab();
+    if (tab === 'vllm') initVllmTab();
     if (tab === 'strata') strataInit();
     if (tab !== 'strata') strataStopPolling();
     if (tab === 'dashboard' && isConnected) refreshDashboard();
@@ -2083,6 +2097,18 @@ function initSglangTab() {
 function reloadSglangFrame() {
     const f = document.getElementById('sglangFrame');
     if (f) f.setAttribute('src', '/sglang.html?r=' + Date.now());
+}
+
+// ====== vLLM 引擎监控标签（[vllm-page-1003] 内嵌 /vllm.html，后端 metrics?port= 按实例取数） ======
+// 懒加载口径同 bench/cpu/sglang：首次激活才拉页；页内 2s 轮询自带后台门控与看门狗，切标签不重复起。
+// 命名带 Vllm 域前缀，避免 index.html 同名函数静默覆盖（09-15 CPU 卡事故铁律）。
+function initVllmTab() {
+    const f = document.getElementById('vllmFrame');
+    if (f && !f.getAttribute('src')) f.setAttribute('src', '/vllm.html');
+}
+function reloadVllmFrame() {
+    const f = document.getElementById('vllmFrame');
+    if (f) f.setAttribute('src', '/vllm.html?r=' + Date.now());
 }
 
 function updateTimestamp() {

@@ -207,6 +207,7 @@ printf '{"token":"你的口令"}' > console-auth.json
 
 ## 深入文档
 
+- **[CHANGELOG.md](CHANGELOG.md)** — 版本更新日志：每个发布版本做了什么、为什么这么做（含架构推翻重来的缘由与判障方法论）。
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — 内部架构：进程发现、`/metrics` 缓存（400ms TTL + 单飞）、gzip/ETag 白名单、GPU 异步采样与熔断、前端轮询门控与停摆看门狗、bench 引擎闭包设计。改代码前必读。
 - **[docs/PATCHES.md](docs/PATCHES.md)** — 全部补丁清单：控制台自身的每次功能/修复迭代（含回滚文件名），以及 `patches/` 里 11 个 vLLM 侧补丁的动机、内容、验证与结论。
 - **[docs/PITFALLS.md](docs/PITFALLS.md)** — 踩坑实录：GPU 驱动 D 状态拖死控制台、仪表盘两次停刷的不同根因、tailwind 浏览器 JIT 性能坑、`AbortSignal.timeout` 冻结标签页不 settle……每一条都是真实付出过代价的经验。

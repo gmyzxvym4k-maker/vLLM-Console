@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# cpu-ctl — X99 / E5-2696 v4 运行时 CPU 控制台（单文件，vLLM 管理台「CPU 控制」页调用）
-# 移植自 bench-console/cpu-control（i5-14600K 版），本版为当前平台定制：
-#   · 平台事实：HUANANZHI X99-T8，E5-2696 v4 = 22 个同构物理核（无大小核），BIOS 已关超线程
-#     → 删除 P/E 分类、小核簇、超线程、EPP 等混合架构专属逻辑（本机全部无意义）
-#   · 新增睿频开关：/sys/devices/system/cpu/intel_pstate/no_turbo（X99/E5 平台级控制）
-#   · 新增逐核温度：coretemp hwmon，label "Core N" 与 topology/core_id 对应（core_id 不连续，
-#     如 cpu20→Core 27，实测映射成立）
-#   · 频率 1.2~3.7GHz（intel_pstate active，无 HWP），调速器 performance/powersave/ondemand 等
+# cpu-ctl — 运行时 CPU 控制台 v3（跨平台：Intel / AMD 自适应；单文件，vLLM 管理台「CPU 控制」页调用）
+# 演进史：v1 移植自 bench-console/cpu-control（i5-14600K 混合架构版）；v2 为 X99/E5 定制；
+# v3（10-05 换装 AMD EPYC 7F52 + HUANANZHI H12D-8D 后通用化）：
+#   · 睿频通道自适应：intel_pstate/no_turbo（语义反转）⇄ /sys/devices/system/cpu/cpufreq/boost
+#     （acpi-cpufreq/amd-pstate 的平台级总开关）；两者皆无时报不可用
+#   · 温度：coretemp 逐核（Intel）→ 无则回落 k10temp/zenpower 的 Tctl/Tdie 封装温度（AMD），
+#     逐核 tempC 缺省下前端显示包温；不再硬绑 coretemp
+#   · platform 串运行时生成（厂商/核数/SMT/NUMA），帮助与状态文案不再写死机型
+#   · 频率上下限/调速器全部按 sysfs 实读（本机 EPYC：acpi-cpufreq，2.5~3.5GHz，SMT 32 线程）
 # 全部为运行时软控制（写 /sys），重启回 BIOS/内核默认。
 # 用法: cpu-ctl <命令>（非 root 自动提权）  cpu-ctl help 查看全部
 # 依赖: bash / python3（status --json 与 bench）/ taskset（bench）
@@ -14,6 +15,7 @@ set -uo pipefail
 
 CPU=/sys/devices/system/cpu
 PSTATE=$CPU/intel_pstate
+BOOSTF=$CPU/cpufreq/boost      # acpi-cpufreq / amd_pstate 的全局睿频开关（1=开）
 STATE=/var/lib/cpu-ctl
 
 [[ $EUID -ne 0 ]] && exec sudo "$0" "$@"
@@ -56,6 +58,7 @@ do_status_json() {
 import glob, json, os
 CPU = '/sys/devices/system/cpu'
 PSTATE = f'{CPU}/intel_pstate'
+BOOSTF = f'{CPU}/cpufreq/boost'
 def rd(p, default=None):
     try:
         with open(p) as f: return f.read().strip()
@@ -63,20 +66,25 @@ def rd(p, default=None):
 present = sorted(int(x[3:]) for x in os.listdir(CPU) if x.startswith('cpu') and x[3:].isdigit())
 nosmt = 'nosmt' in rd('/proc/cmdline', '')
 smt_control = rd(f'{CPU}/smt/control') or 'missing'
-# coretemp 每核温度：label "Core N" 的 N 与 topology/core_id 对应；"Package id 0" 单独取
+# ---- 温度：Intel coretemp 逐核（label "Core N" ↔ topology/core_id）----
+# ----      AMD k10temp/zenpower 只有封装级 Tctl/Tdie → 填 pkg_temp，逐核留空由前端回落 ----
 core_temps = {}
 pkg_temp = None
 for h in glob.glob('/sys/class/hwmon/hwmon*'):
-    if rd(f'{h}/name') != 'coretemp': continue
+    nm = rd(f'{h}/name')
     for inp in glob.glob(f'{h}/temp*_input'):
         try: v = int(rd(inp))
         except (TypeError, ValueError): continue
         lab = rd(inp.replace('_input', '_label'), '')
-        if lab.startswith('Core'):
-            try: core_temps[int(lab.split()[1])] = v
-            except (IndexError, ValueError): pass
-        elif lab.startswith('Package'):
-            pkg_temp = v
+        if nm == 'coretemp':
+            if lab.startswith('Core'):
+                try: core_temps[int(lab.split()[1])] = v
+                except (IndexError, ValueError): pass
+            elif lab.startswith('Package'):
+                pkg_temp = v
+        elif nm in ('k10temp', 'zenpower') and pkg_temp is None:
+            if lab in ('Tctl', 'Tdie'):
+                pkg_temp = v
 online_cpus = []
 for c in present:
     if not os.path.exists(f'{CPU}/cpu{c}/online') or rd(f'{CPU}/cpu{c}/online') == '1':
@@ -107,11 +115,38 @@ for c in present:
         d['govAvail'] = (rd(f'{cf}/scaling_available_governors') or '').split()
     cores.append(d)
 model = ''
+vendor = ''
 for line in (rd('/proc/cpuinfo') or '').splitlines():
-    if line.startswith('model name'):
-        model = line.split(':', 1)[1].strip(); break
+    if line.startswith('model name') and not model:
+        model = line.split(':', 1)[1].strip()
+    elif line.startswith('vendor_id') and not vendor:
+        vendor = line.split(':', 1)[1].strip()
+    if model and vendor: break
+# ---- 平台串运行时生成：物理核数 / SMT / NUMA ----
+uniq_cores = set()
+for c in online_cpus:
+    pk = rd(f'{CPU}/cpu{c}/topology/physical_package_id', '0')
+    cid = rd(f'{CPU}/cpu{c}/topology/core_id')
+    if cid is not None: uniq_cores.add((pk, cid))
+phys = len(uniq_cores)
+sibs = len([x for x in (rd(f'{CPU}/cpu0/topology/thread_siblings_list') or '').replace(',', ' ').replace('-', ' ').split() if x.isdigit()]) if rd(f'{CPU}/cpu0/topology/thread_siblings_list') else 1
+numa_n = len(glob.glob('/sys/devices/system/node/node[0-9]*')) or 1
+drv = rd(f'{CPU}/cpu0/cpufreq/scaling_driver') or '?'
+plat_bits = [f'{phys or "?"} 物理核/{len(present)} 线程' + ('（SMT 开）' if (phys and sibs >= 2 and not nosmt) else '（无超线程）')]
+if drv: plat_bits.append(drv)
+plat_bits.append(f'{numa_n} NUMA')
+platform = (vendor or '?') + ' · ' + ' · '.join(plat_bits)
+# ---- 睿频统一抽象：intel=no_turbo（反转语义）⇄ acpi/amd=cpufreq/boost ----
+nt = rd(f'{PSTATE}/no_turbo')
+bg = rd(BOOSTF)
+if nt is not None:
+    turbo_src, turbo_on = 'intel_pstate/no_turbo', (nt == '0')
+elif bg is not None:
+    turbo_src, turbo_on = 'cpufreq/boost', (bg == '1')
+else:
+    turbo_src, turbo_on = None, None
 out = {
-    'platform': 'X99 / E5（22 同构核 · BIOS 关超线程 · 单 NUMA）',
+    'platform': platform,
     'model': model,
     'nosmt': nosmt,
     'smtControl': smt_control,
@@ -120,9 +155,12 @@ out = {
     'onlineCount': len(online_cpus),
     'cores': cores,
     'pkgTempC': round(pkg_temp / 1000) if pkg_temp else None,
+    'turbo': {'source': turbo_src, 'enabled': turbo_on},
+    # 兼容字段：前端旧逻辑按 no_turbo 字符串判断；acpi/boost 平台合成同等语义值
     'pstate': {
-        'driver': rd(f'{CPU}/cpu0/cpufreq/scaling_driver'),
-        'noTurbo': rd(f'{PSTATE}/no_turbo'),
+        'driver': drv,
+        'noTurbo': nt if nt is not None else (('0' if bg == '1' else '1') if bg is not None else None),
+        'boostGlobal': bg,
         'maxPerfPct': rd(f'{PSTATE}/max_perf_pct'),
         'minPerfPct': rd(f'{PSTATE}/min_perf_pct'),
         'turboPct': rd(f'{PSTATE}/turbo_pct'),
@@ -197,21 +235,43 @@ do_gov() {  # gov performance [spec]
   echo "gov -> $val: 成功 $ok, 失败 $fail"
 }
 
-# ---------- 睿频（intel_pstate/no_turbo，平台级） ----------
+# ---------- 睿频（跨平台：intel_pstate/no_turbo ⇄ cpufreq/boost，均为平台级总开关） ----------
+turbo_kind() {
+  if [[ -e $PSTATE/no_turbo ]]; then echo intel
+  elif [[ -e $BOOSTF ]]; then echo boost
+  else echo none; fi
+}
 do_turbo() {
-  local action=${1:-status} cur
-  [[ -e $PSTATE/no_turbo ]] || { echo "本平台无 intel_pstate/no_turbo" >&2; return 1; }
-  cur=$(cat "$PSTATE/no_turbo")
+  local action=${1:-status} kind cur is_on desc
+  kind=$(turbo_kind)
+  [[ $kind != none ]] || { echo "本平台无运行时睿频开关（既无 intel_pstate/no_turbo 也无 cpufreq/boost）" >&2; return 1; }
+  if [[ $kind = intel ]]; then
+    cur=$(cat "$PSTATE/no_turbo" 2>/dev/null)
+    [[ $cur = 0 ]] && is_on=1 || is_on=0
+    desc="no_turbo=$cur"
+  else
+    cur=$(cat "$BOOSTF" 2>/dev/null)
+    [[ $cur = 1 ]] && is_on=1 || is_on=0
+    desc="boost=$cur"
+  fi
   case "$action" in
     status)
-      [[ $cur = 0 ]] && echo "睿频: 开启（no_turbo=0，单核可冲 3.7GHz）" || echo "睿频: 关闭（no_turbo=1，封顶基频 2.2GHz）"
-      echo "当前在线: $(online_str)  max_perf_pct=$(cat $PSTATE/max_perf_pct 2>/dev/null)" ;;
+      [[ $is_on = 1 ]] && echo "睿频: 开启（$desc，通道=$kind）" || echo "睿频: 关闭（$desc，频率封顶基频）"
+      echo "当前在线: $(online_str)  驱动=$(cat $CPU/cpu0/cpufreq/scaling_driver 2>/dev/null)" ;;
     on)
-      [[ $cur = 0 ]] && { echo "已经是开启状态"; return 0; }
-      echo 0 > "$PSTATE/no_turbo" && echo "睿频已开启" || { echo "写入失败" >&2; return 1; } ;;
+      [[ $is_on = 1 ]] && { echo "已经是开启状态"; return 0; }
+      if [[ $kind = intel ]]; then
+        echo 0 > "$PSTATE/no_turbo" && echo "睿频已开启" || { echo "写入失败" >&2; return 1; }
+      else
+        echo 1 > "$BOOSTF" && echo "睿频已开启" || { echo "写入失败" >&2; return 1; }
+      fi ;;
     off)
-      [[ $cur = 1 ]] && { echo "已经是关闭状态"; return 0; }
-      echo 1 > "$PSTATE/no_turbo" && echo "睿频已关闭（频率封顶到基频 2.2GHz）" || { echo "写入失败" >&2; return 1; } ;;
+      [[ $is_on = 0 ]] && { echo "已经是关闭状态"; return 0; }
+      if [[ $kind = intel ]]; then
+        echo 1 > "$PSTATE/no_turbo" && echo "睿频已关闭（频率封顶到基频）" || { echo "写入失败" >&2; return 1; }
+      else
+        echo 0 > "$BOOSTF" && echo "睿频已关闭（频率封顶到基频）" || { echo "写入失败" >&2; return 1; }
+      fi ;;
     *) do_turbo status ;;
   esac
 }
@@ -254,7 +314,7 @@ do_bench() {
   local best=0 bestcpu=""
   for c in $(present_list); do
     is_online "$c" || continue
-    # 本机无超线程：每个在线 cpu 就是一个物理核，直接逐个测
+    # 逐逻辑线程测（SMT 开时兄弟线程互为噪声源，反映的是"线程体质"）
     out=$(taskset -c "$c" python3 - "$secs" "$c" <<'PYEOF' 2>/dev/null
 import sys, time
 dur = float(sys.argv[1]); cpuid = sys.argv[2]
@@ -319,20 +379,19 @@ case "${1:-}" in
   bench)  shift; do_bench "$@" ;;
   ""|help|-h|--help)
     cat <<'EOF'
-cpu-ctl — X99 / E5-2696 v4 运行时 CPU 控制台（重启回默认）
+cpu-ctl — 运行时 CPU 控制台 v3（跨平台 Intel/AMD，重启回默认）
 
-  cpu-ctl status --json        总览 JSON（管理台用，含逐核温度与 intel_pstate 状态）
+  cpu-ctl status --json        总览 JSON（管理台用：温度自适应 coretemp/k10temp，睿频通道自适应）
   cpu-ctl freq max 3.5G [spec] 限最高频率  spec: all|0-7,16
   cpu-ctl freq min 1.2G [spec] 锁最低频率（任意下限）
   cpu-ctl freq reset           恢复改动前的原始上/下限
   cpu-ctl gov performance      调速器（performance/powersave/ondemand/...）
-  cpu-ctl turbo on|off|status  睿频开关（intel_pstate/no_turbo，平台级）
+  cpu-ctl turbo on|off|status  睿频开关（intel_pstate/no_turbo 或 cpufreq/boost，平台级）
   cpu-ctl core off|on <n>      单个逻辑核下/上线
   cpu-ctl core all-on          一键上线全部离线核（恢复被脚本/手动下线的核）
-  cpu-ctl bench [秒]           性能测试: 逐核单线程体质 ×3 轮 + 多核并行
+  cpu-ctl bench [秒]           性能测试: 逐线程单线程体质 ×3 轮 + 多核并行
 
-平台事实: 22 同构物理核（无大小核），BIOS 关超线程（无兄弟线程可切），
-intel_pstate active 无 HWP（频率 1.2~3.7GHz，无 EPP），单 NUMA 节点。
+平台信息运行时读取（status --json 的 platform/model 字段），无机型硬编码。
 EOF
     ;;
   *) echo "未知命令: $1" >&2; exit 1 ;;

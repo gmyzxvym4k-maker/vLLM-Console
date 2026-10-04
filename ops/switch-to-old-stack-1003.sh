@@ -6,7 +6,7 @@
 # GPU/内存状态不干净有关。本脚本按"干净顺序"重来一遍：停净 → 置 DISABLED 哨兵 → 预热 PLE
 # 页缓存 → 起旧栈 → 健康检查。全程写日志，可断点复查。
 #
-# 用法（在 ll@192.168.1.127 上，脱离终端执行）：
+# 用法（在 ll@192.168.1.126 上，脱离终端执行）：
 #   setsid bash /home/ll/deploy/ops/switch-to-old-stack-1003.sh </dev/null >/dev/null 2>&1 &
 # 日志：/home/ll/deploy/switch-old-1003.log
 #

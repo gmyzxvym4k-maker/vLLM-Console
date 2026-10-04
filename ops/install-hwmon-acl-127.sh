@@ -2,7 +2,7 @@
 # vLLM 控制台 · SPD/LM78 只读探测：安装/更新 + 免密自测（幂等，可反复执行）
 #
 # 用法（在你自己的终端，会让你输一次 ll 的 sudo 密码）：
-#   ssh -t ll@192.168.1.127 "sudo bash /tmp/install-hwmon-acl-127.sh"
+#   ssh -t ll@192.168.1.126 "sudo bash /tmp/install-hwmon-acl-127.sh"
 #
 # 为什么改了探测脚本还要再跑这条：sudoers 白名单锁的是固定路径
 # /usr/local/sbin/vll-hwmon-probe.py（root:root 0755，ll 改不动），脚本内容

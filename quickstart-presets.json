@@ -5,10 +5,51 @@
     "scriptModel": "qwen3.8-flash-next-w4a16",
     "presets": [
       {
-        "key": "current-norepeat-1m-mtp4-kvoff96-oldstack",
-        "name": "当前固化-1M-MTP4-CPU96G-不复读采样t0.7-rp1.15（生产定版）",
+        "key": "current-pp3-1m-mtp4-int8disk-32g",
+        "name": "当前固化-三卡PP3-1M-MTP4-PLE-INT8硬盘驻留-无二级缓存（10-05换装生产版）",
         "engine": "script",
         "standard": true,
+        "port": 18420,
+        "modelName": "qwen3.8-flash-next-w4a16",
+        "log": "/home/ll/deploy/vllm-flash-next-w4a16.log",
+        "params": {
+          "modelName": "qwen3.8-flash-next-w4a16",
+          "port": "18420",
+          "servedName": "qwen3.8-flash-next",
+          "maxModelLen": "1048576",
+          "longCtx": "1m",
+          "gpuMemUtil": "0.93",
+          "maxNumSeqs": "4",
+          "blockSize": "1616",
+          "maxBatchedTokens": "8192",
+          "prefixCaching": "1",
+          "chunkedPrefill": "1",
+          "asyncScheduling": "1",
+          "kvCacheQuant": "auto",
+          "enforceEager": "0",
+          "parallelMode": "pp",
+          "gpuCount": "3",
+          "thinking": "1",
+          "thinkingEffort": "medium",
+          "mtp": "1",
+          "mtpTokens": "4",
+          "pleInt8": "1",
+          "pleLoc": "disk",
+          "temperature": "0.6",
+          "topP": "0.95",
+          "topK": "20",
+          "minP": "0.0",
+          "presencePenalty": "0.2",
+          "repetitionPenalty": "1.15",
+          "kvoff": "0"
+        },
+        "note": "【10-05 换装机当前生产固化档】逐键复刻自 2026-10-04 21:15 实跑实例（pid 51251 wrapper → chroot 旧栈，引擎 cmdline 58 token ＋ /home/ll/deploy/flash-next-w4a16-launch.env 双源核对）。硬件：AMD EPYC 7F52（16C/32T）+ HUANANZHI H12D-8D + 3×CMP 170HX 64G + 32GB 内存（原 Intel E5-2696 v4/双卡/64GB 机换装）。参数：1M(YaRN×4, models-1m 副本)＋block1616＋seqs4＋mbt8192＋gpu-mem0.93＋TP1×PP3（三卡满配流水线）＋MTP×4＋思考 medium（实跑值，非控制台缺省 xhigh）＋采样 t0.6/p0.95/k20/minp0/pp0.2/rp1.15（0921 反循环定档家族）。内存账（32GB 红线）：① 二级缓存必须关（kvoff=0；classic 96GiB/SimpleCPU 100GiB 均会瞬间打爆 shmem/tmpfs → 整机 OOM，看门狗 3 分钟一次的拉起循环即是该症状）；② PLE 必须 INT8+disk（mmap 47.7GiB 走可回收页缓存；INT8 heap 48.3GiB 匿名堆与 BF16 95.4GiB 均不可回收必 OOM）。冷启动约 5~8 分钟（PLE INT8 表页缓存预热）。注意：内核已回原生 5.15.0-139-generic（非当年 p2pdma 定制核），跨卡 P2P 依赖 cmpunlocker 驱动的强制能力，NCCL 大概率走 SHM 传输，PP3 吞吐影响有限、暂无需干预。"
+      },
+      {
+        "key": "current-norepeat-1m-mtp4-kvoff96-oldstack",
+        "name": "〔旧机档〕当前固化-1M-MTP4-CPU96G-不复读采样t0.7-rp1.15（10-03 双卡/64G 机定版）",
+        "engine": "script",
+        "standard": false,
         "port": 18420,
         "modelName": "qwen3.8-flash-next-w4a16",
         "log": "/home/ll/deploy/vllm-flash-next-0300.log",
@@ -42,7 +83,7 @@
           "kvoff": "1",
           "kvoffGiB": "96"
         },
-        "note": "【当前在跑实例的不复读固化档】固化自 2026-10-03 17:27 实跑实例（pid 1058763，端口 18420）。权威源＝引擎 /proc/<pid>/cmdline（59 token 实测）＋旧栈 launch.env 双源；该实例经 start-flash-next-w4a16.sh（旧 chroot 栈 wrapper）启动，vllm-0300/DISABLED 哨兵在位、控制台启动入口当前路由旧栈。参数：1M(YaRN×4，models-1m 副本)＋block1616＋seqs4＋mbt8192＋gpu-mem0.93＋TP1×PP2＋MTP×4(ring 整除合法)＋思考 xhigh＋二级缓存=经典 OffloadingConnector 96GiB（FN_KVOFF=1＋FN_KVOFF_BYTES=103079215104，旧栈实现）＋采样 t0.7/p0.95/k20/minp0/pp0/rp1.15（rp>1 抑制复读＝不复读档）。验收＝线上 scriptModelLaunchPlan(本 params) 22 键与实跑等效（唯 FN_YARN_FACTOR 4/4.0 同值表示）；旧栈 inner FN_DRY_RUN=1 产出 argv 与实跑 cmdline 逐 token 一致。注意：①旧栈不支持 FN_SIMPLE_OFFLOAD（SimpleCPU 为新栈独有，传了会告警并以无二级缓存运行），本档用 kvoff=1/经典连接器；②看门狗自愈会清掉二级缓存档，要完整档位请从控制台用本预设启动；③新栈（若 rm DISABLED 后用 0300 脚本启动）本预设同样可跑：经典连接器由 rt-patch#9 支持，但不带 --disable-custom-all-reduce 等新栈特有项。冷启动约 5~8 分钟（PLE BF16 表驻留 460s 级）。"
+        "note": "⚠️ 10-05 换装后不适用：本机仅 32GB 内存，本档 kvoff=96GiB 二级缓存会在启动后数十秒内整机 OOM（09-26 在 64GB 机即实锤）；PP2 也只用到 3 卡中的 2 卡。仅作历史参照，勿在本机一键启动。\n原注：【当前在跑实例的不复读固化档】固化自 2026-10-03 17:27 实跑实例（pid 1058763，端口 18420）。权威源＝引擎 /proc/<pid>/cmdline（59 token 实测）＋旧栈 launch.env 双源；该实例经 start-flash-next-w4a16.sh（旧 chroot 栈 wrapper）启动，vllm-0300/DISABLED 哨兵在位、控制台启动入口当前路由旧栈。参数：1M(YaRN×4，models-1m 副本)＋block1616＋seqs4＋mbt8192＋gpu-mem0.93＋TP1×PP2＋MTP×4(ring 整除合法)＋思考 xhigh＋二级缓存=经典 OffloadingConnector 96GiB（FN_KVOFF=1＋FN_KVOFF_BYTES=103079215104，旧栈实现）＋采样 t0.7/p0.95/k20/minp0/pp0/rp1.15（rp>1 抑制复读＝不复读档）。验收＝线上 scriptModelLaunchPlan(本 params) 22 键与实跑等效（唯 FN_YARN_FACTOR 4/4.0 同值表示）；旧栈 inner FN_DRY_RUN=1 产出 argv 与实跑 cmdline 逐 token 一致。注意：①旧栈不支持 FN_SIMPLE_OFFLOAD（SimpleCPU 为新栈独有，传了会告警并以无二级缓存运行），本档用 kvoff=1/经典连接器；②看门狗自愈会清掉二级缓存档，要完整档位请从控制台用本预设启动；③新栈（若 rm DISABLED 后用 0300 脚本启动）本预设同样可跑：经典连接器由 rt-patch#9 支持，但不带 --disable-custom-all-reduce 等新栈特有项。冷启动约 5~8 分钟（PLE BF16 表驻留 460s 级）。"
       },
       {
         "key": "legacy-1m-mtp4-simplecpu100",

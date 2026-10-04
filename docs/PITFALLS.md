@@ -198,6 +198,13 @@ for f in /tmp/live_chk_*.js; do node --check "$f" || echo "❌ $f 语法错误";
 
 ---
 
+### 18. 换装机（主板/CPU/GPU/内存变动）三连坑（10-05 实锤）
+10-04 深夜该机从「Intel E5-2696 v4 + X99 + 双卡 + 64GB」换成「AMD EPYC 7F52(16C/32T) + HUANANZHI H12D-8D + 三卡 + 32GB」、内核回原生 5.15.0-139-generic 后，控制台依次暴雷：
+1. **主端口粘滞缺省 8000、仪表盘整页假死 `{}`**：控制台开机比引擎早起，`resolveBackendPort()` 探不到按缺省 8000 起步；此后端口自愈只挂在 ticker 的 `req.on('error')` 一条腿上，那条腿一旦断（busy 滞留/首个请求悬挂），没有任何力量能把主端口纠回来——`/metrics` 直连明明 200，`stats` 却恒 `{}`。修成三层防御：6s 定时兜底重探 + ticker busy>15s 强制放行 + stats 空数据触发纠偏（判据宁取「渲染/数据没推进」也别只挂错误回调，参见 09-23 看门狗准则同源思想）。
+2. **CPU 控制页全线哑火**：cpu-ctl v2 把睿频写死 `intel_pstate/no_turbo`、逐核温度写死 `coretemp`——AMD 机上是 acpi-cpufreq + `cpufreq/boost`（语义相反：1=开）+ k10temp（只有封装级 Tctl）。v3 改为双通道自适应 + 平台串运行时生成；前端逐核温度缺失时回落显示封装温度（带 `*` 角标）。
+3. **旧内存档预设在新机必炸**：standard 档带的 `kvoff 96GiB`（shmem 撑爆）与 `pleLoc heap`（48.3GiB 匿名堆不可回收）在 32GB 内存上都是整机 OOM 配方。换装后第一件事是对着 `free -g` 重算内存账、重固预设与 `SCRIPT_MODELS.base`（10-05 定：PP3 + kvoff=0 + PLE INT8 disk，逐键复刻实跑 launch.env，验收=线上 scriptModelLaunchPlan 与 launch.env 全键 diff 为零）。
+另外三件小事：DHCP 又换址（127→110→127→126，ops 脚本 `CONSOLE_HOST` 缺省已指 192.168.1.126）；BIOS/RTC 时钟漂转会伪造出「未来的」 systemd 启动时间戳，判进程寿命用 `ps lstart` 别信 `systemctl show`；新板的 CMP 170HX 三卡在原生内核 + cmpunlocker 下无 p2pdma 底子，NCCL 照旧走 SHM（inner 的 `NCCL_P2P_DISABLE=1` 维持）。
+
 ## E. 移植到别的机器时最容易踩的
 
 1. 以为要 npm install——**零依赖**，只要 Node。

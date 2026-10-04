@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CPU 控制 · X99 / E5-2696 v4</title>
+<title>CPU 控制 · 运行时调优</title>
 <style>
 :root{--bg:#f1f5f9;--panel:#ffffff;--panel2:#f8fafc;--bd:#e2e8f0;--bd2:#cbd5e1;--tx:#0f172a;--tx2:#475569;--tx3:#94a3b8;--ac:#6366f1;--ac2:#eef2ff;--ok:#059669;--warn:#b45309;--bad:#dc2626;--mono:'SF Mono',Consolas,monospace;--sh:0 1px 3px rgba(28,42,70,.06),0 4px 14px rgba(28,42,70,.05)}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -41,11 +41,11 @@ input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(99,102
 </head>
 <body>
 <header>
-  <h1><span class="logo">⚙</span> CPU 控制 <span style="font-size:13px;font-weight:500;color:var(--tx2)">X99-T8 · E5-2696 v4</span></h1>
+  <h1><span class="logo">⚙</span> CPU 控制 <span id="cpuPlateSub" style="font-size:13px;font-weight:500;color:var(--tx2)">检测平台中…</span></h1>
   <span id="cpuChip">加载中…</span>
   <span style="flex:1"></span>
   <span id="cpuFresh" style="font-size:11.5px;color:var(--tx3)"></span>
-  <span style="font-size:11.5px;color:var(--tx3)">运行时软控制 sysfs，重启回 BIOS 默认 · 22 同构物理核（无大小核/超线程）</span>
+  <span style="font-size:11.5px;color:var(--tx3)">运行时软控制 sysfs，重启回 BIOS 默认（平台信息实时读取）</span>
 </header>
 <div class="sub">逐核上/下线 · 睿频开关 · 任意上/下限锁频 · 调速器 · 逐核温度 · 性能测试</div>
 
@@ -116,7 +116,7 @@ input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(99,102
       </select>
       <input id="cpuGovSpecNum" placeholder="编号，如 0-7,20" style="margin-top:8px;display:none" oninput="document.getElementById('cpuGovSpec').value=''">
       <div class="btns"><button class="btn primary" onclick="cpuGovApply()">应用</button></div>
-      <div class="hint">vLLM 推理场景常用 performance（消除调度器犹豫的升频延迟）；本机 intel_pstate active，powersave 亦能满频。</div>
+      <div class="hint">vLLM 推理场景常用 performance（消除调度器犹豫的升频延迟）；可选调速器列表按 sysfs 实时读取（intel_pstate / acpi-cpufreq / amd-pstate 通用）。</div>
     </div>
   </div>
 </div>
@@ -178,12 +178,18 @@ function renderCpuCtl(d) {
     chip.style.color = d.onlineCount === d.present.length ? 'var(--ok)' : 'var(--warn)';
   }
   set('cpuModel', d.model || '–');
-  set('cpuOnline', d.onlineCount + ' / ' + d.present.length + ' 物理核' + (d.onlineCount < d.present.length ? '（有核被下线）' : ''));
+  set('cpuOnline', d.onlineCount + ' / ' + d.present.length + ' 逻辑核' + (d.onlineCount < d.present.length ? '（有核被下线）' : ''));
   set('cpuRange', (d.minFreqTotal ? cpuGHz(d.minFreqTotal) : '?') + ' ~ ' + (d.maxFreqTotal ? cpuGHz(d.maxFreqTotal) : '?') + ' GHz');
   const pt = document.getElementById('cpuPkgTemp');
   if (pt) { pt.textContent = d.pkgTempC != null ? d.pkgTempC + ' °C' : '–'; pt.style.color = tempColor(d.pkgTempC); }
+  const plate = document.getElementById('cpuPlateSub');
+  if (plate) plate.textContent = [d.model, d.platform].filter(Boolean).join(' · ') || '未知平台';
+  // 睿频：cpu-ctl 已把 intel(no_turbo)/acpi-amd(cpufreq/boost) 两通道合成为 noTurbo 字符串
   const nt = d.pstate && d.pstate.noTurbo;
-  set('cpuTurboState', nt === '0' ? '开启（可冲 3.7GHz）' : nt === '1' ? '关闭（封顶基频 2.2GHz）' : (nt == null ? '不可用' : nt),
+  const hiGHz = d.maxFreqTotal ? (Math.round(d.maxFreqTotal / 10000) / 100) : null;
+  set('cpuTurboState', nt === '0' ? ('开启（可冲 ' + (hiGHz || '?') + 'GHz）' + (d.pstate.boostGlobal != null ? ' · boost=' + d.pstate.boostGlobal : ''))
+      : nt === '1' ? ('关闭（封顶基频' + (d.minFreqTotal ? ' ~' + (Math.round(d.minFreqTotal / 10000) / 100) + 'GHz' : '') + '）')
+      : (nt == null ? '不可用' : nt),
       nt === '0' ? 'var(--ok)' : 'var(--warn)');
   const tb = document.getElementById('cpuTurboBtn');
   if (tb) { tb.textContent = nt === '0' ? '关闭睿频' : '开启睿频'; tb.disabled = (nt !== '0' && nt !== '1'); }
@@ -215,7 +221,7 @@ function renderCpuCtl(d) {
         + '<span>cpu' + c.cpu + '</span>'
         + (c.core_id != null ? '<span style="font-size:9.5px;color:var(--tx3)">core' + c.core_id + '</span>' : '')
         + '<span style="flex:1"></span>'
-        + (c.online ? '<span id="cpuTempV-' + c.cpu + '" style="font-size:11px;font-weight:700;color:' + tempColor(c.tempC) + '">' + (c.tempC != null ? c.tempC + '°C' : '–') + '</span>' : '<span style="font-size:10.5px;color:var(--tx3)">已下线</span>')
+        + (c.online ? '<span id="cpuTempV-' + c.cpu + '" title="' + (c.tempC == null && d.pkgTempC != null ? '本机无逐核温度传感器（AMD k10temp 仅提供封装温度），显示为封装值' : '') + '" style="font-size:11px;font-weight:700;color:' + tempColor(c.tempC != null ? c.tempC : d.pkgTempC) + '">' + (c.tempC != null ? c.tempC + '°C' : (d.pkgTempC != null ? d.pkgTempC + '°C*' : '–')) + '</span>' : '<span style="font-size:10.5px;color:var(--tx3)">已下线</span>')
         + '</div>'
         + '<div id="cpuFreqV-' + c.cpu + '" style="font-size:15px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--tx)">' + (c.online ? '–' : '–') + '</div>'
         + '<div id="cpuRangeV-' + c.cpu + '" style="font-size:10.5px;color:var(--tx3);font-variant-numeric:tabular-nums">' + (c.online ? '' : '点击上线') + '</div>'
@@ -235,7 +241,7 @@ function renderCpuCtl(d) {
       } else { f.textContent = cpuGHz(c.cur) + ' GHz'; f.style.color = 'var(--tx)'; f.title = ''; }
     }
     const tp = document.getElementById('cpuTempV-' + c.cpu);
-    if (tp && c.online) { tp.textContent = c.tempC != null ? c.tempC + '°C' : '–'; tp.style.color = tempColor(c.tempC); }
+    if (tp && c.online) { const tv = c.tempC != null ? c.tempC : d.pkgTempC; tp.textContent = tv != null ? tv + '°C' + (c.tempC == null && d.pkgTempC != null ? '*' : '') : '–'; tp.style.color = tempColor(tv); }
     const r = document.getElementById('cpuRangeV-' + c.cpu);
     if (r && c.online) r.textContent = cpuGHz(c.min) + ' ~ ' + cpuGHz(c.max) + ' GHz';
   });
@@ -317,7 +323,7 @@ function cpuAllOn() {
 function cpuTurboToggle() {
   const st = (document.getElementById('cpuTurboState').textContent || '').trim();
   const turningOn = st.indexOf('关闭') >= 0;
-  if (!confirm((turningOn ? '开启' : '关闭') + '睿频？（intel_pstate/no_turbo 运行时直切，立即生效）')) return;
+  if (!confirm((turningOn ? '开启' : '关闭') + '睿频？（运行时直切平台级开关 intel_pstate/no_turbo 或 cpufreq/boost，立即生效）')) return;
   cpuCmd(turningOn ? 'turbo_on' : 'turbo_off', {}, (turningOn ? '开启' : '关闭') + '睿频');
 }
 

@@ -2,7 +2,7 @@
 # vLLM 控制台 · CPU 控制（cpu-ctl）安装/更新 + 免密自测（幂等，可反复执行）
 #
 # 用法（在你自己的终端）：
-#   scp cpu-ctl ops/install-cpu-ctl-127.sh ll@192.168.1.127:/tmp/
+#   scp cpu-ctl ops/install-cpu-ctl-127.sh ll@192.168.1.126:/tmp/
 #   ssh -t ll@<控制台机IP> "sudo bash /tmp/install-cpu-ctl-127.sh"   # -t 分配 TTY，现场输口令
 #   （口令不写进仓库、也不留在 shell 历史里；控制台机是 DHCP 地址，换了就用当时实际的 IP）
 #

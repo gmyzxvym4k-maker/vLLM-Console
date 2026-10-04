@@ -487,6 +487,14 @@ function maybeReDetectBackend() {
   } catch (e) {}
 }
 
+// [hw-move 1005] 无条件定时兜底：原自愈只挂在 ticker 的 req error 回调（1774）上，
+// 只要那条链断裂（busy 滞留 / 首个请求挂起不报错 / 迁移期时序竞态），主端口就会
+// 永久卡在启动缺省 8000——10-04 换装机实锤：引擎在跑、/metrics 直连 200，但
+// stats 恒 {}、代理打 8000，且日志里出现过跟随却没保住。此处每 6s 主动探一次
+// （maybeReDetectBackend 内部自带 5s 节流；resolveBackendPort 是无子进程的纯
+// /proc 扫描，毫秒级；探不到返回 null 保持现状，不会再引入横跳）。
+setInterval(() => { try { maybeReDetectBackend(); } catch (e) {} }, 6000).unref();
+
 // ====== Multi-model support ======
 // Map of served model name -> vLLM backend port. Each backend is its own
 // `vllm serve` instance pinned to one GPU. Unknown model names fall back to
@@ -560,7 +568,7 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   // 官方 0.30.0 新栈的日志（start-flash-next-0300.sh 里 FN_LOG 缺省值）。祖先链 cmdline
   // 通常已能定位到它（见 ancestorLogFiles），这里兜底：cmdline 拿不到时仍能选中新日志。
   altLogs: ['/home/ll/deploy/vllm-flash-next-0300.log'],
-  note: '\u5bb9\u5668\u955c\u50cf PP2 \u811a\u672c\u542f\u52a8\uff08W4A16-AutoRound\uff0c\u5b98\u65b9\u624b\u518c \u00a74\uff09\uff0c\u52a0\u8f7d\u7ea6 3~9 \u5206\u949f',
+  note: '\\u5bb9\\u5668\\u955c\\u50cf PP\\u00d7\\u5361\\u6570\\u811a\\u672c\\u542f\\u52a8\\uff08W4A16-AutoRound\\uff0c\\u5b98\\u65b9\\u624b\\u518c \\u00a74\\uff09\\uff0c\\u52a0\\u8f7d\\u7ea6 3~9 \\u5206\\u949f\\uff1b10-05 \\u6362\\u88c5\\u540e\\u672c\\u673a 3 \\u5361=PP3',
   base: {
     maxModelLen: 262144, gpuMemUtil: 0.93, maxNumSeqs: 4, maxBatchedTokens: 8192,
     // [gen-loopfix 0929] 采样基准回到 09-21 反循环定档 t0.6 / p0.95 / k20 / minp0 / pp0.1 / rp1.0（用户 09-29 拍板：09-27 的 1/0/1 裸档导致思考模型 uct/duct token 级硬循环）。
@@ -568,11 +576,14 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
     // GENCFG_DEFAULT 必须与此逐字段一致（flash-next-w4a16-inner.sh / vllm-0300/bin/flash-next-0300-inner.sh），
     // 否则会出现「弹窗显示 ≠ 引擎 cmdline 真值」。
     blockSize: 1616, temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-    presencePenalty: 0.2, repetitionPenalty: 1.15, pp: 2, mtpTokens: 4,
-    // [kvoff-off 0929] 生产真值：二级缓存关（A/B 定案 21h 零外部命中，省 107GB pinned）；
-    // PLE=INT8+heap（匿名堆 49.2GB，不受 pinned 挤压页缓存影响，disk 模式与
-    // 大 pinned 层共存有缺页拖垮 decode 的结构性风险，见 09-19 事故模式）。
-    kvoff: 'simple', kvOffGiB: 96, pleInt8: '1', pleLoc: 'heap', // 0927 生产定版=SimpleCPU 96GiB
+    presencePenalty: 0.2, repetitionPenalty: 1.15, pp: 3, mtpTokens: 4,
+    // [hw-move 1005] 换装 HUANANZHI H12D-8D + EPYC 7F52 + 3×CMP 170HX + 仅 32GB 内存：
+    // ① PP 基准 2→3（三卡满配，与 10-04 实跑实例 FN_PP=3 一致）；
+    // ② 二级缓存关（classic 96GiB / SimpleCPU 100GiB 在 64GB 机即实锤 OOM，32GB 更快炸）；
+    // ③ PLE 唯一可行档 = INT8+disk（mmap 47.7GiB 可回收页缓存，10-04 实跑验证；
+    //    INT8 heap 匿名堆 48.3GiB 与 BF16 95.4GiB 均不可回收、必 OOM）。
+    // （存档：0929/0927 定版的 kvoff=simple 96GiB 与 pleLoc=heap 均以大内存机为前提，已随换装作废。）
+    kvoff: '0', pleInt8: '1', pleLoc: 'disk', // 1005 生产定版=二级缓存关 + PLE INT8 硬盘驻留
   },
   bannedArgs: ['--mamba-ssm-cache-dtype', '--mamba-cache-mode', '--language-model-only',
                '--enable-prompt-tokens-details', '--safetensors-load-strategy',
@@ -929,7 +940,7 @@ function scriptModelLaunchPlan(sm, d) {
     env.FN_TP = String(_gpus);
     env.FN_PP = '1';
     env.FN_PP_PARTITION = 'none';
-    if (_gpus !== 2) warnings.push('TP×' + _gpus + '：本机 2 张卡，请确认卡数与 --tensor-parallel-size 匹配（TP2 为当前硬件满配）');
+    if (_gpus !== 2) warnings.push('TP×' + _gpus + '：请确认与在位 GPU 数匹配（10-05 换装后本机 3 卡；TP 档内存/PLE 分片账另行评估）');
   } else {
     env.FN_TP = '1';
     env.FN_PP = String(_parMode === 'pp' && _gpus >= 1 ? _gpus : (b.pp || 2));
@@ -1625,8 +1636,14 @@ function readSglangTheory(port) {
 // 采样指定端口的 /metrics 并更新对应 ticker（主/从端口共用）
 function samplePortMetrics(port) {
   const tk = getTicker(port);
-  if (tk.busy) return;
-  tk.busy = true;
+  // [hw-move 1005] busy 滞留防御：底层请求既不 resolve 也不 reject（半开连接等罕见态）
+  // 会让 busy 永真、该端口 ticker 从此停摆——连带端口自愈的错误回调永不触发。
+  // 超过 15s 未见结算即强制放行下一轮（正常一轮 <3s）。
+  if (tk.busy) {
+    if (!(tk.busySince && Date.now() - tk.busySince > 15000)) return;
+    console.error(`[ticker:${port}] busy 滞留 >15s，强制放行（疑似半开连接）`);
+  }
+  tk.busy = true; tk.busySince = Date.now();
   const req = http.get(`http://${config.vllmHost}:${port}/metrics`, (proxyRes) => {
     let data = '';
     proxyRes.on('data', c => data += c);
@@ -9820,11 +9837,12 @@ async function strataHandle(req, res, urlObj) {
 }
 // ==== [strata-console] END module ====
 
-// ---------------- 5) CPU 控制（X99 / E5-2696 v4 定制版，移植自 bench-console/cpu-control） ----------------
+// ---------------- 5) CPU 控制（跨平台版 v3：Intel intel_pstate / AMD·acpi-cpufreq boost 自适应，移植自 bench-console/cpu-control） ----------------
 // 调 /usr/local/bin/cpu-ctl（脚本随本仓库部署；非 root 时自提权，需 sudoers.d 白名单，
 // 见 ops/install-cpu-ctl-127.sh）。全部为运行时软控制 sysfs，重启回 BIOS/内核默认。
-// 本机 22 同构核、BIOS 关超线程、无 HWP → 上游的小核簇/超线程/EPP 动作已删，
-// 新增睿频开关（intel_pstate/no_turbo）。
+// 混合架构专属动作（小核簇/超线程/EPP）维持删除；睿频开关由 cpu-ctl 抽象
+// （intel 走 no_turbo，AMD/acpi 走 /sys/devices/system/cpu/cpufreq/boost）。
+// 10-05 换装：AMD EPYC 7F52 16C/32T（SMT 开），HUANANZHI H12D-8D。
 // 接口: GET  /v1/internal/cpuctl      状态 JSON（0.5s TTL 缓存 + 单飞，防轮询叠发）
 //       POST /v1/internal/cpuctl/cmd  action 白名单（走既有 /v1/internal/ POST 口令拦截）
 // 铁律遵守：execFile + 自身 timeout，绝不 execSync——sysfs/脚本卡住不许拖垮事件循环。
@@ -11527,6 +11545,9 @@ const server = http.createServer(async (req, res) => {
 
     // 09-20：/metrics 走缓存+单飞（400ms TTL）——此前每次 stats 都实时抓 64KB 上游
     fetchMetricsCached(`${vllmBaseUrl}/metrics`, 400, 3000).then(async (data) => {
+        // [hw-move 1005] 主端口拿不到 metrics 也是端口漂移的直接证据，顺手触发一次
+        // 再探测（内部 5s 节流；探不到保持现状）。防止 stats 长期 {} 而无人纠偏。
+        if (!data) { try { maybeReDetectBackend(); } catch (e) {} }
         try {
           const m = parseMetrics(data);
           // SGLang 运行时：指标命名/结构不同，走独立构建器（vllm 路径保持不变）

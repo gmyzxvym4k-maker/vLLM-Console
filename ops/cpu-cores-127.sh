@@ -4,7 +4,7 @@
 # 背景：该机 22 个逻辑 CPU 就是 22 个同构物理核（无大小核、无超线程配对），
 #       编号 n 与 Core ID n 一一对应，"关奇数编号"= 精确关掉 11 个物理核。
 #
-# 用法（在 127 本机执行，或 ssh ll@192.168.1.127 'bash /home/ll/deploy/ops/cpu-cores-127.sh <cmd>'）：
+# 用法（在 127 本机执行，或 ssh ll@192.168.1.126 'bash /home/ll/deploy/ops/cpu-cores-127.sh <cmd>'）：
 #   cpu-cores-127.sh status          查看当前在线/离线核心与服务健康
 #   cpu-cores-127.sh off <目标>       下线核心：<目标> 可为 odd / even / 显式列表
 #                                    列表支持逗号与区间，如 off 2,6,10,14,18 或 off 4-9

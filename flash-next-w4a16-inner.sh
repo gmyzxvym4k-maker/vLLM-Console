@@ -112,12 +112,12 @@ export VLLM_SKIP_MM_WARMUP=1
 export VLLM_CACHE_ROOT="${FN_CACHE_ROOT:-/root/.cache/vllm-flash-next-w4a16}"
 mkdir -p "$VLLM_CACHE_ROOT" 2>/dev/null || true
 
-# 无 P2P（CNS）：NCCL 走 host SHM
+# 无 P2P（CNS）：NCCL 走 host SHM。10-05 换装 EPYC+原生内核后依旧无 P2P 底子（无 p2pdma 定制核），保持禁用
 # 0919 P2P 实验：平台已换 X99-T8，topo -p2p r=OK，实测跨卡 copy 5.27GB/s，启用 P2P（回滚=恢复 .bak-p2p-0919）
 # export NCCL_P2P_DISABLE=1
 export NCCL_SHM_DISABLE=0
 # 0919 关键：GA100 双卡为 PHB 拓扑（同桥异根端口），NCCL 默认 P2P 级别 LOC 不跨 PHB，必须显式放行（见 CMP170HX-P2P-打通记录.md §2.5）
-export NCCL_P2P_LEVEL=PHB  # 0919 A/B 定版：P2P 生效（via P2P/IPC），性能与 SHM 持平，保留 P2P（省 CPU 中继）
+export NCCL_P2P_DISABLE=1  # [p2pfix 1001] 09-30 驱动 BAR1 P2P 补丁数据通路损坏（拷贝校验失败），禁用走 SHM
 export NCCL_CUMEM_ENABLE=0
 export NCCL_NET_GDR_LEVEL=0
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"  # 0919 实验结束回 WARN（实验期曾临时 INFO）
@@ -160,7 +160,7 @@ if [ "${FN_LONGCTX:-0}" = "1" ]; then
 fi
 # 采样参数缺省（可被 FN_GENCFG 覆盖；与 server.js SCRIPT_MODELS.base、快启预设 p2p-mtp4 一致）
 # [gendefault 0927] 采样缺省定档 t1.0/p0.95/k20/minp0/pp0/rp1.0（与 server.js SCRIPT_MODELS.base 逐字段一致）
-GENCFG_DEFAULT='{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"repetition_penalty":1.0}'
+GENCFG_DEFAULT='{"temperature":0.6,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.2,"repetition_penalty":1.15}'
 CHATKW_DEFAULT='{"enable_thinking":true,"preserve_thinking":true}'
 
 ARGS=(
@@ -179,7 +179,7 @@ ARGS=(
   # gavinxym 手册：sharded mamba cache dtype 不一致 → float32 必传
   --mamba-ssm-cache-dtype "${FN_SSMDTYPE:-float32}"
   --max-num-seqs "${FN_SEQS:-4}"
-  --gpu-memory-utilization "${FN_GPUMEM:-0.95}"
+  --gpu-memory-utilization "${FN_GPUMEM:-0.93}"
   --enable-prefix-caching
   --enable-prompt-tokens-details
   --max-num-batched-tokens "${FN_MBTOKENS:-8192}"
@@ -245,6 +245,14 @@ esac
 # store_threshold=2：只存被查过≥2 次的块（write_back 类比，防一次性文档冲刷档位——
 # 参照 ChinaBoy0618/170hx 仓库 v1.0.0 write_through→write_back 的演进经验）。
 # 回滚：FN_KVOFF=0；调容量：FN_KVOFF_BYTES=<字节数>
+# 【1003 路由防呆】SimpleCPUOffloadConnector（FN_SIMPLE_OFFLOAD，百G 二级缓存的正确开关）
+# 只存在于官方 vLLM 0.30.0 新栈（vllm-0300/bin/flash-next-0300-inner.sh 消费）。
+# 本旧 chroot 栈不实现它——以前传入时被静默忽略，造成「设了 100G 却没开」的迷惑
+# （10-03 实锤：envfile FN_SIMPLE_OFFLOAD=100，引擎 cmdline 无任何 offload 参数）。
+# 现在显式报警；要二级缓存请走新栈（rm vllm-0300/DISABLED 后从新栈脚本重启）。
+if [ -n "${FN_SIMPLE_OFFLOAD:-}" ]; then
+  echo "[WARN] 旧 chroot 栈不支持 FN_SIMPLE_OFFLOAD=${FN_SIMPLE_OFFLOAD}（SimpleCPU 二级缓存仅官方 vLLM 0.30.0 新栈实现）；本实例将以【无二级缓存】运行。需要二级缓存：rm /home/ll/deploy/vllm-0300/DISABLED 后经 vllm-0300/start-flash-next-0300.sh 重启。" >&2
+fi
 if [ "${FN_KVOFF:-0}" = "1" ]; then  # 0924 卡死实锤后缺省关（三次 hang 死均紧跟 KVOFF store/load）
   KVOFF_BYTES="${FN_KVOFF_BYTES:-103079215104}"
   # store_threshold 教训（09-24 定案）：=2 对本机「增长型多轮对话」负载是毒药——

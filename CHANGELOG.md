@@ -2,6 +2,20 @@
 
 本文件记录对外发布的版本变更。版本号遵循语义化版本，标签形如 `v1.0.0`。
 
+
+---
+
+## Unreleased — 2026-10-05 换装机适配（页面戳 20261006-r14）
+
+受管机（ll-desktop）换装：Intel E5-2696 v4/X99/双卡/64GB → **AMD EPYC 7F52 16C/32T + HUANANZHI H12D-8D + 3×CMP 170HX + 32GB**，内核回原生 5.15.0-139，控制台地址随之变为 `http://192.168.1.126:8889/`。
+
+- **server.js 主端口自愈三层防御**：6s 定时兜底重探（`maybeReDetectBackend`）、ticker `busy`>15s 强制放行、`/v1/internal/stats` 空数据触发纠偏。修复换装开机时序竞态导致的「引擎在跑、`/metrics` 直连 200、仪表盘却恒 `{}`、代理打 8000」整页假死。
+- **`SCRIPT_MODELS.base` 与快启预设按 32GB 内存账重固**：`pp:3`、二级缓存关（96/100GiB 档在 32GB 机必 OOM，降级为〔旧机档〕）、PLE 唯一可行档 INT8+disk；新 standard 档 `current-pp3-1m-mtp4-int8disk-32g` 逐键复刻 10-04 实跑实例（验收＝线上 `scriptModelLaunchPlan()` 输出与 `flash-next-w4a16-launch.env` 全键 diff 为零）。
+- **cpu-ctl v3 跨平台化**：睿频通道自适应（`intel_pstate/no_turbo` ⇄ `cpufreq/boost`，语义自动反转）、温度自适应（coretemp 逐核 ⇄ k10temp/zenpower 封装级回落）、平台/机型串运行时生成，去除 X99/E5 硬编码；`cpu.html` 标题、睿频文案、逐核温度（缺逐核传感时显示封装温度带 `*`）同步适配。
+- **启停脚本安全整改落地线上**：`start/stop/watchdog` 切换到 `lib/sudo-pass.sh` 口令链路（`~/.console-sudo`，600），受管机上的明文口令版本就此替换；watchdog 合并保留线上领先的栈路由逻辑。
+- **文案卡数自适应**：「启动双卡/两卡合计/PP 双卡」等措辞改为全部卡/跨卡合计/PP 多卡；GPU 功耗与采样链路实测三卡全自动纳管（`gpu-ctl` 三卡 210W、能耗页「3 卡合计」）。
+- `ops/` 脚本与文档的目标机指向 192.168.1.126。
+
 ---
 
 ## v1.0.0 — 2026-10-07

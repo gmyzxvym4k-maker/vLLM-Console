@@ -7620,19 +7620,35 @@ function buildCpuStatic() {
   out.single_thread_core_count = singleThreads; // 单线程核数（Intel 混合架构 = E 核）
   out.hybrid = htThreads > 0 && singleThreads > 0;
   out.physical_cores = htCores + singleThreads;
-  // 缓存层级：cpu0 的 index*（shared_cpu_list 说明共享域）
-  const caches = [], seenCache = new Set();
-  for (let idx = 0; idx < 10; idx++) {
-    const dir = sysbase + '/cpu0/cache/index' + idx;
-    if (!fs.existsSync(dir)) continue;
-    const level = cpuNum(dir + '/level');
-    const type = (cpuRead(dir + '/type') || '').trim();
-    const size = (cpuRead(dir + '/size') || '').trim();
-    const shared = expandCpuList(cpuRead(dir + '/shared_cpu_list') || '').length || 1;
-    const line = cpuNum(dir + '/physical_line_size');
-    const key = level + ':' + type + ':' + size + ':' + shared;
-    if (seenCache.has(key)) continue; seenCache.add(key);
-    caches.push({ level, type, size, shared_cpus: shared, line });
+  // 缓存层级：扫描全部 CPU 的 index*，按「共享域」去重后聚合总量（10-05 EPYC 机实锤只读 cpu0 会把
+  // 16 核×16MB=256MB 的 L3 显示成一个域的 16MB——服务器 CPU 每核/每 CCX 一个同级切片）。
+  // 域判据：(level,type,size,min(shared_cpu)) 唯一化后计数；size 输出 Σ，slice/domains 留明细。
+  const caches = [];
+  const cacheAgg = new Map(); // key(level:type) -> {level,type,totalKB,slices:Set,sliceKB,line,repShared}
+  const kbOf = (sz) => { const m = String(sz).match(/^(\d+)\s*([KMGT]?B?)$/i); if (!m) return 0; const n = +m[1]; const u = m[2].toUpperCase(); return n * (u.startsWith('G') ? 1048576 : u.startsWith('M') ? 1024 : 1); };
+  const humanKB = (kb) => (kb >= 1048576 && kb % 1048576 === 0 ? (kb / 1048576) + 'G' : (kb % 1024 === 0 ? (kb / 1024) + 'M' : kb + 'K'));
+  const _cacheDomSeen = new Set();
+  for (const ci of cpus) {
+    for (let idx = 0; idx < 10; idx++) {
+      const dir = sysbase + '/cpu' + ci + '/cache/index' + idx;
+      if (!fs.existsSync(dir)) continue;
+      const level = cpuNum(dir + '/level'); if (level == null) continue;
+      const type = (cpuRead(dir + '/type') || '').trim();
+      const szRaw = (cpuRead(dir + '/size') || '').trim();
+      const skb = kbOf(szRaw); if (!skb) continue;
+      const sharedList = expandCpuList(cpuRead(dir + '/shared_cpu_list') || '');
+      const domKey = level + ':' + type + ':' + szRaw + ':' + (sharedList[0] != null ? sharedList[0] : ci);
+      if (!_cacheDomSeen.has(domKey)) {
+        _cacheDomSeen.add(domKey);
+        const ak = level + ':' + type;
+        let a = cacheAgg.get(ak);
+        if (!a) { a = { level, type, totalKB: 0, sliceKB: skb, domains: 0, line: cpuNum(dir + '/physical_line_size'), repShared: sharedList.length || 1 }; cacheAgg.set(ak, a); }
+        a.totalKB += skb; a.domains += 1;
+      }
+    }
+  }
+  for (const a of Array.from(cacheAgg.values()).sort((x, y) => x.level - y.level)) {
+    caches.push({ level: a.level, type: a.type, size: humanKB(a.totalKB), slice_size: humanKB(a.sliceKB), domains: a.domains, shared_cpus: a.repShared, line: a.line });
   }
   out.caches = caches;
   // 调频：驱动 / governor / EPP / 频率范围 / 睿频开关
@@ -7734,7 +7750,10 @@ function sampleCpuStats() {
       else cores.push({ cpu: +m[1].slice(3), pct: pct != null ? Math.round(pct) : null });
     }
     global.__cpuPrev = prev;
-    // 封装温度：优先 x86_pkg_temp/k10temp/coretemp，退化 acpitz
+    // 封装温度：优先 thermal_zone（x86_pkg_temp/k10temp/...），zone 里找不到偏好类型或缺 zone 时
+    // 回落 hwmon（10-05 EPYC 板实锤：/sys/class/thermal 整个为空，k10temp 只在 hwmon2 挂着，
+    // 页面封装温度恒 --）。hwmon 侧标签判据：Tctl/Package 优先（整机封装值），Tdie 次之，
+    // 避开 k10temp 的逐 CCD 分量 Tccd*（拿它当封装温度是错的口径）。
     let temp = null, tempSrc = null;
     try {
       const prefer = ['x86_pkg_temp', 'k10temp', 'coretemp', 'soc_thermal', 'cpu_thermal', 'acpitz'];
@@ -7750,6 +7769,34 @@ function sampleCpuStats() {
       }
       if (best && best.rank < 99) { temp = +best.temp.toFixed(1); tempSrc = best.type; }
     } catch (e) {}
+    if (temp == null) {
+      try {
+        const preferHw = ['k10temp', 'x86_pkg_temp', 'coretemp', 'zenpower', 'soc_thermal', 'cpu_thermal', 'acpitz'];
+        let bh = null;
+        for (const hd of fs.readdirSync('/sys/class/hwmon')) {
+          if (!/^hwmon\d+$/.test(hd)) continue;
+          const nm = (cpuRead('/sys/class/hwmon/' + hd + '/name') || '').trim();
+          const rank = preferHw.indexOf(nm);
+          if (rank < 0) continue;
+          let tf;
+          try { tf = fs.readdirSync('/sys/class/hwmon/' + hd).filter((f) => /^temp\d+_input$/.test(f)); } catch (e) { continue; }
+          for (const f of tf) {
+            const v = cpuNum('/sys/class/hwmon/' + hd + '/' + f);
+            if (v == null) continue;
+            const lab = (cpuRead('/sys/class/hwmon/' + hd + '/' + f.replace('_input', '_label')) || '').trim();
+            let sc; // 同传感器族内择优：封装级 > 无名单传感器 > 其它
+            if (/^(Tctl|Package|Physical)/i.test(lab)) sc = 0;
+            else if (/^Tdie$/i.test(lab)) sc = 1;
+            else if (!lab || /^temp$/i.test(lab)) sc = 2;
+            else if (/^Core ?\d+$/i.test(lab)) sc = 3;      // coretemp 无 Package 标签时退逐核
+            else if (/^Tccd/i.test(lab)) sc = 9;            // 逐 CCD 分量：垫底不作封装值
+            else sc = 4;
+            if (!bh || rank < bh.rank || (rank === bh.rank && sc < bh.sc)) bh = { v, nm, lab, rank, sc };
+          }
+        }
+        if (bh) { temp = +(bh.v / 1000).toFixed(1); tempSrc = bh.nm + (bh.lab ? '(' + bh.lab + ')' : ''); }
+      } catch (e) {}
+    }
     // 各逻辑核当前频率（kHz→MHz，取均值与最大值；混合架构 P/E 频率不同）
     // 09-18 修复：同步读全部核 scaling_cur_freq 需 350~600ms（每核首次打开触发内核慢路径），
     // 在 1s 采样器里会阻塞事件循环、饿死 GPU 卡等所有秒级数据 → 频率改由

@@ -148,6 +148,14 @@
 - **为什么这是治本**：同一病因已犯三次——09-26（w4a16 → 官方 0.30.0 换栈）、09-27（两栈并存）、09-29（换 uncensored）。凡是「显示判据要先去注册表登记新东西」的结构，上新模型时必失配，而且**静默回落、无一处报错**。判据要挂在「进程」这个真值源上，不是挂在「配置表」上。
 - **落点与回滚**：`server.js` 的 `pickLogFromProcs()` / `getVllmLogSource()` ⓪ 段；线上备份 `server.js.bak-logsrc-0929`。验证手法：`curl /v1/internal/vllm-logs?tailLines=400` 看返回的 `file` 是否等于 wrapper argv 里那份日志（对照 `ps` 的 argv），再看 `stale_min` 归零。
 
+### 14e-2. argv 判据第四次失灵：重定向发生在 wrapper shell 内部时 cmdline 里没有 .log（10-05，已上线）
+
+- **症状**：与 14e 同款——接口返回 `"file":"/home/ll/deploy/vllm.log","stale_min":4386,"cleared":true`，面板空白；引擎 189200 在跑、`vllm-flash-next-w4a16.log` 每秒都在写。
+- **根因**：14e 的 ⓪ 段判据「祖先链 cmdline 里的 .log token」**隐含前提是日志路径以独立 argv 参数出现**（当时的 wrapper 形态 `sh -c 'exec setsid bash "$1" >> "$2"' _ <inner> <logfile>`）。10-05 现场的启动链换成**看门狗托管**：`fnx-watchdog → bash start-flash-next-w4a16.sh`（最后一行 `sudo_run setsid chroot … >> "$LOG" 2>&1` 的重定向由 wrapper **shell 自己**做，不进任何 cmdline）→ `sudo(root)` → chroot 引擎(root)。祖先链各级 cmdline 实测零个 `.log` token → argv 判据失明；① 段注册表打分又不命中（引擎模型路径换新为 `models-1m/Qwen3.8-Flash-Next-Channel-INT8-w8a8-1M`，与注册表路径不同源）；②③ 读 root 引擎 fd 是 EACCES → 三路全断，再次跌 ⑤ 兜底。
+- **修法（已上线 10-05，PAGE_VERSION 20261006-r16）**：新增 `ancestorFdLogFiles()/ancestorFdLogFile()`——argv 判据落空时沿祖先链找**本用户可读**进程（看门狗/wrapper 属 ll）的 `fd1/fd2` 所指 `.log`（bash 把重定向继承给 exec 的子进程，wrapper 的 fd1 就是日志真身），并用「引擎模型路径 or `(APIServer pid=N)`」做 `logFileMentions` 内容交叉校验防拿错文件；接入 `pickLogFromProcs()`（⓪ 段）与 `pickScriptModelLogFile()`（①′ 后加 ①″，PLE 显示共用）。另加透明化：⑤ 兜底返回 `fallback:true` → 端点透传 → 前端红条「未能定位当前运行引擎所写的日志文件」，杜绝静默显示陈年文件。
+- **推广教训**：argv 判据与 fd 判据是互补关系不是替代关系——**重定向在哪一层做，真值就在哪一层的 fd 上**；判据链至少要备齐「cmdline token」「祖先 fd」「内容校验」三种形态才不会随启动器演化再度失明。
+- **落点与回滚**：`server.js` 的 `ancestorFdLogFiles/ancestorFdLogFile/pickLogFromProcs/pickScriptModelLogFile/getVllmLogSource` + `index.html` fallback 红条；线上备份 `server.js.bak-logsrc-1005-0020` / `index.html.bak-logsrc-1005-0020`。验证手法同上（`file` 应为引擎祖先 wrapper fd1 指向的日志、`fallback:false`、`stale_min` 归零）。
+
 ### 14f. 显存温度显示：`temperature.memory` 与核心温度阈值不能混用（09-29，已上线）
 
 - **需求**：显卡信息加显存温度。`nvidia-smi --query-gpu=temperature.memory` 在 CMP 170HX（cmpunlocker 魔改驱动 610.43.03）实测可返回数值（核心 68/显存 74、核心 64/显存 68）。

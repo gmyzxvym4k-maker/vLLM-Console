@@ -3952,6 +3952,59 @@ function ancestorLogFiles(pid, maxHops) {
   }
   return found;
 }
+// 10-05 修复「vLLM 运行日志显示不出来」的根因：ancestorLogFiles 的判据太窄。
+// 它能工作的唯一前提是「日志路径作为一个独立 argv token 出现在祖先链 cmdline 里」
+// （旧 wrapper 形态 sudo -S sh -c 'exec setsid bash "$1" >> "$2"' _ <inner> <logfile>）。
+// 现行启动链是 看门狗 setsid nohup bash start-flash-next-w4a16.sh >> LAUNCH_LOG
+// → wrapper 最后一行 sudo_run setsid chroot …（shell 级重定向不进任何 cmdline）
+// → sudo(root) → 引擎(root)。于是祖先链 argv 里没有任何 .log token（实测 hops=4 全空），
+// ①′ 判据失明；② 候选打分链的 sm.log 注册路径也已与实际写入文件脱钩；普通进程读 root
+// 进程的 /proc/<pid>/fd 又是 EACCES——三条路全断 → 一路跌到 ⑤ 兜底 ./vllm.log
+// （10-01 的陈旧崩溃日志），面板表现为空白 + 「已 N 千分钟没有新内容」。
+// 补救判据：祖先链上**本用户可读**的进程（看门狗/wrapper 属 ll），其 fd1/fd2 指向的
+// 普通文件就是日志真身（bash 会把重定向继承给它 exec 的子进程）；再用内容交叉校验
+// （文件里出现过引擎的 APIServer pid=N 或模型路径）防止拿错文件。
+function ancestorFdLogFiles(pid, needles, maxHops) {
+  const out = [];
+  let cur = pid | 0;
+  for (let hop = 1; hop <= (maxHops || 5) && cur > 1; hop++) {
+    let ppid = 0;
+    try {
+      const st = fs.readFileSync('/proc/' + cur + '/stat', 'utf8');
+      ppid = parseInt(st.slice(st.lastIndexOf(')') + 1).trim().split(/\s+/)[1], 10) || 0;
+    } catch (e) { break; }
+    if (!ppid || ppid === cur) break;
+    cur = ppid;
+    for (const fd of ['1', '2']) {
+      let link = '';
+      try { link = fs.readlinkSync('/proc/' + cur + '/fd/' + fd); } catch (e) { continue; } // root 进程 → EACCES，跳过
+      if (!/^\/\S+\.log$/.test(link)) continue;
+      let ok = false;
+      try {
+        if (!fs.statSync(link).isFile()) continue;
+        fs.accessSync(link, fs.constants.R_OK);
+        ok = !needles || !needles.length || needles.some((nd) => nd && logFileMentions(link, nd));
+      } catch (e) { continue; }
+      if (ok && !out.some((f) => f.file === link)) out.push({ file: link, hop: hop });
+    }
+  }
+  return out;
+}
+// 祖先链 fd 判据的统一入口：先从引擎 cmdline 提取模型路径作校验 needle，再向上找。
+function ancestorFdLogFile(enginePid, maxHops) {
+  const needles = [];
+  try {
+    const cmd = fs.readFileSync('/proc/' + (enginePid | 0) + '/cmdline', 'utf8').split('\0').join(' ');
+    const m = cmd.match(/(?:serve|--model(?:-path)?)\s+(\/\S+)/);
+    if (m) needles.push(m[1]);
+    needles.push('(APIServer pid=' + enginePid + ')');
+  } catch (e) { /* 引擎已退出：无 needle，接受任意 .log 候选 */ }
+  const hits = ancestorFdLogFiles(enginePid, needles, maxHops);
+  if (!hits.length) return null;
+  const mt = (f) => { try { return fs.statSync(f).mtimeMs; } catch (e) { return 0; } };
+  hits.sort((a, b) => a.hop - b.hop || mt(b.file) - mt(a.file));
+  return hits[0].file;
+}
 function pickScriptModelLogFile(inst, sm) {
   // [dsh-sglang-stack-1003] sglang 栈在位 → 直接读 sglang 日志（打分链候选不含该文件名）
   try {
@@ -3972,6 +4025,15 @@ function pickScriptModelLogFile(inst, sm) {
         memo.set(memoKey, { file: anc[0].file, at: Date.now() });
         return anc[0].file;
       }
+    }
+  } catch (e) { /* 退回候选打分 */ }
+  // ①″ 10-05 新增：argv 无 .log token（重定向发生在 wrapper shell 内部）时，
+  //     沿祖先链找「本用户可读的 fd1/fd2 所指 .log」并以引擎身份内容校验。
+  try {
+    const f2 = ancestorFdLogFile(inst.pid, 5);
+    if (f2) {
+      memo.set(memoKey, { file: f2, at: Date.now() });
+      return f2;
     }
   } catch (e) { /* 退回候选打分 */ }
   const cands = [];
@@ -4031,6 +4093,10 @@ function pickLogFromProcs(procs) {
       anc.sort((a, b) => a.hop - b.hop || mt(b.file) - mt(a.file));
       if (anc.length && mt(anc[0].file) > 0) file = anc[0].file;
     } catch (e) { /* 读不到就换个进程 */ }
+    if (!file) {
+      // 10-05：argv 判据落空的启动链（重定向在 wrapper shell 内部做）→ 祖先链 fd1/fd2 判据
+      try { file = ancestorFdLogFile(c.pid, 5); } catch (e2) { /* 继续换下一个进程 */ }
+    }
     if (!file) continue;
     const pm = String(c.cmd || '').match(/--port\s+(\d+)/);
     out.push({ file: file, tty: false, pid: c.pid, port: pm ? parseInt(pm[1], 10) : null });
@@ -4100,8 +4166,8 @@ function getVllmLogSource() {
   if (procs.sglang.length && fs.existsSync(SGLANG_LOG_PATH)) {
     return { file: SGLANG_LOG_PATH, tty: false, pid: procs.sglang[0].pid };
   }
-  // ⑤ 兜底
-  return { file: path.join(__dirname, 'vllm.log'), tty: false };
+  // ⑤ 兜底（fallback:true 供上层/前端判别：没能定位到在跑引擎的真实日志）
+  return { file: path.join(__dirname, 'vllm.log'), tty: false, fallback: true };
 }
 
 function resolveVllmLogPath() {
@@ -11172,6 +11238,9 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         logs: tail, totalLines: out.length, file: logFile,
         mtime_ms: fsMod, stale_min: staleMin, cleared: cleared,
+        // 10-05 判障透传：日志源没能在跑引擎的祖先链上定位到（跌到 ⑤ 兜底 vllm.log）
+        // 时明示，避免把陈年兜底文件当成"当前日志"却毫无提示。
+        fallback: !!logSrc.fallback,
       }));
     } catch (e) {
       res.writeHead(200, { 'Content-Type': 'application/json' });

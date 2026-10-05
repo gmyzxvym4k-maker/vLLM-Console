@@ -550,8 +550,8 @@ const SCRIPT_MODELS = {
   },
 };
 SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
-  dirNames: ['Qwen3.8-Flash-Next-W4A16-AutoRound'],
-  modelPath: '/media/ll/data/models/Qwen3.8-Flash-Next-W4A16-AutoRound',
+  dirNames: ['Qwen3.8-Flash-Next-Channel-INT8-w8a8', 'Qwen3.8-Flash-Next-W4A16-AutoRound'],  // [w8a8-1005] 主映射=w8a8 生产模型（W4A16 目录保留兼容其重下完成后的手动档）
+  modelPath: '/media/ll/data/models/Qwen3.8-Flash-Next-Channel-INT8-w8a8',
   script: '/home/ll/deploy/start-flash-next-w4a16.sh',
   inner: '/home/ll/deploy/flash-next-w4a16-inner.sh',
   stopScript: '/home/ll/deploy/stop-flash-next-w4a16.sh',
@@ -568,9 +568,9 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   // 官方 0.30.0 新栈的日志（start-flash-next-0300.sh 里 FN_LOG 缺省值）。祖先链 cmdline
   // 通常已能定位到它（见 ancestorLogFiles），这里兜底：cmdline 拿不到时仍能选中新日志。
   altLogs: ['/home/ll/deploy/vllm-flash-next-0300.log'],
-  note: '\\u5bb9\\u5668\\u955c\\u50cf PP\\u00d7\\u5361\\u6570\\u811a\\u672c\\u542f\\u52a8\\uff08W4A16-AutoRound\\uff0c\\u5b98\\u65b9\\u624b\\u518c \\u00a74\\uff09\\uff0c\\u52a0\\u8f7d\\u7ea6 3~9 \\u5206\\u949f\\uff1b10-05 \\u6362\\u88c5\\u540e\\u672c\\u673a 3 \\u5361=PP3',
+  note: 'chroot 镜像 PP3 脚本启动（现行生产=Channel-INT8-w8a8，1M=YaRN×4 副本），加载约 3~9 分钟',
   base: {
-    maxModelLen: 262144, gpuMemUtil: 0.93, maxNumSeqs: 4, maxBatchedTokens: 8192,
+    maxModelLen: 262144, gpuMemUtil: 0.95, maxNumSeqs: 4, maxBatchedTokens: 8192,
     // [gen-loopfix 0929] 采样基准回到 09-21 反循环定档 t0.6 / p0.95 / k20 / minp0 / pp0.1 / rp1.0（用户 09-29 拍板：09-27 的 1/0/1 裸档导致思考模型 uct/duct token 级硬循环）。
     // base 同时是「弹窗默认值」与「是否下发 FN_GENCFG 的比较基准」，因此两套栈的 inner
     // GENCFG_DEFAULT 必须与此逐字段一致（flash-next-w4a16-inner.sh / vllm-0300/bin/flash-next-0300-inner.sh），
@@ -591,7 +591,7 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   bannedEnv: ['QWEN_GDN_REPLAY', 'GDN_DIAG_DISABLE_JIT_MONITOR', 'CUDA_MODULE_LOADING',
               'PYTORCH_NVML_BASED_CUDA_CHECK', 'PYTORCH_CUDA_ALLOC_CONF', 'VLLM_SPEC_DECODE_ATTN',
               'VLLM_DFLASH2_LOOKUP', 'VLLM_V2_CUDAGRAPH_MEM_MIB'],
-  aliases: ['Qwen3.8-Flash-Next-W4A16-AutoRound', 'qwen3.8-flash-next-w4a16-autoround'],
+  aliases: ['Qwen3.8-Flash-Next-Channel-INT8-w8a8', 'Qwen3.8-Flash-Next-W4A16-AutoRound', 'qwen3.8-flash-next-w4a16-autoround'],
   // ===== 1M 长上下文（2026-09-16）=====
   // 本 checkpoint 原生 text_config.max_position_embeddings=262144、rope_type=default：
   // 直接把 max_model_len 填 >262144 会被 vLLM 拒（VLLM_ALLOW_LONG_MAX_MODEL_LEN），
@@ -603,15 +603,14 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   // 长上下文档位（2026-09-16）：原生 256K / 512K(YaRN×2) / 1M(YaRN×4)。
   //   每档一个「只改 config.json、其余软链回原目录」的副本；factor = 目标长度 / 262144。
   //   mrope 缓存恒 = original(262144) × 4 = 1048576，故 512K、1M 都安全（≤ 缓存）。
-  altModelPaths: ['/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M',
-                  '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-512K'],
-  longCtxModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M',
-  longCtx512ModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-512K',
+  altModelPaths: ['/media/ll/data/models-1m/Qwen3.8-Flash-Next-Channel-INT8-w8a8-1M', '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M'],  // [w8a8-1005] w8a8 无 512K 副本，512 档已隐藏
+  longCtxModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-Channel-INT8-w8a8-1M',
   maxModelLenLong: 1048576,
-  maxModelLen512: 524288,
 };
 MODEL_ALIASES['qwen3.8-flash-next-w4a16'] = 'qwen3.8-flash-next';
 MODEL_ALIASES['Qwen3.8-Flash-Next-W4A16-AutoRound'] = 'qwen3.8-flash-next';
+MODEL_ALIASES['Qwen3.8-Flash-Next-Channel-INT8-w8a8'] = 'qwen3.8-flash-next';  // [w8a8-1005]
+MODEL_ALIASES['Qwen3.8-Flash-Next-Channel-INT8-w8a8-1M'] = 'qwen3.8-flash-next';
 
 function scriptModelForName(name) {
   if (!name) return null;
@@ -725,6 +724,11 @@ function scriptModelDefaults(sm) {
     // 1M 长上下文开关（'0' 原生 256K / '1' YaRN×4 → 1M）；maxModelLenLong=0 表示该脚本
     // 模型没提供 1M 档（如 NVFP4 栈），前端据此隐藏开关
     longCtx: '0', maxModelLenLong: sm.maxModelLenLong || 0, maxModelLen512: sm.maxModelLen512 || 0,
+    // [pagefix-1005] PLE 驻留精度/位置与 CPU 二级缓存缺省跟随 base（10-05 换装定版已在 base
+    // 写明 kvoff/pleInt8/pleLoc）。本机 32GB 内存下 INT8 heap/BF16 heap/大 GiB 二级缓存均必 OOM，
+    // base 未声明时回落安全档：INT8+disk、二级缓存关。旧版前端把这三档写死导致启动页误炸。
+    pleInt8: String(b.pleInt8 || '1'), pleLoc: String(b.pleLoc || 'disk'),
+    kvoff: String(b.kvoff || '0'), kvoffGiB: b.kvoffGiB,  // __pagefix_1005__
   };
 }
 // ====== Flash-Next 启动方案（2026-09-14）======
@@ -987,6 +991,13 @@ function scriptModelLaunchPlan(sm, d) {
   // 两者正交、四种组合都成立（INT8+内存 = 引擎侧 VLLM_PLE_INT8_MEMORY 匿名堆 48.3GiB，
   // 由 inner 依据「精度+位置」推导后下发，不需要额外 FN_ 变量）。旧预设无本字段 → 'disk'。
   env.FN_PLE_LOC = String(d.pleLoc) === 'heap' ? 'heap' : 'disk';
+  // [pleclamp-1005] 低内存机防线：heap=48.3GiB(INT8)/95.4GiB(BF16) 匿名堆不可回收，
+  // MemTotal <100GiB 的机器（本机 32GB）必被 oom-killer 杀 → EngineDead → 看门狗循环。
+  // 旧缓存页面/手选/旧预设传来的 heap 一律在此强制降级 disk（inner 侧第二道兜底同判据）。
+  if (env.FN_PLE_LOC === 'heap' && require('os').totalmem() < 100 * 1024 * 1024 * 1024) {
+    env.FN_PLE_LOC = 'disk';
+    warnings.push('本机物理内存 <100GiB，「PLE 表位置=放内存」会被 OOM 杀（历史四连 oom-kill）——已自动降级为「放硬盘」（mmap 可回收页缓存）');
+  }
   // 采样：全部等于基准 → 不传（= 生产无 --override-generation-config）
   const gen = {
     temperature: num(d.temperature, b.temperature), top_p: num(d.topP, b.topP),
@@ -8286,8 +8297,19 @@ function getPcieTopo() {
 // 整块包 IIFE：外部已有 sleep/parseMetrics 等同名符号，闭包内自带一份互不冲突。
 const BENCH = (function () {
   'use strict';
-  const VERSION = '2.2.1';
+  const VERSION = '2.3.0';
   const MODES = ['single', 'conc', 'prefill'];
+  // 预填充档位边界（10-05 扩档）：最高测到 1M tokens。引擎实际 max_model_len 更小时，
+  // 超档位在开测前就跳过并写进事件流——绝不能让一次 400 把整轮测试打死。
+  const PF_MAX_TOKENS = 1048576;
+  const PF_MIN_TOKENS = 256;
+  // 档位标签：与前端 fmtK 同口径（≥1M 记 M、≥1K 记 K，非整除留一位小数）
+  function pfLabel(n) {
+    n = +n || 0;
+    if (n >= 1048576) { const m = n / 1048576; return (m % 1 ? m.toFixed(1) : m) + 'M'; }
+    if (n >= 1024) { const k = n / 1024; return (k % 1 ? k.toFixed(1) : k) + 'K'; }
+    return String(n);
+  }
   const PROMPT_FILES = {
     '13': path.join(__dirname, 'prompts', 'prompts13.json'),
     '6': path.join(__dirname, 'prompts', 'prompts6.json'),
@@ -8461,7 +8483,12 @@ const BENCH = (function () {
     const res = await fetch(baseUrl(s) + '/v1/completions', {
       method: 'POST', headers: { 'Content-Type': 'application/json', ...svcKey(s) }, body, signal,
     });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) {
+      // 带上引擎原文（截断）：超上下文 / 显存不足 / 引擎已死 的判因全在这句话里
+      let detail = '';
+      try { detail = (await res.text()).replace(/\s+/g, ' ').slice(0, 260); } catch (e) {}
+      throw new Error('HTTP ' + res.status + (detail ? ' · ' + detail : ''));
+    }
     let usage = null;
     const dec = new TextDecoder();
     let buf = '';
@@ -8494,12 +8521,20 @@ const BENCH = (function () {
     'Long-context inference shifts the bottleneck from decode bandwidth to prefill compute: attention over tens of thousands of tokens dominates time-to-first-token.',
     '缓存命中率的变化往往比吞吐量更早暴露问题：当热数据集超出容量时，逐出率上升，尾延迟随之抬升，告警应在命中率跌破阈值时触发。',
   ];
-  function buildPrefillPrompt(targetTokens, variant, ratio) {
-    const chars = Math.max(Math.round(targetTokens * (ratio || 2.7)), 300);
+  // maxChars = 字符上限（按引擎 max_model_len 折算，防顶格档分词后超出被拒）
+  function buildPrefillPrompt(targetTokens, variant, ratio, maxChars) {
+    let chars = Math.max(Math.round(targetTokens * (ratio || 2.7)), 300);
+    if (maxChars > 0 && chars > maxChars) chars = maxChars;
     const header = `请阅读以下材料，读完后输出 OK 即可。\n材料编号 V${variant}：\n`;
-    let out = header, i = 0;
-    while (out.length < chars) { out += FILLERS[(i + variant) % FILLERS.length]; i++; }
-    return out.slice(0, chars) + '\n（材料结束）';
+    // 1M 档约 280 万字符：原先逐段 while 拼接要三万多次（大字符串反复扩容），改成
+    // 「8 段材料按 variant 轮转成一个 unit」再倍增复制，二十次内即到位；
+    // 首段随 variant 变化 ⇒ 每轮/每档前缀都不同，前缀缓存照样命不中。
+    const start = ((variant % FILLERS.length) + FILLERS.length) % FILLERS.length;
+    let unit = '';
+    for (let k = 0; k < FILLERS.length; k++) unit += FILLERS[(start + k) % FILLERS.length];
+    let body = unit;
+    while (body.length < chars) body += body;
+    return header + body.slice(0, chars) + '\n（材料结束）';
   }
 
   // ---------- runner ----------
@@ -8582,9 +8617,15 @@ const BENCH = (function () {
     if (mode === 'prefill') {
       const ks = Object.keys(state.prefill).map(Number).sort((a, b) => a - b);
       if (!ks.length) return null;
-      const rows = ks.map((k) => ({ len: k, ptps: state.prefill[k].meanPtps, ttft: state.prefill[k].meanTtft, tokens: state.prefill[k].meanPromptTokens }));
-      const best = rows.filter((r) => r.ptps).reduce((a, b) => (b.ptps > (a.ptps || 0) ? b : a), rows[0]);
-      return { mode, rows, best };
+      // 成功的档一律进表（哪怕 ptps 罕见地为 0），只有 error 档被摘出去点名——
+      // 否则「跑了但没数」的档既不在 rows 也不在 failed，曲线上凭空少一格没人知道为什么
+      const failed = ks.filter((k) => state.prefill[k].error);
+      const ok = ks.filter((k) => !state.prefill[k].error);
+      if (!ok.length) return null;
+      const rows = ok.map((k) => ({ len: k, ptps: state.prefill[k].meanPtps, ttft: state.prefill[k].meanTtft, tokens: state.prefill[k].meanPromptTokens }));
+      const best = rows.reduce((a, b) => ((b.ptps || 0) > (a.ptps || 0) ? b : a), rows[0]);
+      // failed 原样回传：汇总里点名失败档，不静默丢档（否则曲线少两档没人知道为什么）
+      return { mode, rows, best, total: ks.length, failed: failed.length ? failed : null };
     }
     return null;
   }
@@ -8765,20 +8806,53 @@ const BENCH = (function () {
           const cal = await streamPrefill(s, model, buildPrefillPrompt(1024, 997, ratio), runAc.signal);
           if (cal.promptTokens) ratio = Math.round(1024 * 2.7) / cal.promptTokens;
         } catch (e) {}
-        const lens = prefill.lengths.filter((n) => n >= 256 && n <= 131072).sort((a, b) => a - b);
+        // 档位区间 256 ~ 1M（PF_MIN/PF_MAX），再用配置快照里的引擎真实 max_model_len 收一道。
+        // 字符上限留 1.5% 余量：target*ratio 与实际分词数有偏差，且 max_tokens=1 也要占位，
+        // 顶格档一旦被判「prompt is too long」就白跑几百秒，宁可少测 1.5%。
+        const ctxCap = +((state.env && state.env.engineParams && state.env.engineParams.max_model_len) || 0);
+        const charCap = ctxCap > 0 ? Math.floor(ctxCap * 0.985 * ratio) : 0;
+        const uniq = Array.from(new Set(prefill.lengths.map(Number)));
+        const bad = uniq.filter((n) => !(Number.isFinite(n) && n >= PF_MIN_TOKENS && n <= PF_MAX_TOKENS));
+        const want = uniq.filter((n) => Number.isFinite(n) && n >= PF_MIN_TOKENS && n <= PF_MAX_TOKENS).sort((a, b) => a - b);
+        const lens = ctxCap > 0 ? want.filter((n) => n <= ctxCap) : want;
+        const over = want.filter((n) => lens.indexOf(n) < 0);
+        if (bad.length) {
+          addEvent(state, 'pf', '⏭ 非法/超 1M 的档位已忽略',
+            '档位须在 ' + PF_MIN_TOKENS + ' ~ ' + PF_MAX_TOKENS + '（1M）之间，已忽略：'
+            + bad.map((n) => '~' + pfLabel(n)).join(' / ') + '（要测 1M 以上得先提高引擎 max_model_len）');
+        }
+        if (over.length) {
+          addEvent(state, 'pf', '⏭ 超引擎上下文的档位已跳过',
+            '引擎 max_model_len=' + ctxCap + ' tok（' + pfLabel(ctxCap) + '），这些档测不了：'
+            + over.map((n) => '~' + pfLabel(n)).join(' / ')
+            + '。要测更高档位先在启动页把上下文切到 1M（YaRN×4）再重测');
+        }
+        if (!lens.length) {
+          throw new Error('无档位可测：所选 ' + uniq.map((n) => '~' + pfLabel(n)).join(' / ')
+            + ' 全部非法（限 ' + PF_MIN_TOKENS + ' ~ ' + PF_MAX_TOKENS + '）或超出引擎 max_model_len（' + (ctxCap || '未知') + ' tok）');
+        }
         for (let li = 0; li < lens.length; li++) {
           const target = lens[li];
+          const label = pfLabel(target);
           state.stage = 'prefill';
-          state.stageNote = `预填充 ~${target >= 1024 ? (target / 1024) + 'K' : target} tokens`;
+          state.stageNote = `预填充 ~${label} tokens` + (ctxCap > 0 ? `（引擎上限 ${pfLabel(ctxCap)}）` : '');
           state.progress = { phase: '预填充', cur: li + 1, total: lens.length, rep: 0, reps };
-          const rec = { reps: [], running: true };
+          const rec = { reps: [], running: true, target };
           state.prefill[target] = rec;
           for (let r = 0; r < reps; r++) {
             if (state.abort) throw new Error('aborted');
             state.progress.rep = r + 1;
             state.cur = { phase: '预填充', len: target, rep: r + 1, reps, tokens: 0, t0: Date.now() };
-            const prompt = buildPrefillPrompt(target, r * 7 + li, ratio);
-            const out = await streamPrefill(s, model, prompt, runAc.signal);
+            const prompt = buildPrefillPrompt(target, r * 7 + li, ratio, charCap);
+            let out;
+            try {
+              out = await streamPrefill(s, model, prompt, runAc.signal);
+            } catch (e) {
+              if (state.abort) throw new Error('aborted');
+              // 单档失败不再打死整轮：记原因 + 跳过该档剩余轮次，继续测后面的档位
+              rec.error = String((e && e.message) || e).slice(0, 400);
+              break;
+            }
             const pt = out.promptTokens || Math.round(target * 0.9);
             rec.reps.push({
               promptTokens: pt,
@@ -8788,10 +8862,14 @@ const BENCH = (function () {
             rec.meanPtps = +(mean(rec.reps.map((x) => x.ptps).filter(Boolean))).toFixed(0);
             rec.meanTtft = Math.round(mean(rec.reps.map((x) => x.ttft).filter(Boolean)));
             rec.meanPromptTokens = Math.round(mean(rec.reps.map((x) => x.promptTokens)));
-            if (roundIso) await roundIsolate(s, state, '~' + (target >= 1024 ? (target / 1024) + 'K' : target) + 'tok 第' + (r + 1) + '轮后');
+            if (roundIso) await roundIsolate(s, state, '~' + label + 'tok 第' + (r + 1) + '轮后');
           }
           rec.running = false;
-          addEvent(state, 'pf', '✔ 预填充 ~' + (target >= 1024 ? (target / 1024) + 'K' : target) + ' tok',
+          if (rec.error) {
+            addEvent(state, 'pf', '✖ 预填充 ~' + label + ' tok 失败', rec.error + '（该档剩余轮次已跳过，继续后面的档位）');
+            continue;
+          }
+          addEvent(state, 'pf', '✔ 预填充 ~' + label + ' tok',
             rec.meanPtps + ' tok/s · TTFT ' + rec.meanTtft + 'ms · ' + reps + '轮 [' + rec.reps.map((x) => x.ptps).join(' / ') + ']');
         }
         state.cur = null;
@@ -8813,7 +8891,8 @@ const BENCH = (function () {
         let head = '';
         if (mode === 'single') head = state.final.count + ' 类均值 ' + state.final.avg + ' tok/s，最快「' + state.final.best.name + '」' + state.final.best.tps + '，最慢「' + state.final.worst.name + '」' + state.final.worst.tps;
         else if (mode === 'conc') head = '峰值 c=' + state.final.peak.c + ' 聚合 ' + state.final.peak.agg + ' tok/s' + (state.final.scale ? '（相对 c' + state.final.baseC + ' ×' + state.final.scale + '）' : '');
-        else head = '峰值 ~' + (state.final.best.len >= 1024 ? (state.final.best.len / 1024) + 'K' : state.final.best.len) + ' tok 档 ' + state.final.best.ptps + ' tok/s';
+        else head = '峰值 ~' + pfLabel(state.final.best.len) + ' tok 档 ' + state.final.best.ptps + ' tok/s'
+          + (state.final.failed ? ('（另有 ' + state.final.failed.map((n) => '~' + pfLabel(n)).join(' / ') + ' 档失败）') : '');
         addEvent(state, 'final', '🏁 测试完成', head);
       }
 

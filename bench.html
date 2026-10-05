@@ -37,6 +37,11 @@ input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(99,102
 #go:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}
 #stop{width:100%;margin-top:8px;padding:8px;background:#fff;border:1px solid var(--bad);color:var(--bad);border-radius:9px;cursor:pointer}
 #stop:hover{background:#fdf1f0}
+.mini{flex:0 0 auto !important;width:auto;margin-top:0;padding:7px 12px;background:#fff;border:1px solid var(--bd2);color:var(--tx2);border-radius:7px;font-size:12px;cursor:pointer;transition:.15s}
+.mini:hover{border-color:var(--ac);color:var(--ac);background:var(--ac2)}
+.chip .x{margin-left:5px;opacity:.55;font-weight:700}
+.chip .x:hover{opacity:1;color:var(--bad)}
+.pfErr{color:var(--bad)}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{padding:7px 10px;text-align:right;border-bottom:1px solid var(--bd)}
 th{color:var(--tx2);font-weight:500;font-size:12px;background:var(--panel2)}
@@ -133,9 +138,15 @@ details summary{cursor:pointer;color:var(--tx2);font-size:12px}
   </div>
   <div class="card" id="cardPf" style="display:none"><h3>预填充参数</h3>
     <label>每档轮数</label><select id="repsPf"><option>1</option><option selected>3</option><option>5</option></select>
-    <label>上下文长度档位</label>
+    <label>上下文长度档位 <span class="small" id="pfCtxNote"></span></label>
     <div class="chips" id="pfLens"></div>
+    <div class="row" style="margin-top:8px;align-items:flex-end">
+      <div><label>自定义档位（tokens）</label><input id="pfCustom" type="number" min="256" max="1048576" placeholder="256 ~ 1048576"></div>
+      <button class="mini" id="pfAdd">＋ 加档</button><button class="mini" id="pfClear">清空自定义</button>
+    </div>
     <div class="small" style="margin-top:8px">测 TTFT ≈ prefill 时间，得 prefill tok/s；每轮自动换材料避免前缀缓存命中。</div>
+    <div class="small">档位从 1K 一路到 <b>1M（1048576 tok）</b>。超出引擎 max_model_len 的档在开测前即跳过并记进事件流，不会打断其余档位；顶格档按引擎上限留 1.5% 分词余量收口，避免白跑几百秒。</div>
+    <div class="small">参考耗时：本机 prefill ≈4,700 tok/s ⇒ 1M 档单轮约 <b>3.7 分钟</b>（3 轮 + 轮间冲缓存约 12 分钟）；256K 档单轮约 55s。</div>
   </div>
   <div class="card"><h3>运行</h3>
     <div class="row">
@@ -247,7 +258,9 @@ var CHOPT={responsive:true,maintainAspectRatio:false,animation:false,resizeDelay
 
 function h(tag,cls,html){var e=document.createElement(tag);if(cls)e.className=cls;if(html!=null)e.innerHTML=html;return e;}
 function fmtPct(v){if(v==null)return '—';var s=(v>=0?'+':'')+(v*100).toFixed(1)+'%';var cls=v>0.005?'pos':(v<-0.005?'neg':'');return '<span class="'+cls+'">'+s+'</span>';}
-function fmtK(n){return n>=1024?(n/1024)+'K':n}
+function fmtK(n){n=+n||0;if(n>=1048576){var m=n/1048576;return (m%1?m.toFixed(1):m)+'M'}if(n>=1024){var k=n/1024;return (k%1?k.toFixed(1):k)+'K'}return ''+n}
+// TTFT 显示：1M 档单轮可达数百秒，写 ms 会是一串没人读的 6 位数
+function fmtTtft(v){if(v==null||!v)return '—';return v>=10000?(v/1000).toFixed(1)+' s':v+' ms'}
 function j(){try{return JSON.stringify([].slice.call(arguments))}catch(e){return ''}}
 
 // services
@@ -265,7 +278,7 @@ function loadSvcs(){
 }
 // mode chips
 var MODE_LABEL={single:'▶ 开始 · 单流解码 13 类',conc:'▶ 开始 · 并发档位测试',prefill:'▶ 开始 · 预填充测试'};
-var MODE_HINT={single:'逐类型 × N 轮，测各类提示词的 decode tok/s 与 TTFT。',conc:'按并发档位 c=1…32 各测 N 轮聚合吞吐，与其他模式互不影响。',prefill:'长上下文 TTFT 法测 prefill tok/s，每档 N 轮。'};
+var MODE_HINT={single:'逐类型 × N 轮，测各类提示词的 decode tok/s 与 TTFT。',conc:'按并发档位 c=1…32 各测 N 轮聚合吞吐，与其他模式互不影响。',prefill:'长上下文 TTFT 法测 prefill tok/s，档位 1K～1M，每档 N 轮；超引擎上下文的档自动跳过。'};
 document.querySelectorAll('#modeChips .chip').forEach(function(c){
   c.onclick=function(){
     if(running)return;
@@ -287,13 +300,41 @@ document.querySelectorAll('#modeChips .chip').forEach(function(c){
 });
 function readConc(){selConc=[];document.querySelectorAll('#conc .chip').forEach(function(c){if(c.classList.contains('on'))selConc.push(+c.dataset.c)});}
 readConc();
-// prefill length chips
-[1024,4096,16384,32768,65536].forEach(function(n){
-  var el=h('span','chip'+(selPf.indexOf(n)>=0?' on':''),fmtK(n));el.dataset.n=n;
-  el.onclick=function(){el.classList.toggle('on');readPf();};
-  document.getElementById('pfLens').appendChild(el);
-});
+// prefill length chips（10-05 扩档：1K→1M 共 11 档 + 手输自定义档）
+var PF_PRESETS=[1024,2048,4096,8192,16384,32768,65536,131072,262144,524288,1048576];
+var PF_MIN=256,PF_MAX=1048576;
 function readPf(){selPf=[];document.querySelectorAll('#pfLens .chip').forEach(function(c){if(c.classList.contains('on'))selPf.push(+c.dataset.n)});}
+function sortPfChips(){ // 档位统一按长度升序（自定义档插到正确位置，表格/图表才不乱序）
+  var box=document.getElementById('pfLens');
+  [].slice.call(box.querySelectorAll('.chip')).sort(function(a,b){return (+a.dataset.n)-(+b.dataset.n)}).forEach(function(c){box.appendChild(c)});
+}
+function pfChip(n,custom){
+  var el=h('span','chip'+(selPf.indexOf(n)>=0?' on':''),fmtK(n)+(custom?'<b class="x" title="移除这个自定义档位">×</b>':''));
+  el.dataset.n=n; if(custom)el.dataset.custom='1';
+  el.onclick=function(ev){
+    if(running)return;
+    if(custom&&ev.target&&ev.target.classList&&ev.target.classList.contains('x')){el.remove();readPf();return;}
+    el.classList.toggle('on');readPf();
+  };
+  document.getElementById('pfLens').appendChild(el);
+  return el;
+}
+PF_PRESETS.forEach(function(n){pfChip(n,false)});
+readPf();
+function pfAddCustom(){
+  if(running)return;
+  var i=document.getElementById('pfCustom'),v=Math.round(+i.value||0);
+  if(!(v>=PF_MIN&&v<=PF_MAX)){alert('自定义档位需在 '+PF_MIN+' ~ '+PF_MAX+'（=1M）tokens 之间');return;}
+  var ex=document.querySelector('#pfLens .chip[data-n="'+v+'"]');
+  if(ex){ex.classList.add('on');}else{pfChip(v,true).classList.add('on');sortPfChips();}
+  i.value='';readPf();
+}
+document.getElementById('pfAdd').onclick=pfAddCustom;
+document.getElementById('pfCustom').addEventListener('keydown',function(e){if(e.key==='Enter')pfAddCustom()});
+document.getElementById('pfClear').onclick=function(){
+  if(running)return;
+  document.querySelectorAll('#pfLens .chip[data-custom]').forEach(function(c){c.remove()});readPf();
+};
 
 // tabs
 document.querySelectorAll('.tab').forEach(function(t){
@@ -311,6 +352,14 @@ document.getElementById('go').onclick=function(){
   if(mode==='conc'&&!selConc.length){alert('至少选一个并发档位');return;}
   if(mode==='prefill'&&!selPf.length){alert('至少选一个长度档位');return;}
   var reps=mode==='prefill'?+document.getElementById('repsPf').value:+document.getElementById('reps').value;
+  if(mode==='prefill'){
+    var tooBig=selPf.filter(function(n){return n>1048576});
+    if(tooBig.length){alert('档位 '+tooBig.join(' / ')+' 超过上限 1048576（1M tokens）：先把它们取消勾选');return;}
+    // 粗略预估总耗时（按 4700 tok/s + 每轮冲缓存/静置），1M×3 轮就是十几分钟，让人有个数
+    var est=selPf.reduce(function(a,n){return a+n*reps/4700},0)+selPf.length*reps*8;
+    if(est>180&&!confirm('预计要跑约 '+(est>=60?Math.round(est/60)+' 分钟':Math.round(est)+' 秒')
+      +'（档位 '+selPf.map(fmtK).join('/')+' × '+reps+' 轮，按 prefill 4700 tok/s 粗估）。\n现在开始？'))return;
+  }
   var body={mode:mode,port:selSvc.port,sid:selSvc.id,model:selModel,suite:document.getElementById('suite').value,
     reps:reps,concLevels:selConc,
     maxTokens:+document.getElementById('mt').value||700,
@@ -355,6 +404,10 @@ function applyState(s){
   pill.textContent={init:'初始化',running:'运行中',done:'完成',error:'出错',aborted:'已停止'}[s.status]||'空闲';
   document.getElementById('stageNote').textContent=(s.mode?('['+({single:'单流',conc:'并发',prefill:'预填充'}[s.mode])+'] '):'')+(s.stageNote||'')+(s.iso?(' · '+s.iso):'');
   var _en=document.getElementById('envNote');if(_en)_en.textContent=s.env?('　'+envBrief(s.env)):''; // 09-29 配置快照摘要
+  if(s.env&&s.env.engineParams&&s.env.engineParams.max_model_len){ // 预填充卡的上下文提示（跟着最近一次快照走，不多打接口）
+    var _cx=document.getElementById('pfCtxNote');
+    if(_cx)_cx.textContent='（引擎 max_model_len '+fmtK(s.env.engineParams.max_model_len)+'，更高的档会自动跳过）';
+  }
   var pct=0,tx='';
   if(s.progress&&s.progress.total){
     var p=s.progress;pct=Math.round(100*(p.cur-1+(p.rep/Math.max(p.reps,1)))/p.total);
@@ -471,12 +524,13 @@ function renderFinal(f,doScroll){
     html+='</table></div>';
   } else if(f.mode==='prefill'){
     html+=tiles([[f.best?f.best.ptps:'—','峰值 tok/s（~'+(f.best?fmtK(f.best.len):'')+'）'],[f.rows.length,'长度档数'],
-      [f.best?f.best.ttft+'ms':'—','峰值档 TTFT']]);
-    html+='<div style="overflow:auto"><table class="fin-tbl"><tr><th>长度</th><th>实际 prompt tok</th><th>TTFT ms</th><th>prefill tok/s</th></tr>';
+      [f.best?fmtTtft(f.best.ttft):'—','峰值档 TTFT']]);
+    html+='<div style="overflow:auto"><table class="fin-tbl"><tr><th>长度</th><th>实际 prompt tok</th><th>TTFT</th><th>prefill tok/s</th></tr>';
     f.rows.forEach(function(r){
-      html+='<tr><td>'+fmtK(r.len)+'</td><td class="num">'+(r.tokens||'—')+'</td><td class="num">'+(r.ttft||'—')+'</td><td class="num"><b>'+(r.ptps||'—')+'</b></td></tr>';
+      html+='<tr><td>'+fmtK(r.len)+'</td><td class="num">'+(r.tokens||'—')+'</td><td class="num">'+(r.ttft?fmtTtft(r.ttft):'—')+'</td><td class="num"><b>'+(r.ptps||'—')+'</b></td></tr>';
     });
     html+='</table></div>';
+    if(f.failed&&f.failed.length)html+='<div class="small pfErr" style="margin-top:6px">✖ 失败的档位：'+f.failed.map(function(n){return '~'+fmtK(n)}).join(' / ')+'（原因见上方事件流；常见为该档超出引擎 max_model_len 或 KV 池放不下）</div>';
   }
   b.innerHTML=html;
   if(doScroll)card.scrollIntoView({behavior:'smooth',block:'nearest'});
@@ -542,11 +596,15 @@ function renderConc(){
 function renderPf(){
   var t=document.getElementById('tbPf');
   var ks=Object.keys(cur.prefill).sort(function(a,b){return a-b});
-  var html='<tr><th>上下文长度</th><th>实际 prompt tok</th><th>TTFT ms</th><th>prefill tok/s</th><th>各轮 tok/s</th></tr>';
+  var html='<tr><th>上下文长度</th><th>实际 prompt tok</th><th>TTFT</th><th>prefill tok/s</th><th>各轮 tok/s</th></tr>';
   ks.forEach(function(k){
     var r=cur.prefill[k];
     var done=!r.running&&r.meanPtps!=null;
-    html+='<tr><td>'+fmtK(+k)+' tokens'+(r.running?' <span class="small" style="color:var(--warn)">测试中…</span>':'')+'</td><td class="num">'+(r.meanPromptTokens||'—')+'</td><td class="num">'+(done&&r.meanTtft?r.meanTtft:'—')+'</td><td class="num"><b>'+(done?r.meanPtps:'…')+'</b></td><td class="num small">'+r.reps.map(function(x){return x.ptps||'—'}).join(' / ')+'</td></tr>';
+    if(r.error){ // 失败档：整行点名原因（超上下文/显存不足等），不让它在表里凭空消失
+      html+='<tr><td>'+fmtK(+k)+' tokens</td><td class="num">—</td><td colspan="3" style="text-align:left" class="pfErr small">✖ '+esc(r.error)+'</td></tr>';
+      return;
+    }
+    html+='<tr><td>'+fmtK(+k)+' tokens'+(r.running?' <span class="small" style="color:var(--warn)">测试中…</span>':'')+'</td><td class="num">'+(r.meanPromptTokens||'—')+'</td><td class="num">'+(done?fmtTtft(r.meanTtft):'—')+'</td><td class="num"><b>'+(done?r.meanPtps:'…')+'</b></td><td class="num small">'+r.reps.map(function(x){return x.ptps||'—'}).join(' / ')+'</td></tr>';
   });
   t.innerHTML=html;
   if(window.Chart){
@@ -830,14 +888,23 @@ function openDetail(file){
       html+='</table></div>';
     }
     if(pks.length){
-      var bestK=pks[0];pks.forEach(function(k){if((j.prefill[k].meanPtps||0)>(j.prefill[bestK].meanPtps||0))bestK=k});
+      var okKs=pks.filter(function(k){return (j.prefill[k].meanPtps||0)>0});
+      var badKs=pks.filter(function(k){return j.prefill[k].error});
+      var bestK=okKs[0];okKs.forEach(function(k){if((j.prefill[k].meanPtps||0)>(j.prefill[bestK].meanPtps||0))bestK=k});
       html+='<div class="dSec"><h4>预填充 · TTFT 法</h4>';
-      html+=dTiles([[j.prefill[bestK].meanPtps,'峰值 tok/s（~'+fmtK(bestK)+'）'],[(j.prefill[bestK].meanTtft||'—')+'ms','峰值档 TTFT'],[pks.length,'长度档数'],[(j.summary&&j.summary.prefixHit!=null)?j.summary.prefixHit+'%':'—','前缀缓存命中']]);
+      if(bestK!=null){
+        html+=dTiles([[j.prefill[bestK].meanPtps,'峰值 tok/s（~'+fmtK(bestK)+'）'],[fmtTtft(j.prefill[bestK].meanTtft),'峰值档 TTFT'],[okKs.length,'长度档数'],[(j.summary&&j.summary.prefixHit!=null)?j.summary.prefixHit+'%':'—','前缀缓存命中']]);
+      } else {
+        html+=dTiles([['—','峰值 tok/s（无成功档位）'],['—','峰值档 TTFT'],[0,'长度档数'],[(j.summary&&j.summary.prefixHit!=null)?j.summary.prefixHit+'%':'—','前缀缓存命中']]);
+      }
       html+='<div class="dCap">prefill tok/s（按上下文长度）</div><div class="chartbox"><canvas id="chD4"></canvas></div>';
-      html+='<table><tr><th>长度</th><th>实际 prompt tok</th><th>TTFT ms</th><th>prefill tok/s</th><th>各轮 tok/s</th></tr>';
+      html+='<table><tr><th>长度</th><th>实际 prompt tok</th><th>TTFT</th><th>prefill tok/s</th><th>各轮 tok/s</th></tr>';
       pks.forEach(function(k){var r=j.prefill[k];
-        html+='<tr><td>'+fmtK(k)+'</td><td class="num">'+(r.meanPromptTokens||'—')+'</td><td class="num">'+(r.meanTtft||'—')+'</td><td class="num"><b>'+(r.meanPtps||'—')+'</b></td><td class="num small">'+r.reps.map(function(x){return x.ptps||'—'}).join(' / ')+'</td></tr>';});
-      html+='</table></div>';
+        if(r.error){html+='<tr><td>'+fmtK(k)+'</td><td colspan="4" style="text-align:left" class="pfErr small">✖ '+esc(r.error)+'</td></tr>';return;}
+        html+='<tr><td>'+fmtK(k)+'</td><td class="num">'+(r.meanPromptTokens||'—')+'</td><td class="num">'+(r.meanTtft?fmtTtft(r.meanTtft):'—')+'</td><td class="num"><b>'+(r.meanPtps||'—')+'</b></td><td class="num small">'+r.reps.map(function(x){return x.ptps||'—'}).join(' / ')+'</td></tr>';});
+      html+='</table>';
+      if(badKs.length)html+='<div class="small pfErr" style="margin-top:6px">✖ '+badKs.length+' 个档位失败：'+badKs.map(function(k){return '~'+fmtK(k)}).join(' / ')+'（多为超出引擎 max_model_len 或 KV 池放不下）</div>';
+      html+='</div>';
     }
     html+=envSectionHtml(j.env); // 09-29 配置快照（vLLM/模型配置，测试开始时采集）
     if(j.events&&j.events.length){

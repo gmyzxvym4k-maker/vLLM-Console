@@ -2037,7 +2037,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20261006-r17'; // r17 = 10-06 并发实时测速稀释修复：v3TouchRow 活跃期全程均值分母钉在 min(now, 最后产出/新行)（停增/暂离期不发稀释值，截图 g=8·34s·0.2 形态根治）；v3goneAt 冻结滞留窗 15s→5s；bindRow 复活清 stale goneAt 锚；active_requests.elapsed_s 同源钉锚。 // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r16 = 10-05 修复 vLLM 运行日志空白：祖先链 argv 判据对「重定向在 wrapper shell 内部」的现行启动链失明（引擎属 root 读不到其 fd），新增祖先链 fd1/fd2 指向 .log + 内容校验判据 ancestorFdLogFile，接入选日志两条链（pickLogFromProcs ⓪ / pickScriptModelLogFile ①″）；端点透传 fallback、前端红条明示兜底 vllm.log；页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r15 = EPYC 板两处口径修复：① 封装温度——该机 /sys/class/thermal 为空、k10temp 只挂 hwmon，采样器加 hwmon 回落（Tctl/Package 优先、避开逐 CCD 的 Tccd 分量）；② CPU 缓存——后端从只读 cpu0 改为全核扫共享域聚合并行输出（7F52 的 16 个 16MB L3 域合计 256MB 如实呈现，前端加「N域×slice」标注）；r14 = 10-05 换装适配（AMD EPYC 7F52 16C/32T + H12D-8D + 3×CMP 170HX + 32GB 内存）：主端口自愈三层防御（6s 定时兜底重探 / ticker busy>15s 强制放行 / stats 空数据触发纠偏——换装开机时序竞态会令主端口永久粘滞缺省 8000、仪表盘整页假 {}）；cpu-ctl v3 跨平台化（睿频通道 intel_pstate/no_turbo⇄cpufreq/boost 自适应、温度 coretemp⇄k10temp 回落、platform 串运行时生成）；SCRIPT_MODELS.base 换 32GB 账（pp:3、kvoff:0、PLE INT8+disk）；新 standard 预设 current-pp3-1m-mtp4-int8disk-32g；双卡文案改卡数自适应；r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20261006-r18'; // r18 = 10-06 仪表盘曲线提速平滑 + 停刷防御：① PD 动态图轮询 1s→500ms、序列 EMA(α=0.3) 平滑、折线改 Catmull-Rom 贝塞尔、当前值读数用平滑值（曲线跟进更快、无逐秒锯齿）；② 并发卡（500ms 独立轮询）成功渲染即盖 _lastRenderAt——原实现只在主链整轮结束后盖章，后端毛刺期（stats 实测 p95≈1.9s、峰值 4s）主链一轮拖十几秒时看门狗误判正常不自愈，现并发卡心跳成为独立渲染推进信号；③ 后端 stats 加 350ms 结果缓存（同窗口多消费者只算一次）。 //  r17 = 10-06 并发实时测速稀释修复：v3TouchRow 活跃期全程均值分母钉在 min(now, 最后产出/新行)（停增/暂离期不发稀释值，截图 g=8·34s·0.2 形态根治）；v3goneAt 冻结滞留窗 15s→5s；bindRow 复活清 stale goneAt 锚；active_requests.elapsed_s 同源钉锚。 // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r16 = 10-05 修复 vLLM 运行日志空白：祖先链 argv 判据对「重定向在 wrapper shell 内部」的现行启动链失明（引擎属 root 读不到其 fd），新增祖先链 fd1/fd2 指向 .log + 内容校验判据 ancestorFdLogFile，接入选日志两条链（pickLogFromProcs ⓪ / pickScriptModelLogFile ①″）；端点透传 fallback、前端红条明示兜底 vllm.log；页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r15 = EPYC 板两处口径修复：① 封装温度——该机 /sys/class/thermal 为空、k10temp 只挂 hwmon，采样器加 hwmon 回落（Tctl/Package 优先、避开逐 CCD 的 Tccd 分量）；② CPU 缓存——后端从只读 cpu0 改为全核扫共享域聚合并行输出（7F52 的 16 个 16MB L3 域合计 256MB 如实呈现，前端加「N域×slice」标注）；r14 = 10-05 换装适配（AMD EPYC 7F52 16C/32T + H12D-8D + 3×CMP 170HX + 32GB 内存）：主端口自愈三层防御（6s 定时兜底重探 / ticker busy>15s 强制放行 / stats 空数据触发纠偏——换装开机时序竞态会令主端口永久粘滞缺省 8000、仪表盘整页假 {}）；cpu-ctl v3 跨平台化（睿频通道 intel_pstate/no_turbo⇄cpufreq/boost 自适应、温度 coretemp⇄k10temp 回落、platform 串运行时生成）；SCRIPT_MODELS.base 换 32GB 账（pp:3、kvoff:0、PLE INT8+disk）；新 standard 预设 current-pp3-1m-mtp4-int8disk-32g；双卡文案改卡数自适应；r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -2767,6 +2767,12 @@ async function renderConcurrentCard(s) {
         }
         // GPU 排队·处理 时间线（右进左出：已处理任务保留）
         renderGpuQueueCard(insts);
+        // [r18 停刷防御] 并发卡（500ms 独立轮询）成功渲染同样算"画面在推进"，即刻盖章
+        // _lastRenderAt。原实现只在主链 refreshDashboard 整轮结束后盖章——主链一轮要串行
+        // await /v1/models→stats→…，后端毛刺期一轮拖到十几秒时看门狗误判正常（kick 冷静期
+        // 也在顶），不自愈、数字看似定格。并发卡心跳成为独立的渲染推进信号后，看门狗能被
+        // 它救活，不必干等 12s 启动兜底。
+        window._lastRenderAt = Date.now();
 
     } catch (e) { console.warn('Concurrent render error:', e); }
 }
@@ -3213,7 +3219,7 @@ function loadModelParams() {
                 row('思考模式', '是否启用 reasoning 链', (inst.thinking === null || inst.thinking === undefined) ? '✅ 默认（开）' : inst.thinking ? '✅ 开启 (' + (inst.thinkingEffort || 'medium') + ')' : '❌ 关闭') +
                 row('KV 缓存量化', 'KV cache 数据类型，量化可省显存', inst.kv_cache_quant || 'auto') +
                 (inst.ple_table ? row('PLE 表精度', 'Flash-Next n-gram 嵌入表数据类型（日志判据，显示即真值）', ({ int8: 'INT8 — 离线量化', bf16: 'BF16 — 原生精度', fp16: 'FP16 — 半精度', fp8: 'FP8 — 8 位浮点' })[inst.ple_table.dtype] || String(inst.ple_table.dtype || '--').toUpperCase()) : '') +
-                (inst.ple_table ? row('PLE 表驻留', 'n-gram 表运行位置：硬盘=mmap 页缓存可回收 / 内存·匿名堆=不可回收 / 内存·锁页=cuMemHostRegister 不可回收且不可换出 / 显存=GPU 常驻', (({ disk: '💾 硬盘（mmap 页缓存，可回收）', heap: '🧠 内存（匿名堆，不可回收）', pinned: '🧷 内存（锁页，不可回收不可换出）', gpu: '🎮 显存驻留' })[inst.ple_table.loc] || String(inst.ple_table.loc || '--')) + (inst.ple_table.gib != null ? ' · ' + inst.ple_table.gib.toFixed(1) + ' GiB' : '')) : '') +
+                (inst.ple_table ? row('PLE 表驻留', 'n-gram 表运行位置：硬盘=mmap 页缓存可回收 / 内存·匿名堆=不可回收 / 内存·锁页=cuMemHostRegister 不可回收且不可换出 / 显存=GPU 常驻', (({ disk: '🗂 内存中的文件页缓存（mmap，可回收）', heap: '🧠 内存（匿名堆，不可回收）', pinned: '🧷 内存（锁页，不可回收不可换出）', gpu: '🎮 显存驻留' })[inst.ple_table.loc] || String(inst.ple_table.loc || '--')) + (inst.ple_table.gib != null ? ' · ' + inst.ple_table.gib.toFixed(1) + ' GiB' : '')) : '') +
                 '</div></div>'
             ).join('');
             samEl.innerHTML = insts.map(inst =>
@@ -7332,8 +7338,8 @@ function startDashboardTimers() {
     // GPU 排队·处理：已处理任务历史（右进左出）3s 轮询
     refreshGqDone();
     _dashEvery(refreshGqDone, 3000);
-    loadPdSeries(); // PD 动态图：预填充 vs 输出 token 走势（1s 独立轮询）
-    _dashEvery(loadPdSeries, 1000);
+    loadPdSeries(); // PD 动态图：预填充 vs 输出 token 走势（r18：500ms 独立轮询，曲线跟进更快）
+    _dashEvery(loadPdSeries, 500);
 }
 // 右上角数据新鲜度徽章：<5s 正常灰、5~15s 黄（轮询变慢）、>15s 红（停摆，看门狗会自愈）。
 // 有了它，"是不是又停刷了"不用再靠肉眼盯数字，历史停刷也能事后从「自愈 N 次」看出来。
@@ -7425,7 +7431,22 @@ function drawPdChart() {
     }
     const nowB = Math.floor(Date.now() / 1000);
     const winStart = nowB - __pdChartWin;
-    const windowed = pts.filter(p => p.t >= winStart);
+    const _rawWindowed = pts.filter(p => p.t >= winStart);
+    // [pd-smooth 1006 r18] 因果 EMA 平滑（α=0.3 ≈ 3s 移动平均惯性）：后端按秒桶计数，
+    // 逐秒 0↔几百跳变是锯齿主因；平滑后噪声压低、拐点仍在一两个周期内跟上。
+    // 相邻桶间隔 >3s（引擎停止/采样空洞）时重置基线，不把空洞抹成假斜坡。
+    // 每次绘制全段重算（≤180 点，开销可忽略），不维护每桶历史；绝不改动 pts 本体。
+    const windowed = [];
+    {
+        let seP = 0, seG = 0, prevT = 0;
+        for (const p of _rawWindowed) {
+            if (prevT && p.t - prevT > 3) { seP = 0; seG = 0; }
+            prevT = p.t;
+            seP += 0.3 * ((p.prefill || 0) - seP);
+            seG += 0.3 * ((p.gen || 0) - seG);
+            windowed.push({ t: p.t, prefill: seP, gen: seG });
+        }
+    }
     if (!windowed.length) { /* 窗口内无数据：仍画空网格 */ }
     // 双 Y 轴独立缩放：预填充峰值（数千~数万 tok/s）与输出（数百 tok/s）量级差 2-3 个数量级，
     // 共用一个线性刻度时输出曲线会被压到 x 轴下不可见。左轴=预填充（蓝），右轴=输出（橙）。
@@ -7469,23 +7490,34 @@ function drawPdChart() {
         ctx.fillText(new Date(t * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }), xx, H - 6);
     }
     // 曲线（含淡色面积填充）；各曲线用自己的 Y 轴缩放
+    // [pd-smooth 1006 r18] 直线段 → Catmull-Rom 转贝塞尔平滑曲线：EMA 只管幅值噪声，
+    // 几何折角仍需曲线化处理才顺滑。张力系数 1/6（标准 Catmull-Rom），端点钳到自身。
     const drawLine = (key, color, yFn, lw) => {
         if (!windowed.length) return;
+        const xy = windowed.map(p => [x(p.t), yFn(p[key])]);
         ctx.beginPath();
-        windowed.forEach((p, i) => { const xx = x(p.t), yy = yFn(p[key]); if (i === 0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy); });
-        ctx.strokeStyle = color; ctx.lineWidth = lw || 2; ctx.lineJoin = 'round'; ctx.stroke();
-        ctx.lineTo(x(windowed[windowed.length - 1].t), padT + ih);
-        ctx.lineTo(x(windowed[0].t), padT + ih);
+        ctx.moveTo(xy[0][0], xy[0][1]);
+        for (let i = 0; i < xy.length - 1; i++) {
+            const p0 = xy[i > 0 ? i - 1 : 0], p1 = xy[i], p2 = xy[i + 1], p3 = xy[i + 2 < xy.length ? i + 2 : xy.length - 1];
+            ctx.bezierCurveTo(
+                p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6,
+                p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6,
+                p2[0], p2[1]);
+        }
+        const lastPt = xy[xy.length - 1], firstPt = xy[0];
+        ctx.strokeStyle = color; ctx.lineWidth = lw || 2; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.stroke();
+        ctx.lineTo(lastPt[0], padT + ih);
+        ctx.lineTo(firstPt[0], padT + ih);
         ctx.closePath();
         ctx.globalAlpha = 0.10; ctx.fillStyle = color; ctx.fill(); ctx.globalAlpha = 1;
     };
     drawLine('prefill', '#60a5fa', yP);
     drawLine('gen', '#fb923c', yG, 2.5);
-    // 当前值
+    // 当前值（r18：显示平滑值，与曲线一致不跳变）
     const last = windowed.length ? windowed[windowed.length - 1] : null;
     if (last) {
-        const pe = document.getElementById('pdPrefillNow'); if (pe) pe.textContent = String(last.prefill);
-        const ge = document.getElementById('pdGenNow'); if (ge) ge.textContent = String(last.gen);
+        const pe = document.getElementById('pdPrefillNow'); if (pe) pe.textContent = String(Math.round(last.prefill));
+        const ge = document.getElementById('pdGenNow'); if (ge) ge.textContent = String(Math.round(last.gen));
     }
 }
 

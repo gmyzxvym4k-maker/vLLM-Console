@@ -670,6 +670,7 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   logSglang: '/home/ll/deploy/sglang-18420.log',
   scriptNew: '/home/ll/deploy/vllm-0310/start-flash-next-0310.sh',
   stopScriptNew: '/home/ll/deploy/vllm-0310/stop-flash-next-0310.sh',
+  innerNew: '/home/ll/deploy/vllm-0310/bin/flash-next-0310-inner.sh',  // [entry-inner-1006] 0.31 引擎祖先链里的入口
   port: 18420,
   served: 'qwen3.8-flash-next',
   log: '/home/ll/deploy/vllm-flash-next-w4a16.log',
@@ -738,7 +739,11 @@ function scriptModelForName(name) {
 // （script/scriptNew/scriptSglang）与条目一致才算该条目在跑；卡片再按「自身目录
 // 是否是引擎实际加载路径（或其 YaRN 副本基底）」细分显示。
 function smEntryScripts(v) {
-  return [v.script, v.scriptNew, v.scriptSglang].filter(Boolean);
+  // [entry-inner-1006] 追加 inner/innerNew：wrapper 是 `bash start-*.sh` → 内部
+  //   `sudo sh -c 'exec setsid bash <inner> >> log'`，setsid 后 wrapper 本体脱离进程树，
+  //   引擎祖先链 cmdline 只剩 <inner> 路径（10-06 实锤：停止按钮误判未运行→去启动→
+  //   探到旧实例 health=200→返回 healthy 但根本没停）。只收 start-* 会全瞎。
+  return [v.script, v.scriptNew, v.scriptSglang, v.inner, v.innerNew].filter(Boolean);
 }
 function readCmdlineArgv(pid) {
   try { return fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8').split('\0').filter(Boolean); } catch (e) { return []; }
@@ -10658,6 +10663,13 @@ const server = http.createServer(async (req, res) => {
       if (line.indexOf('[FN-0300] PLE') >= 0) {
         return { dtype: 'bf16', loc: line.indexOf('显存') >= 0 ? 'gpu' : 'pinned', gib: pleGib(line) };
       }
+      // [ple-loc-0310-1006] 新栈（0.31.0）inner echo：带体积，可作为 gib 来源
+      if (line.indexOf('[FN-PLE] INT8 \u78c1\u76d8 mmap') >= 0) {
+        // echo 文案是「（47.7+0.6 GiB …）」：表体积是加号前那个数，pleGib 会取到 0.6，需专用提取
+        const g0 = /^.*?\((\d+(?:\.\d+)?)\+/.exec(line);
+        return { dtype: 'int8', loc: 'disk', gib: g0 ? parseFloat(g0[1]) : pleGib(line) };
+      }
+      if (line.indexOf('[FN-PLE] \u5b98\u65b9 pinned-host') >= 0) return { dtype: 'bf16', loc: 'pinned', gib: pleGib(line) };
       // —— 旧栈（自研镜像的 INT8 / 磁盘驻留加载器）——
       if (line.indexOf('[FN-PLE-') < 0) return null;
       // 引擎真值行（晚于 inner echo，反向先命中）
@@ -10681,6 +10693,10 @@ const server = http.createServer(async (req, res) => {
       const hit = global.__pleStatusCache.get(logPath);
       if (hit && Date.now() - hit.t < 10000) return hit.ple;
       let ple = null;
+      // [ple-loc-0310-1006] 同一次启动里是否出现 DSH PLE mmap 证据行（0.31 栈的
+      // weight_device=cpu + pinned=False 既可能是匿名堆也可能是文件页缓存 mmap，
+      // 只有这行能区分；引擎初始化行本身不带这个信息）
+      let mmapSeen = false;
       const fdArr = [];
       try {
         const st = fs.statSync(logPath);
@@ -10697,8 +10713,14 @@ const server = http.createServer(async (req, res) => {
           const parts = (buf.toString('utf8') + carry).split('\n');
           carry = parts.shift() || '';                // 块首残句，并入下一（更早）块
           for (let i = parts.length - 1; i >= 0; i--) {
-            const m = matchPleLine(parts[i]);
-            if (!m) continue;
+            const ln = parts[i];
+            if (!mmapSeen && (ln.indexOf('PLE mmap mode:') >= 0 || ln.indexOf('PLE mmap class installed') >= 0)) mmapSeen = true;
+            const m = matchPleLine(ln);
+            if (!m) {
+              // 越过本次启动的分段边界（更早的启动不再参与 mmapSeen 判定）
+              if (ln.indexOf('Initializing a V1 LLM engine') >= 0 && ple) break scan;
+              continue;
+            }
             if (!ple) {                               // 最新一条=主判据（定 dtype/loc）
               ple = m;
               if (ple.gib != null) break scan;        // 大小齐了，收工
@@ -10713,6 +10735,31 @@ const server = http.createServer(async (req, res) => {
         }
       } catch (e) {}
       for (const fd of fdArr) { try { fs.closeSync(fd); } catch (e) {} }
+      if (ple && ple.loc === 'heap' && mmapSeen) {    // [ple-loc-0310-1006] 0.31 mmap 档改判
+        ple = Object.assign({}, ple, { loc: 'disk', mmap: true });
+        if (ple.gib == null) {
+          const g = /\((\d+(?:\.\d+)\+)\+?[\d.]*\s*GiB/.exec('') || null;
+          ple.gib = null;   // 留给下面的 mmapGiB 兜底
+        }
+      }
+      if (ple && ple.mmap && ple.gib == null) {
+        // inner 的 [FN-PLE] 行带体积（47.7+0.6 GiB），补一次扫描
+        try {
+          const st2 = fs.statSync(logPath);
+          const fd2 = fs.openSync(logPath, 'r');
+          fdArr.push(fd2);
+          const len2 = Math.min(st2.size, 8 * 1024 * 1024);
+          const b2 = Buffer.alloc(len2);
+          fs.readSync(fd2, b2, 0, len2, Math.max(0, st2.size - len2));
+          const ls = b2.toString('utf8').split('\n');
+          for (let i = ls.length - 1; i >= 0; i--) {
+            if (ls[i].indexOf('[FN-PLE]') < 0) continue;
+            const mm0 = /^.*?\((\d+(?:\.\d+)?)\+/.exec(ls[i]);   // 表体积=括号里加号前那个数
+            const g = mm0 ? parseFloat(mm0[1]) : pleGib(ls[i]);
+            if (g != null && g > 1) { ple.gib = g; break; }
+          }
+        } catch (e) {}
+      }
       global.__pleStatusCache.set(logPath, { t: Date.now(), ple });
       return ple;
     }
@@ -12041,6 +12088,21 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/v1/internal/stats') {
     const startTime = Date.now();
 
+    // [stats-cache 1006 r18] 350ms 结果缓存：本页有主链 + 并发卡两路 500ms 轮询、多标签页
+    // 再乘一遍，同一窗口内 stats 会被重复完整计算（全量 parseMetrics + 并发明细 + 计费聚合）。
+    // 高负载期（该机 load avg ~5.5，实测 stats p95≈1.9s、峰值 4s）重复计算挤兑事件循环、
+    // 进一步拉长每一轮响应——是"仪表盘经常停刷"的后端放大器。命中缓存直接回上次序列化的
+    // JSON；未命中走完整计算并回填（含 {} 空响应同样缓存，引擎重启窗口不重算）。
+    {
+      const _sc = global.__statsCache;
+      if (_sc && _sc.body && Date.now() - _sc.at < 350) {
+        try {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(_sc.body);
+        } catch (e) {}
+        return;
+      }
+    }
     // 09-20：/metrics 走缓存+单飞（400ms TTL）——此前每次 stats 都实时抓 64KB 上游
     fetchMetricsCached(`${vllmBaseUrl}/metrics`, 400, 3000).then(async (data) => {
         // [hw-move 1005] 主端口拿不到 metrics 也是端口漂移的直接证据，顺手触发一次
@@ -12496,14 +12558,17 @@ const server = http.createServer(async (req, res) => {
           } catch (e) { /* 多实例聚合失败不影响主实例统计 */ }
 
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(result));
+          const _sb = JSON.stringify(result);
+          global.__statsCache = { at: Date.now(), body: _sb }; // [stats-cache 1006 r18] 回填缓存
+          res.end(_sb);
         } catch (e) {
           console.error('Stats error:', e.message, e.stack);
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({}));
+          res.end('{}');
         }
     }).catch(() => {
       // 上游不可达/超时：返回空对象（与原行为一致；vLLM 挂起时不悬挂）
+      global.__statsCache = { at: Date.now(), body: '{}' }; // [stats-cache 1006 r18] 空响应同样短路，引擎重启窗口不重算
       try { if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({})); } catch (e) {}
     });
     return;

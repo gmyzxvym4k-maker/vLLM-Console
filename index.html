@@ -1011,7 +1011,7 @@
                 <div class="card-body" style="border-top:1px solid var(--border)">
                     <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
                         <div style="font-size:13px;font-weight:600;color:var(--text-secondary);flex:1">最近完成请求 · vLLM / SGLang 实测（每个请求的真实数据）</div>
-                        <label style="font-size:11px;color:var(--text-tertiary);display:flex;align-items:center;gap:4px;white-space:nowrap">GPU0
+                        <label id="recentRowsGpu0Lab" title="GPU0 单实例数据的显示行数（选择会被记住）" style="font-size:11px;color:var(--text-tertiary);display:flex;align-items:center;gap:4px;white-space:nowrap">GPU0
                           <select id="recentRowsGpu0" style="font-size:11px;background:var(--bg-card-hover);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px">
                             <option value="5">5 行</option>
                             <option value="10">10 行</option>
@@ -1024,7 +1024,7 @@
                             <option value="200">200 行</option>
                           </select>
                         </label>
-                        <label style="font-size:11px;color:var(--text-tertiary);display:flex;align-items:center;gap:4px;white-space:nowrap">GPU1
+                        <label id="recentRowsGpu1Lab" title="GPU1 单实例数据的显示行数（选择会被记住）" style="font-size:11px;color:var(--text-tertiary);display:flex;align-items:center;gap:4px;white-space:nowrap">GPU1
                           <select id="recentRowsGpu1" style="font-size:11px;background:var(--bg-card-hover);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px">
                             <option value="5">5 行</option>
                             <option value="10">10 行</option>
@@ -1036,6 +1036,10 @@
                             <option value="100">100 行</option>
                             <option value="200">200 行</option>
                           </select>
+                        </label>
+                        <!-- [recent-rows-1005] 跨卡（PP/TP 多卡）与无法归因数据的行数：常驻头部控件，不随表格重绘 -->
+                        <label id="recentRowsCrossLab" title="单实例跨卡（PP/TP）等分组数据的显示行数（选择会被记住）" style="font-size:11px;color:var(--green);display:none;align-items:center;gap:4px;white-space:nowrap">双卡
+                          <select id="recentRowsCross" style="font-size:11px;background:var(--bg-card-hover);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px"></select>
                         </label>
                       </div>
                     <div id="recentRequests">
@@ -2033,7 +2037,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20261006-r16'; // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r16 = 10-05 修复 vLLM 运行日志空白：祖先链 argv 判据对「重定向在 wrapper shell 内部」的现行启动链失明（引擎属 root 读不到其 fd），新增祖先链 fd1/fd2 指向 .log + 内容校验判据 ancestorFdLogFile，接入选日志两条链（pickLogFromProcs ⓪ / pickScriptModelLogFile ①″）；端点透传 fallback、前端红条明示兜底 vllm.log；页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r15 = EPYC 板两处口径修复：① 封装温度——该机 /sys/class/thermal 为空、k10temp 只挂 hwmon，采样器加 hwmon 回落（Tctl/Package 优先、避开逐 CCD 的 Tccd 分量）；② CPU 缓存——后端从只读 cpu0 改为全核扫共享域聚合并行输出（7F52 的 16 个 16MB L3 域合计 256MB 如实呈现，前端加「N域×slice」标注）；r14 = 10-05 换装适配（AMD EPYC 7F52 16C/32T + H12D-8D + 3×CMP 170HX + 32GB 内存）：主端口自愈三层防御（6s 定时兜底重探 / ticker busy>15s 强制放行 / stats 空数据触发纠偏——换装开机时序竞态会令主端口永久粘滞缺省 8000、仪表盘整页假 {}）；cpu-ctl v3 跨平台化（睿频通道 intel_pstate/no_turbo⇄cpufreq/boost 自适应、温度 coretemp⇄k10temp 回落、platform 串运行时生成）；SCRIPT_MODELS.base 换 32GB 账（pp:3、kvoff:0、PLE INT8+disk）；新 standard 预设 current-pp3-1m-mtp4-int8disk-32g；双卡文案改卡数自适应；r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20261006-r17'; // r17 = 10-06 并发实时测速稀释修复：v3TouchRow 活跃期全程均值分母钉在 min(now, 最后产出/新行)（停增/暂离期不发稀释值，截图 g=8·34s·0.2 形态根治）；v3goneAt 冻结滞留窗 15s→5s；bindRow 复活清 stale goneAt 锚；active_requests.elapsed_s 同源钉锚。 // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r16 = 10-05 修复 vLLM 运行日志空白：祖先链 argv 判据对「重定向在 wrapper shell 内部」的现行启动链失明（引擎属 root 读不到其 fd），新增祖先链 fd1/fd2 指向 .log + 内容校验判据 ancestorFdLogFile，接入选日志两条链（pickLogFromProcs ⓪ / pickScriptModelLogFile ①″）；端点透传 fallback、前端红条明示兜底 vllm.log；页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r15 = EPYC 板两处口径修复：① 封装温度——该机 /sys/class/thermal 为空、k10temp 只挂 hwmon，采样器加 hwmon 回落（Tctl/Package 优先、避开逐 CCD 的 Tccd 分量）；② CPU 缓存——后端从只读 cpu0 改为全核扫共享域聚合并行输出（7F52 的 16 个 16MB L3 域合计 256MB 如实呈现，前端加「N域×slice」标注）；r14 = 10-05 换装适配（AMD EPYC 7F52 16C/32T + H12D-8D + 3×CMP 170HX + 32GB 内存）：主端口自愈三层防御（6s 定时兜底重探 / ticker busy>15s 强制放行 / stats 空数据触发纠偏——换装开机时序竞态会令主端口永久粘滞缺省 8000、仪表盘整页假 {}）；cpu-ctl v3 跨平台化（睿频通道 intel_pstate/no_turbo⇄cpufreq/boost 自适应、温度 coretemp⇄k10temp 回落、platform 串运行时生成）；SCRIPT_MODELS.base 换 32GB 账（pp:3、kvoff:0、PLE INT8+disk）；新 standard 预设 current-pp3-1m-mtp4-int8disk-32g；双卡文案改卡数自适应；r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -3275,8 +3279,13 @@ async function loadModels() {
         // 的参数串到该栈上。
         window.__scriptModelDefaults = {};
         window.__scriptModelSchemes = [];
+        window.__scriptModelNotes = {}; // [script-entry-route-1006] 同条目他目录在跑时的提示
         s.models.forEach(m => {
-            if (m.script_model && m.defaults) window.__scriptModelDefaults[m.name] = m.defaults;
+            if (m.script_model && m.defaults) { // [dir-name-distinct-1006] 双键索引：注册键（script_name）+ 真实目录名（name）
+                window.__scriptModelDefaults[m.script_name || m.name] = m.defaults;
+                if (m.name) window.__scriptModelDefaults[m.name] = m.defaults;
+            }
+            if (m.script_model && m.script_note_extra) window.__scriptModelNotes[m.name] = m.script_note_extra;
             if (m.script_model && m.schemes && m.schemes.length) window.__scriptModelSchemes = m.schemes;
         });
 
@@ -3304,15 +3313,16 @@ function renderModelCard(model) {
         ? '<span class="badge badge-green">运行中</span>'
         : '<span class="badge" style="background:var(--bg-primary);color:var(--text-tertiary);border:1px solid var(--border)">未运行</span>';
     const borderColor = isRunning ? 'var(--green)' : 'var(--border)';
+    const pathTip = ((window.__scriptModelNotes || {})[model.name] || ''); // script-note-tip-1006
     return `<div class="card" data-modelname="${model.name}" data-running="${isRunning}" style="border-color:${borderColor};border-top:3px solid ${isRunning ? 'var(--green)' : 'transparent'}">
         <div style="padding:var(--space-5) var(--space-6)">
             <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">
                 <div style="min-width:0;flex:1">
                     <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
-                        <span style="font-size:15px;font-weight:700;letter-spacing:-0.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${model.name}</span>
+                        <span style="font-size:15px;font-weight:700;letter-spacing:-0.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${model.dir_name || model.name}</span>
                         ${statusBadge}
                     </div>
-                    <div style="font-size:12px;color:var(--text-tertiary);word-break:break-all;line-height:1.5" title="${model.path}">${model.path}</div>
+                    <div style="font-size:12px;color:var(--text-tertiary);word-break:break-all;line-height:1.5" title="${model.path}${pathTip}">${model.path}${pathTip ? `<span style="color:var(--orange)"> ${pathTip}</span>` : ''}</div>
                 </div>
             </div>
             <div style="display:flex;gap:0;margin-top:var(--space-4);padding:var(--space-3);background:var(--bg-primary);border-radius:var(--radius-sm);border:1px solid var(--border-light)">
@@ -3357,12 +3367,13 @@ function renderModelRow(model) {
     const statusBadge = isRunning
         ? '<span class="badge badge-green" style="flex-shrink:0">运行中</span>'
         : '<span class="badge" style="background:var(--bg-primary);color:var(--text-tertiary);border:1px solid var(--border);flex-shrink:0">未运行</span>';
+    const pathTip = ((window.__scriptModelNotes || {})[model.name] || ''); // pathtip-fix-1006：renderModelRow 同款定义（entry-route-1006 漏注入致 ReferenceError）
     return `<div class="card" data-modelname="${model.name}" data-running="${isRunning}" style="border-color:${isRunning ? 'var(--green)' : 'var(--border)'};border-left:3px solid ${isRunning ? 'var(--green)' : 'transparent'}">
         <div style="display:flex;align-items:center;gap:14px;padding:var(--space-3) var(--space-5)">
             ${statusBadge}
             <div style="min-width:0;flex:1 1 0">
-                <div style="font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${model.name}</div>
-                <div style="font-size:12px;color:var(--text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${model.path}">${model.path}</div>
+                <div style="font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${model.dir_name || model.name}</div>
+                <div style="font-size:12px;color:var(--text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${model.path}${pathTip}">${model.path}${pathTip ? `<span style="color:var(--orange)"> ${pathTip}</span>` : ''}</div>
             </div>
             <div style="font-size:12px;color:var(--text-secondary);flex-shrink:0;text-align:right;line-height:1.5;font-variant-numeric:tabular-nums">
                 <div>${model.size_gb} GB · Safetensors</div>
@@ -3410,28 +3421,82 @@ let __recentReqs = [];       // 最近 30 条（分组重渲染用，免重拉�
 let __recentSgExportOff = null; // [sglang-adapt-1003] 在跑 sglang 实例缺 --export-metrics-to-file 的端口列表（后端回传）
 
 // GPU0 / GPU1 各自独立的显示行数（不再共用一个总行数）
+// [recent-rows-1005] 默认 30 → 10；控件全部常驻卡片头部；绑定只做一次。
 const RECENT_ROW_OPTS = [5, 10, 15, 20, 25, 30, 50, 100, 200];
+const RECENT_ROW_DEFAULT = 10;           // 默认显示 10 行
+const RECENT_ROWS_MIG_VER = '10-1005';   // 记忆版本：改默认值时一次性清掉旧记忆
+
+function migrateRecentRowsMemory() {
+    try {
+        if (localStorage.getItem('dsh_recent_rows_ver') === RECENT_ROWS_MIG_VER) return;
+        const drop = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i) || '';
+            if (k.indexOf('dsh_recent_rows') === 0) drop.push(k);
+        }
+        drop.forEach(k => { try { localStorage.removeItem(k); } catch (e) {} });
+        localStorage.setItem('dsh_recent_rows_ver', RECENT_ROWS_MIG_VER);
+    } catch (e) {}
+}
+
 function recentRowsFor(gpu) {
     const v = parseInt(localStorage.getItem('dsh_recent_rows_gpu' + gpu) || '', 10);
     if (RECENT_ROW_OPTS.includes(v)) return v;
-    // 首次使用：迁移旧版单一设置 dsh_recent_rows，缺省 30
-    const old = parseInt(localStorage.getItem('dsh_recent_rows') || '30', 10);
-    return RECENT_ROW_OPTS.includes(old) ? old : 30;
+    const old = parseInt(localStorage.getItem('dsh_recent_rows') || '', 10);
+    if (RECENT_ROW_OPTS.includes(old)) return old;
+    return RECENT_ROW_DEFAULT;
+}
+
+// 跨卡（PP/TP 多卡）分组统一一个行数键：所有跨卡组共用同一行数，
+// 由卡片头部的常驻下拉设置（原先按卡组合后缀各存一份、控件长在会被重建的组头里）。
+function recentCrossRows() {
+    const v = parseInt(localStorage.getItem('dsh_recent_rows_cross') || '', 10);
+    if (RECENT_ROW_OPTS.includes(v)) return v;
+    return Math.max(recentRowsFor(0), recentRowsFor(1));
+}
+
+// 正在操作行数控件（下拉展开中）→ 本轮不重绘：仪表盘 500ms 轮询整表替换 innerHTML，
+// 会把用户手里的下拉抽走，这正是「行数不可选」的直接成因。15s 超时兜底防永久冻结。
+let __recentRowsPickingAt = 0;
+function recentRowsPicking() { return Date.now() - __recentRowsPickingAt < 15000; }
+function __recentRowsPickStart() { __recentRowsPickingAt = Date.now(); }
+function __recentRowsPickEnd() { __recentRowsPickingAt = 0; }
+
+function __bindRecentRowsSelect(sel, onChange) {
+    if (!sel || sel.__rowsBound) return;      // 只绑一次（原实现每轮 addEventListener）
+    sel.__rowsBound = 1;
+    sel.addEventListener('mousedown', __recentRowsPickStart);
+    sel.addEventListener('keydown', __recentRowsPickStart);
+    sel.addEventListener('blur', () => { setTimeout(__recentRowsPickEnd, 300); });
+    sel.addEventListener('change', () => { __recentRowsPickEnd(); onChange(); });
 }
 
 function initRecentRowsSelect() {
+    migrateRecentRowsMemory();
     [0, 1].forEach(g => {
         const sel = document.getElementById('recentRowsGpu' + g);
         if (!sel) return;
-        sel.value = String(recentRowsFor(g));
-        sel.addEventListener('change', () => {
+        __bindRecentRowsSelect(sel, () => {
             localStorage.setItem('dsh_recent_rows_gpu' + g, sel.value);
             loadRecentRequests();
         });
+        if (!recentRowsPicking()) sel.value = String(recentRowsFor(g));
     });
+    const cs = document.getElementById('recentRowsCross');
+    if (cs) {
+        if (!cs.options.length) cs.innerHTML = RECENT_ROW_OPTS.map(v => '<option value="' + v + '">' + v + ' 行</option>').join('');
+        __bindRecentRowsSelect(cs, () => {
+            const n = parseInt(cs.value, 10);
+            if (RECENT_ROW_OPTS.includes(n)) localStorage.setItem('dsh_recent_rows_cross', String(n));
+            loadRecentRequests();
+        });
+        if (!recentRowsPicking()) cs.value = String(recentCrossRows());
+    }
 }
 
 function loadRecentRequests() {
+    // [recent-rows-1005] 用户正在选行数：跳过本轮（重绘会抽走控件），选完 change 会立刻再拉一次
+    if (recentRowsPicking()) return;
     // 拉取窗口 = GPU0 + GPU1 + 双卡分组各自行数之和 + 余量（上限 200），保证每组都能凑够自己设置的行数
     const limit = Math.min(200, recentRowsFor(0) + recentRowsFor(1) + recentCrossRowsMax() + 20);
     _fetchWithTimeout('/v1/internal/recent-requests?limit=' + limit, null, 8000)
@@ -3461,29 +3526,21 @@ function recentGroupGpus(key) {
 }
 function recentGroupIsCross(key) { return key.charAt(0) === 'x'; }
 
-// 每组独立行数：单卡组沿用 GPU0/GPU1 下拉；跨卡组有自己的记忆（首次跟随两卡最大值）
+// 每组独立行数：单卡组用 GPU0/GPU1 下拉；跨卡组与无法归因组用头部「双卡」下拉（统一记忆）
 function recentRowsForGroup(key) {
-    if (key === 'unknown') return Math.max(recentRowsFor(0), recentRowsFor(1));
+    if (!key || key === 'unknown') return recentCrossRows();
     if (!recentGroupIsCross(key)) return recentRowsFor(parseInt(key.slice(1), 10));
-    const v = parseInt(localStorage.getItem('dsh_recent_rows_cross_' + key.slice(1)) || '', 10);
-    if (RECENT_ROW_OPTS.includes(v)) return v;
-    return Math.max(recentRowsFor(0), recentRowsFor(1));
+    return recentCrossRows();
 }
 // 拉取窗口要把跨卡组可能需要的行数也算进去
-function recentCrossRowsMax() {
-    let best = 0;
-    for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i) || '';
-        if (k.indexOf('dsh_recent_rows_cross_') !== 0) continue;
-        const v = parseInt(localStorage.getItem(k) || '', 10);
-        if (RECENT_ROW_OPTS.includes(v)) best = Math.max(best, v);
-    }
-    return best || Math.max(recentRowsFor(0), recentRowsFor(1));
-}
+function recentCrossRowsMax() { return recentCrossRows(); }
+// 兼容旧内联调用（组头已不再渲染下拉，保留签名防任何残留 onchange 报错）
 function setRecentCrossRows(v, suffix) {
     const n = parseInt(v, 10);
     if (!RECENT_ROW_OPTS.includes(n)) return;
-    localStorage.setItem('dsh_recent_rows_cross_' + suffix, String(n));
+    localStorage.setItem('dsh_recent_rows_cross', String(n));
+    const cs = document.getElementById('recentRowsCross');
+    if (cs) cs.value = String(n);
     loadRecentRequests();
 }
 
@@ -3514,13 +3571,11 @@ function computeRecentAggregates(reqs) {
     return out;
 }
 
-// 跨卡组的行数下拉（动态渲染在组头里，与顶部 GPU0/GPU1 下拉同一风格）
+// [recent-rows-1005] 组头不再渲染下拉：这段 HTML 每 500ms 随整表重建，
+// 正在展开的 select 会被抽走 → 点了没反应。行数改由卡片头部常驻控件设置，组头只报当前值。
 function recentCrossSelectHtml(key) {
-    const suffix = key.slice(1);
-    const cur = String(recentRowsForGroup(key));
-    const opts = RECENT_ROW_OPTS.map(v => '<option value="' + v + '"' + (String(v) === cur ? ' selected' : '') + '>' + v + ' 行</option>').join('');
-    return '<select onchange="setRecentCrossRows(this.value,\'' + suffix + '\')" title="双卡实例的显示行数（独立记忆）" ' +
-        'style="font-size:11px;background:var(--bg-card-hover);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:1px 4px">' + opts + '</select>';
+    return '<span style="font-size:11px;color:var(--text-tertiary)" title="跨卡（PP/TP）等分组的行数在卡片右上角「双卡」下拉里设置，选择会被记住">' +
+        recentCrossRows() + ' 行/组</span>';
 }
 
 // 分组头：徽标 + 条数 +（跨卡组：实例端口 + 行数下拉 + 说明）+ 该组聚合指标（tg TPS / 缓存命中 / MTP）
@@ -3636,6 +3691,7 @@ function buildRecentTable(rows) {
 function renderRecentRequests() {
     const el = document.getElementById('recentRequests');
     if (!el) return;
+    if (recentRowsPicking()) return;   // [recent-rows-1005] 正在选行数，保持现有 DOM 不动
     const reqs = __recentReqs;
     // [sglang-adapt-1003] 在跑 sglang 实例未启用 --export-metrics-to-file 时，本表只可能是
     // 其他实例（vLLM 时代）的历史残留行——时间旧、归因不到卡，看起来像「面板显示假数据」。
@@ -3688,17 +3744,22 @@ function renderRecentRequests() {
 // 只保留双卡组自己的行数下拉，界面同样呈现「一组数据、一个控件」。
 function syncRecentHeaderSelects(groups) {
     const hasCross = groups.some(g => recentGroupIsCross(g.key) && g.rows.length);
-    const singleHas = { 0: false, 1: false };
-    for (const g of groups) {
-        if (recentGroupIsCross(g.key) || g.key === 'unknown') continue;
-        if (g.rows.length) singleHas[parseInt(g.key.slice(1), 10)] = true;
-    }
+    const hasUnknown = groups.some(g => g.key === 'unknown' && g.rows.length);
+    // [recent-rows-1005] 不再隐藏 GPU0/GPU1 下拉：09-16 那版「只有跨卡数据就隐藏」使得
+    // 三卡 PP 现场（gpus=[0,1,2]）整张表一个可用行数控件都不剩，用户根本没法选。
     [0, 1].forEach(n => {
+        const lab = document.getElementById('recentRowsGpu' + n + 'Lab');
+        if (lab) { lab.style.display = ''; return; }
         const sel = document.getElementById('recentRowsGpu' + n);
-        const lab = sel && sel.parentElement;
-        if (!lab || lab.tagName !== 'LABEL') return;
-        lab.style.display = (hasCross && !singleHas[n]) ? 'none' : '';
+        const l2 = sel && sel.parentElement;
+        if (l2 && l2.tagName === 'LABEL') l2.style.display = '';
     });
+    const clab = document.getElementById('recentRowsCrossLab');
+    if (clab) {
+        const show = hasCross || hasUnknown;
+        clab.style.display = show ? '' : 'none';
+        if (show) clab.style.alignItems = 'center';
+    }
 }
 
 function loadSysMem() {
@@ -4114,11 +4175,11 @@ function startConfigDefaults(modelName, suggestPort, suggestGpu) {
             mtp: smd.mtp === '1' ? '1' : '0', dflash: '0', dspark: '0', mtpTokens: smd.mtpTokens || 6,
             kvCacheQuant: 'auto', retention: '', runtime: smd.runtime || 'vllm', // [sglang-adapt-1003] SGLang 脚本栈哨兵在位时后端回 'sglang'，弹窗直接开对面板
             // [kvoff-toggle 09-22][sync 09-23] 脚本化模型（Flash-Next W4A16）：二级缓存=生产现状（开，96GiB，c5a 后命中已通）
-            kvOff: String(smd.kvoff || 'simple'), kvOffGiB: Number(smd.kvoffGiB || smd.kvOffGiB) || 96, // 0927 生产定版=SimpleCPU 96GiB
+            kvOff: String(smd.kvoff == null ? '0' : smd.kvoff), kvOffGiB: Number(smd.kvoffGiB || smd.kvOffGiB) || 48, // [pagefix-1005] 本机 32GB：二级缓存缺省关（开档仅手动，48GiB 参考）
             // [ple-field 0923] PLE 表精度=生产现状（INT8 磁盘驻留；选 BF16 则下发 FN_PLE_INT8=0）
-            pleInt8: '1',
+            pleInt8: String(smd.pleInt8 == null ? '1' : smd.pleInt8), // [pagefix-1005]
             // [ple-loc 0923][sync 09-23] 生产=heap：大 pinned 二级层会挤压页缓存，disk 模式有 09-19 缺页拖垮 decode 的事故模式；heap 匿名堆免疫此压力
-            pleLoc: 'heap',
+            pleLoc: String(smd.pleLoc == null ? 'disk' : smd.pleLoc), // [pagefix-1005] 写死 heap 曾在 32GB 机直接 OOM（48.3GiB 匿名堆），改随 base=disk
             vllmAttnBackend: '', vllmMaxBatchedTokens: smd.maxBatchedTokens,
             vllmMaxScheduledTokens: '', vllmSchedPolicy: '', vllmAsyncScheduling: '1',
             vllmEnforceEager: '0', vllmBlockSize: smd.blockSize, vllmCpuOffloadGb: '',

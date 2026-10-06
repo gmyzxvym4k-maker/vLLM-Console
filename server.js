@@ -19,6 +19,7 @@ const execFileAsync = (file, args, opts) => new Promise((resolve, reject) => {
 // [__close127_btn_1006__] ===== 关闭 127（18420 Flash-Next）按钮指令 =====
 // 独立端点：POST /v1/internal/close-127 → 走 SCRIPT_MODELS 注册的宿主停止脚本
 // （SIGTERM 优先、等退净才兜底，绝不无差别 SIGKILL 持 CUDA 上下文的进程）。
+// __vllmver_1006__
 // 与 model-manager 的脚本化停止分支同链路，供页面顶部按钮与外部 curl 指令共用。
 async function close127Instance() {
   const port = 18420;
@@ -216,6 +217,112 @@ function listVllmInstances(force) {
   }
   __vllmInstancesCache = { at: now, list: dedup };
   return dedup;
+}
+
+// ---- vLLM 版本探测（[vllm-version-1006] 供「vLLM」标签页显示当前模型的引擎版本）----
+// 判据链（与 ple_table 同款"日志是真值"）：
+//   ① 引擎启动日志自报行 "Initializing a V1 LLM engine (<ver>)"——脚本化/chroot 实例
+//      （引擎属 root：/proc/<pid>/exe、/root、/environ 对 ll 全权限不够；宿主 glob 到的
+//      dist-info 又可能是另一个环境的）唯有此项可靠。126 实锤：18420=root chroot，
+//      宿主 /home/ll/vllm-env 是 0.30.0，引擎实际 0.1.dev20073+g8e685d198。
+//   ② 宿主 dist-info 目录名推导（venv 直起实例）：先按 cmdline 解释器路径锁定所属 venv，
+//      再扫常见站点目录。
+// 端口级 5 分钟缓存（负结果也缓存，避免前端 2s 轮询反复读大日志）。
+let __vllmVerCache = new Map(); // port → { at, ver }
+function vllmVerFromLog(logPath) {
+  // 尾部 8MB 反向分块找最近一条引擎自报行（实例重启换版本时新行必然更靠近尾部）。
+  try {
+    const st = fs.statSync(logPath);
+    const CHUNK = 1024 * 1024, MIN_POS = Math.max(0, st.size - 8 * 1024 * 1024);
+    const fd = fs.openSync(logPath, 'r');
+    try {
+      let pos = st.size, carry = '';
+      while (pos > MIN_POS) {
+        const start2 = Math.max(MIN_POS, pos - CHUNK);
+        const len = pos - start2;
+        const buf = Buffer.alloc(len);
+        fs.readSync(fd, buf, 0, len, start2);
+        const parts = (buf.toString('utf8') + carry).split('\n');
+        carry = parts.shift() || '';
+        for (let i = parts.length - 1; i >= 0; i--) {
+          const m = parts[i].match(/Initializing a V1 LLM engine \(([^)]+)\)/);
+          if (m) return m[1].replace(/^v/, ''); // 归一化：日志自报行带 v 前缀，去掉（前端统一补 'v'）
+        }
+        pos = start2;
+      }
+    } finally { try { fs.closeSync(fd); } catch (e) {} }
+  } catch (e) {}
+  return null;
+}
+function vllmDistVersion(pkgRoot) {
+  try {
+    const infos = fs.readdirSync(pkgRoot).filter(n => /^vllm-[0-9][^-]*\.dist-info$/.test(n));
+    if (infos.length) {
+      const m = infos[infos.length - 1].match(/^vllm-([0-9][^-]*)\.dist-info$/);
+      if (m) return m[1];
+    }
+  } catch (e) {}
+  return null;
+}
+function detectVllmVersion(pid, port, cmdline) {
+  if (port == null) return null;
+  const hit = __vllmVerCache.get(port);
+  if (hit && Date.now() - hit.at < 300000) return hit.ver;
+  let ver = null;
+  // ① 脚本化模型：日志引擎自报行（条目 log + altLogs；pickScriptModelLogFile 内容打分为首选）
+  try {
+    const sms = scriptModelsForPort(port, cmdline || []);
+    for (const sm of sms) {
+      const cands = [];
+      try { const pf = pickScriptModelLogFile({ pid, port }, sm); if (pf) cands.push(pf); } catch (e) {}
+      if (sm.log) cands.push(sm.log);
+      for (const al of sm.altLogs || []) cands.push(al);
+      for (const lf of cands) {
+        ver = vllmVerFromLog(lf);
+        if (ver) break;
+      }
+      if (ver) break;
+    }
+  } catch (e) {}
+  // ② 宿主 dist-info：按 cmdline 解释器的 realpath 推出其 site/dist-packages 根
+  if (!ver && cmdline && cmdline.length) {
+    try {
+      const py = String(cmdline[0] || '');
+      if (/python/.test(py)) {
+        let rp = py;
+        try { rp = fs.realpathSync(py); } catch (e) {}
+        const mm = rp.match(/^(.*)[\/\\]lib[\/\\]python[0-9.]+[\/\\](site|dist)-packages/);
+        if (mm) ver = vllmDistVersion(mm[0].replace(/[\/\\](site|dist)-packages$/, ''));
+        if (!ver) {
+          const m2 = rp.match(/^(.*)[\/\\]bin[\/\\]python[^\/\\]*$/);
+          if (m2) {
+            for (const sp of ['lib', 'lib64']) {
+              const dp = path.join(m2[1], sp);
+              try {
+                for (const d of fs.readdirSync(dp)) {
+                  if (!/^python3\./.test(d)) continue;
+                  ver = vllmDistVersion(path.join(dp, d, 'site-packages'))
+                     || vllmDistVersion(path.join(dp, d, 'dist-packages'));
+                  if (ver) break;
+                }
+              } catch (e) {}
+              if (ver) break;
+            }
+          }
+        }
+      }
+    } catch (e) {}
+  }
+  if (!ver) {
+    for (const hp of ['/home/ll/vllm-env/lib/python3.11/site-packages',
+                      '/usr/local/lib/python3.12/dist-packages',
+                      '/usr/lib/python3.12/dist-packages']) {
+      ver = vllmDistVersion(hp);
+      if (ver) break;
+    }
+  }
+  __vllmVerCache.set(port, { at: Date.now(), ver: ver || null });
+  return ver || null;
 }
 
 // ---- trace 记录时间戳合理性校验（09-18）----
@@ -523,6 +630,7 @@ function resolveModelAlias(model) { return MODEL_ALIASES[model] || model; }
 // 必须在容器镜像 chroot 内启动、无法走标准 vLLM 启动路径的模型（Flash-Next-NVFP4：
 // PP2 + PLE-mmap，依赖 chroot 内补丁与镜像内环境）。模型启动页的「启动/停止」按钮
 // 对这类模型直接调用宿主侧脚本。
+// __dirname_distinct_1006__
 const SCRIPT_MODELS = {
   'qwen3.8-flash-next-nvfp4': {
     dirNames: ['Qwen3.8-Flash-Next-NVFP4'],
@@ -550,8 +658,8 @@ const SCRIPT_MODELS = {
   },
 };
 SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
-  dirNames: ['Qwen3.8-Flash-Next-Channel-INT8-w8a8', 'Qwen3.8-Flash-Next-W4A16-AutoRound'],  // [w8a8-1005] 主映射=w8a8 生产模型（W4A16 目录保留兼容其重下完成后的手动档）
-  modelPath: '/media/ll/data/models/Qwen3.8-Flash-Next-Channel-INT8-w8a8',
+  dirNames: ['Qwen3.8-Flash-Next-W4A16-AutoRound', 'Qwen3.8-Flash-Next-Channel-INT8-w8a8'],  // [w4a16-restore-1006] 主映射=W4A16-AutoRound（重下完成+验收通过，10-06 切回；w8a8 目录保留兼容）
+  modelPath: '/media/ll/data/models/Qwen3.8-Flash-Next-W4A16-AutoRound',  // [w4a16-restore-1006]
   script: '/home/ll/deploy/start-flash-next-w4a16.sh',
   inner: '/home/ll/deploy/flash-next-w4a16-inner.sh',
   stopScript: '/home/ll/deploy/stop-flash-next-w4a16.sh',
@@ -560,30 +668,30 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   scriptSglang: '/home/ll/deploy/sglang-18420/start-flash-next-sglang.sh',
   stopScriptSglang: '/home/ll/deploy/sglang-18420/stop-flash-next-sglang.sh',
   logSglang: '/home/ll/deploy/sglang-18420.log',
-  scriptNew: '/home/ll/deploy/vllm-0300/start-flash-next-0300.sh',
-  stopScriptNew: '/home/ll/deploy/vllm-0300/stop-flash-next-0300.sh',
+  scriptNew: '/home/ll/deploy/vllm-0310/start-flash-next-0310.sh',
+  stopScriptNew: '/home/ll/deploy/vllm-0310/stop-flash-next-0310.sh',
   port: 18420,
   served: 'qwen3.8-flash-next',
   log: '/home/ll/deploy/vllm-flash-next-w4a16.log',
   // 官方 0.30.0 新栈的日志（start-flash-next-0300.sh 里 FN_LOG 缺省值）。祖先链 cmdline
   // 通常已能定位到它（见 ancestorLogFiles），这里兜底：cmdline 拿不到时仍能选中新日志。
-  altLogs: ['/home/ll/deploy/vllm-flash-next-0300.log'],
-  note: 'chroot 镜像 PP3 脚本启动（现行生产=Channel-INT8-w8a8，1M=YaRN×4 副本），加载约 3~9 分钟',
+  altLogs: ['/home/ll/deploy/vllm-flash-next-0310.log', '/home/ll/deploy/vllm-flash-next-0300.log'],
+  note: '官方 vLLM 0.31.0 运行时补丁栈 TP1×PP2（现行生产=W4A16-AutoRound-1M，PLE=INT8 磁盘 mmap，内存二级缓存 96GiB），加载约 5~8 分钟；回滚：touch /home/ll/deploy/vllm-0310/DISABLED → 退回 chroot 旧栈',  // [stack-0310-1006]
   base: {
-    maxModelLen: 262144, gpuMemUtil: 0.95, maxNumSeqs: 4, maxBatchedTokens: 8192,
+    maxModelLen: 262144, gpuMemUtil: 0.95, maxNumSeqs: 4, maxBatchedTokens: 8192,  // [seqs4-1006] 用户 10-06 指定 4 并发（FULL 图捕获 [1,2,4]）
     // [gen-loopfix 0929] 采样基准回到 09-21 反循环定档 t0.6 / p0.95 / k20 / minp0 / pp0.1 / rp1.0（用户 09-29 拍板：09-27 的 1/0/1 裸档导致思考模型 uct/duct token 级硬循环）。
     // base 同时是「弹窗默认值」与「是否下发 FN_GENCFG 的比较基准」，因此两套栈的 inner
     // GENCFG_DEFAULT 必须与此逐字段一致（flash-next-w4a16-inner.sh / vllm-0300/bin/flash-next-0300-inner.sh），
     // 否则会出现「弹窗显示 ≠ 引擎 cmdline 真值」。
     blockSize: 1616, temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-    presencePenalty: 0.2, repetitionPenalty: 1.15, pp: 3, mtpTokens: 4,
+    presencePenalty: 0.2, repetitionPenalty: 1.15, pp: 2, mtpTokens: 4,  // [w4a16-restore-1006] 本机在位 2×CMP 170HX（lspci 仅 03:00/04:00），PP 基准 3→2；三卡机勿套此值
     // [hw-move 1005] 换装 HUANANZHI H12D-8D + EPYC 7F52 + 3×CMP 170HX + 仅 32GB 内存：
     // ① PP 基准 2→3（三卡满配，与 10-04 实跑实例 FN_PP=3 一致）；
     // ② 二级缓存关（classic 96GiB / SimpleCPU 100GiB 在 64GB 机即实锤 OOM，32GB 更快炸）；
     // ③ PLE 唯一可行档 = INT8+disk（mmap 47.7GiB 可回收页缓存，10-04 实跑验证；
     //    INT8 heap 匿名堆 48.3GiB 与 BF16 95.4GiB 均不可回收、必 OOM）。
     // （存档：0929/0927 定版的 kvoff=simple 96GiB 与 pleLoc=heap 均以大内存机为前提，已随换装作废。）
-    kvoff: '0', pleInt8: '1', pleLoc: 'disk', // 1005 生产定版=二级缓存关 + PLE INT8 硬盘驻留
+    kvoff: 'simple', kvoffGiB: 96, pleInt8: '1', pleLoc: 'disk',  // [stack-0310-1006] 二级缓存=SimpleCPUOffloadConnector 96GiB（每 rank ≈48GiB 锁页）；PLE=INT8 产物磁盘 mmap（/media/ll/data/ple，47.7+0.6 GiB 可回收页缓存）。0.31 只有两档：mmap-INT8 / pinned-BF16——弹窗「精度=BF16」或「位置=heap」都会走官方锁页 BF16 95.4GiB
   },
   bannedArgs: ['--mamba-ssm-cache-dtype', '--mamba-cache-mode', '--language-model-only',
                '--enable-prompt-tokens-details', '--safetensors-load-strategy',
@@ -603,8 +711,9 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   // 长上下文档位（2026-09-16）：原生 256K / 512K(YaRN×2) / 1M(YaRN×4)。
   //   每档一个「只改 config.json、其余软链回原目录」的副本；factor = 目标长度 / 262144。
   //   mrope 缓存恒 = original(262144) × 4 = 1048576，故 512K、1M 都安全（≤ 缓存）。
-  altModelPaths: ['/media/ll/data/models-1m/Qwen3.8-Flash-Next-Channel-INT8-w8a8-1M', '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M'],  // [w8a8-1005] w8a8 无 512K 副本，512 档已隐藏
-  longCtxModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-Channel-INT8-w8a8-1M',
+  altModelPaths: ['/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M'],  // [w4a16-restore-1006] 1M=YaRN×4 W4A16 副本
+  longCtxModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M',  // [w4a16-restore-1006]
+  pleInt8Dir: '/media/ll/data/ple',  // [w4a16-restore-1006] W4A16 专属 INT8 表产物目录（不存在则 inner 回落 BF16 磁盘驻留）；禁止跨 checkpoint 复用（inner 缺省是 ple-w8a8）
   maxModelLenLong: 1048576,
 };
 MODEL_ALIASES['qwen3.8-flash-next-w4a16'] = 'qwen3.8-flash-next';
@@ -621,6 +730,124 @@ function scriptModelForName(name) {
   }
   return null;
 }
+// [script-entry-route-1006] 脚本化模型实例认领的共享工具。
+// 背景（126 机 10-06 实锤）：旧认领=「进程 cmdline 含候选模型路径之一」——同注册键
+// （SCRIPT_MODELS 条目）挂多个 dirNames/altModelPaths 时，任何一个在跑目录被命中，
+// 该条目名下所有目录卡片都显示「运行中」（AutoRound 卡明明没跑也亮绿，且点它会因
+// 「已在运行」被拒启动）。正解=按「启动入口脚本」认领：引擎进程的 wrapper 脚本
+// （script/scriptNew/scriptSglang）与条目一致才算该条目在跑；卡片再按「自身目录
+// 是否是引擎实际加载路径（或其 YaRN 副本基底）」细分显示。
+function smEntryScripts(v) {
+  return [v.script, v.scriptNew, v.scriptSglang].filter(Boolean);
+}
+function readCmdlineArgv(pid) {
+  try { return fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8').split('\0').filter(Boolean); } catch (e) { return []; }
+}
+function procCmdline(pid) {
+  try { return fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8').split('\0').join(' '); } catch (e) { return ''; }
+}
+// 祖先链上（含自身之上、≤maxHops 层）是否出现过该 wrapper 脚本的 cmdline。
+// wrapper 谱系：bash <script> → sudo -S setsid chroot … <inner> → python 引擎（各级
+// cmdline 各不相同）；引擎被 kill 后 wrapper 若还活着（停止中）依然命中=仍在运行，语义正确。
+function procHasAncestorScript(pid, scripts, maxHops) {
+  if (!scripts || !scripts.length) return false;
+  let cur = pid | 0;
+  for (let hop = 0; hop <= (maxHops || 8) && cur > 1; hop++) {
+    let ppid = 0;
+    try {
+      const st = fs.readFileSync('/proc/' + cur + '/stat', 'utf8');
+      ppid = parseInt(st.slice(st.lastIndexOf(')') + 1).trim().split(/\s+/)[1], 10) || 0;
+    } catch (e) { break; }
+    if (!ppid || ppid === cur) break;
+    cur = ppid;
+    const cmd = procCmdline(cur);
+    if (cmd && scripts.some((s) => cmd.includes(s))) return true;
+  }
+  return false;
+}
+// 引擎 cmdline 的模型路径（serve 后第一个非 flag / --model / --model-path）
+function procModelPath(cmdOrArgv) {
+  // 兼容两种入参：/proc cmdline 原文（\0 分隔）或已 split 的 argv 数组
+  const argv = Array.isArray(cmdOrArgv) ? cmdOrArgv : String(cmdOrArgv).split('\0').filter(Boolean);
+  for (let i = 0; i < argv.length; i++) {
+    if ((argv[i] === '--model' || argv[i] === '--model-path') && argv[i + 1]) return argv[i + 1];
+    if (argv[i] === 'serve' && argv[i + 1] && !String(argv[i + 1]).startsWith('-')) return argv[i + 1];
+  }
+  return '';
+}
+// 把一个模型目录解析成「启动条目目录」集合：自身 + 指向它的外部软链（如
+// /home/ll/models → /media/ll/data/models）+ 其软链子目录（models-1m 的 YaRN 副本
+// 目录：10-04 用 cp -as 创建，实体文件只有 config 等少数、其余全是指回基底的软链，
+// 例如 <副本>/LICENSE → <基底>/LICENSE）。[dir-entry-map-1006]
+function resolveEntryDirs(dirPath) {
+  const out = new Set();
+  const norm = (x) => String(x || '').replace(/\/+$/, '');
+  if (!dirPath) return out;
+  const a = norm(dirPath);
+  out.add(a);
+  try { out.add(norm(fs.realpathSync(a))); } catch (e) {}
+  // 外部软链：同父目录下哪些条目 symlink 指向本目录
+  try {
+    const parent = a.slice(0, a.lastIndexOf('/'));
+    for (const d of fs.readdirSync(parent)) {
+      const full = parent + '/' + d;
+      if (full === a) continue;
+      try {
+        if (fs.lstatSync(full).isSymbolicLink() && norm(fs.realpathSync(full)) === a) out.add(full);
+      } catch (e) {}
+    }
+  } catch (e) {}
+  // 软链子目录（YaRN 上下文副本判据：目录名以本目录名为前缀 + 其下有 ≥1 个
+  // 回指本目录的软链文件，防误伤恰好同前缀的独立目录）。副本常在**别的父目录**
+  // （如基底在 models/、副本在 models-1m/，10-04 定版），父目录集合=自身父级 +
+  // MODELS_DIR 同级派生目录（models-1m/models-512k 等）。[dir-parent-cross-1006]
+  try {
+    const parent2 = a.slice(0, a.lastIndexOf('/'));
+    const gp = parent2.slice(0, parent2.lastIndexOf('/'));
+    const parents = new Set([parent2]);
+    try {
+      for (const d of fs.readdirSync(gp)) {
+        const full = gp + '/' + d;
+        try { if (fs.lstatSync(full).isDirectory() && !fs.lstatSync(full).isSymbolicLink() && /^models([-_]|$)/.test(d) && full !== parent2) parents.add(full); } catch (e) {}
+      }
+    } catch (e) {}
+    const myName = a.slice(a.lastIndexOf('/') + 1);
+    for (const par of parents) {
+    let ds = [];
+    try { ds = fs.readdirSync(par); } catch (e) { continue; }
+    for (const d of ds) {
+      const full = par + '/' + d;
+      if (full === a || d.indexOf(myName) !== 0 || d.length <= myName.length) continue;
+      let st = null;
+      try { st = fs.lstatSync(full); } catch (e) { continue; }
+      if (!st.isDirectory() || st.isSymbolicLink()) continue;
+      let linkedBack = false;
+      try {
+        // 任一软链回指本目录即认定副本（YaRN 副本用 cp -as 创建、百余文件全是指回
+        // 基底的软链，实体只有 config 等数个；扫描带上隐藏文件、不设上限截断）
+        for (const f of fs.readdirSync(full, { withFileTypes: true })) {
+          try {
+            if (!f.isSymbolicLink()) continue;
+            const tgt = norm(fs.readlinkSync(full + '/' + f.name));
+            if (tgt === a || tgt.startsWith(a + '/')) { linkedBack = true; break; }
+          } catch (e) {}
+        }
+      } catch (e) {}
+      if (linkedBack) out.add(norm(full));
+    }
+    }
+  } catch (e) {}
+  return out;
+}
+// 某模型目录是否「就是」引擎加载路径（含软链别名与 YaRN 副本展开）。
+function modelDirMatchesEnginePath(dirPath, enginePath) {
+  if (!dirPath || !enginePath) return false;
+  const b = String(enginePath).replace(/\/+$/, '');
+  for (const d of resolveEntryDirs(dirPath)) if (d === b) return true;
+  return false;
+}
+
+// __script_entry_route_1006__
 // 脚本模型实例探测：chroot 内引擎属 root（ll 的 lsof 看不到监听端口），按
 // /proc/<pid>/cmdline 里的模型路径认领，端口从 --port 动态解析（弹窗可改端口）。
 // 1M 档会用 longCtxModelPath（altModelPaths），故这里要把所有候选路径都算上。
@@ -637,9 +864,18 @@ function scriptModelInstance(sm) {
       try {
         const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ');
         if (/(^|\s)(ssh|bash|sh|expect)(\s|$)/.test(cmd)) continue;
-        if (paths.length && !paths.some(p => cmd.includes(p))) continue;
+        // [script-entry-route-1006] 认领按「启动入口脚本」而非模型路径：同注册键条目挂着
+        // 多个 dirNames/altModelPaths 时互不串味——只有被该条目自己的 wrapper（script/
+        // scriptNew/scriptSglang）拉起的引擎才算这条目在跑。无入口脚本的条目退回旧路径认领。
+        const entryScripts = smEntryScripts(sm);
+        if (entryScripts.length) {
+          if (!procHasAncestorScript(parseInt(pid), entryScripts, 8)) continue;
+        } else if (paths.length && !paths.some(pp => {
+          for (const ed of resolveEntryDirs(pp)) if (cmd.includes(ed)) return true;
+          return false;
+        })) continue;
         const m = cmd.match(/--port\s+(\d+)/);
-        if (m) return { port: parseInt(m[1]), pid: parseInt(pid) };
+        if (m) return { port: parseInt(m[1]), pid: parseInt(pid), engineModelPath: procModelPath(readCmdlineArgv(pid)) };
       } catch (e) {}
     }
   } catch (e) {}
@@ -678,7 +914,10 @@ function sglangActive() {
   try { return fs.existsSync(SGLANG_ACTIVE); } catch (e) { return false; }
 }
 function stack0300Active() {
-  try { return !fs.existsSync(STACK0300_DISABLED); } catch (e) { return false; }
+  // [stack-0310-1006] 「新栈」已升到官方 vLLM 0.31.0（vllm-0310）：
+  // 哨兵换名生效——vllm-0310/DISABLED 在位 = 退回 chroot 旧栈；不在位 = 走 0.31.0。
+  // （0.30.0 已被 0.31.0 取代，其 DISABLED 不再参与判定；回滚 0.30 用本补丁 --revert。）
+  try { return !fs.existsSync('/home/ll/deploy/vllm-0310/DISABLED'); } catch (e) { return false; }
 }
 function resolveStopScript(sm) {
   try {
@@ -884,6 +1123,7 @@ function scriptModelLaunchPlan(sm, d) {
   const warnings = [];
   // 不写死 FN_LOG：wrapper 按端口命名为 vllm-flash-next-${PORT}.log
   const env = { FN_MODEL_PATH: sm.modelPath };
+  if (sm.pleInt8Dir) env.FN_PLE_INT8_DIR = sm.pleInt8Dir;  // [w4a16-restore-1006] 防落 inner 缺省(w8a8 表)
   const num = (v, dflt) => { const n = parseFloat(v); return isNaN(n) ? dflt : n; };
   const int = (v, dflt) => { const n = parseInt(v, 10); return isNaN(n) ? dflt : n; };
   const port = int(d.port, sm.port);
@@ -4474,6 +4714,9 @@ function lsIngestLine(r) {
     st.g = g;
     st.gLastT = ts;
   }
+  // 首 token 判据维持 pf-only：151 序列实测 150 个首样本即 pf=1,g=1（精确真值）。
+  // （曾加 g>0 兜底，统计证伪：pf=1 时兜底先把 firstT 提前到 max(a,t−0.35)，
+  // 分母虚大反而稀释速度——已撤，勿再画蛇添足。）
   if (r.pf && st.firstT === null) st.firstT = ts; // 首 token 步
   if (st.g > 0 || r.f) {
     const last = st.samples[st.samples.length - 1];
@@ -4625,7 +4868,11 @@ function v3TouchRow(lv, st) {
   lv.tokens = st.g;
   // g 冻结 >2.5s（客户端断连/被抢占/引擎停顿，行未 done 但不再产出）：
   // 均值钉住在最后活跃值——否则分母随时间增长把显示稀释成假低速（实测 117→16）。
-  const gAge = Date.now() / 1000 - (st.gLastT || st.obsT || 0);
+  // [v3-pin-stale-1006] g 停增但**新行仍在到达**（st.lastLineT 比 gLastT 新）
+  // ≠ 输出冻结：多为客户端断连/抢占丢弃后引擎仍带该序列收尾，或观测间隙。
+  // 只有"新行也停了"才算真冻结——否则分母钉在墙钟 now 上，行滞留期间每轮
+  // 重算 den 随墙钟增长 → 显示被稀释成 0.2 这类假低速（10-06 并发截图实锤）。
+  const gAge = Date.now() / 1000 - (st.lastLineT || st.gLastT || st.obsT || 0);
   if (gAge > 2.5) {
     // [v3avg-pin-1003] 钉住 = 把最后活跃时刻算出的均值固化为终值（v3AvgFrozen），
     // 此后不再重算。旧版只"跳过赋值"，留下两个数值缺陷：
@@ -4634,8 +4881,11 @@ function v3TouchRow(lv, st) {
     //     分母继续增长 → 显示被稀释成十几 tok/s 的假低速；
     //  ② 行被别的 rid 接管复用（bindRow 换绑）时旧 v3Avg 残留显示。
     // 缺 v3AvgFrozen（首轮即冻结：接管时 g 已停）→ 回落最后活跃时刻口径。
+    // [v3-pin-stale-1006] 同活跃支路：钉住分母只到 gLastT 为止；观测窗未成熟
+    // （接管即停/完成行 g 同刻覆盖样本基线，10-06 实测 REQ-22 0.3 形态）→ 不发
+    // 稀释值，前端回落上一有效值/显示 --。
     if (lv.v3AvgFrozen === undefined) {
-      const tEnd = st.gLastT || st.obsT || (Date.now() / 1000);
+      const tEnd = Math.min(Date.now() / 1000, st.gLastT || st.obsT || (Date.now() / 1000));
       if (st.firstT) {
         const den = tEnd - st.firstT;
         lv.v3AvgFrozen = den >= 0.5 ? st.g / den : undefined;
@@ -4650,7 +4900,14 @@ function v3TouchRow(lv, st) {
   }
   if (st.firstT) {
     lv.decodeStart = Math.round(st.firstT * 1000);
-    const den = (Date.now() - lv.decodeStart) / 1000;
+    // [v3-pin-stale-1006] **活跃期全程均值的分母钉在 min(now, 最后产出)**：
+    // 10-06 截图形态（g=8·el=34s·0.2 tok/s）的直接源头——行 g 已停/完成、rid
+    // 暂离绑定（v3goneAt）后仍走本支路，分母随墙钟增长而分子是冻结终值，
+    // 全程均值被稀释成零点几。停增/停观测期不再发放稀释值；产出恢复（g 推进
+    // → gLastT 变新）时窗口自然重新成熟。
+    const _anchorS = Math.max((st.gLastT || st.obsT || st.firstT) - 0.05, st.firstT || 0);
+    const _denEnd = Math.min(Date.now() / 1000, _anchorS);
+    const den = (_denEnd * 1000 - lv.decodeStart) / 1000;
     lv.v3Avg = den >= 0.5 ? st.g / den : undefined; // 全程真均值（首token起算）
   } else {
     // 中途接管（pf 行未见，真实首token时刻未知）：全程均值退化为「接管后
@@ -5041,6 +5298,10 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
         lv.id = pk.id; lv.taskId = pk.taskId; lv.crid = pk.crid; lv.ip = pk.ip;
         rt.parked.delete(st.rid);
       }
+      // [v3-pin-stale-1006] 复活暂存身份时同步清除 stale goneAt：行在 gauge
+      // 滞后窗（≤5s）内按 rid 暂存、随后 bindRow 复活，若不重清，v3TouchRow
+      // 活跃支路会把 goneAt 当 decodeStart 起点 → 新请求 avg 分母虚大被稀释。
+      if (lv.v3goneAt && st.lastLineT) lv.v3goneAt = Math.round(st.lastLineT * 1000);
       lv.v3rid = st.rid; lv.v3Exact = !!exact;
       // 接管过的行（曾是别的已完成请求）复位旧身份钉与 decode 起点，再按
       // 新 rid 重钉——否则 elapsed 继承旧行虚高、avg_speed 分母错。
@@ -5170,9 +5431,11 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
         const lv = rt.live[i];
         if (!lv) { zeroTokenIdx.push(i); continue; }
         if (lv.v3rid && v3StateById.has(lv.v3rid)) phaseOf[i] = 'decode';
-        else if (lv.v3goneAt && Date.now() - lv.v3goneAt < 15000) {
-          // 刚完成（gauge 滞后，最坏=metrics 缓存失效回退窗口）：保持「输出中」
-          // 冻结显示 ≤15s，避免闪回「预填充中」（tokens 停在引擎终值）。
+        else if (lv.v3goneAt && Date.now() - lv.v3goneAt < 5000) {
+          // [v3-pin-stale-1006] 冻结滞留窗 15s→5s：旧窗内行显示"输出中"但数值
+          // 已停（tokens 冻结），elapsed 继续随墙钟涨 → 并发高发期截图上"8 tok ·
+          // 34s · 0.2 tok/s"形态的窗口本体会被缩到 5s（配合分母钉住双保险）。
+          // 刚完成（gauge 滞后）：保持「输出中」避免闪回「预填充中」。
           phaseOf[i] = 'decode';
         } else zeroTokenIdx.push(i);
       }
@@ -5242,8 +5505,9 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
           rowV2[i] = { spd: rs ? rs.spd : undefined, gen: st.g, src: lv.v3Exact ? 'v3-exact' : 'v3' };
           lv.v3lastSec = v3LastSec(st, nowV3b);
           v2Used = true;
-        } else if (lv.v3goneAt && nowV3b - lv.v3goneAt < 15000) {
-          // 刚完成（gauge 滞后 ≤3s）：瞬时速度不出数，累计冻结在终值
+        } else if (lv.v3goneAt && nowV3b - lv.v3goneAt < 5000) {
+          // [v3-pin-stale-1006] 与相位支路同步 15s→5s：刚完成（gauge 滞后）
+          // 瞬时速度不出数，累计冻结在终值
           rowV2[i] = { spd: undefined, gen: lv.tokens, src: 'v3' };
           v2Used = true;
         }
@@ -5577,6 +5841,7 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
       const isPrefill = phaseOf[i] === 'prefill';
       const reqId = i + 1;
       const live = rt.live[i] || { id: 'REQ-' + reqId, ip: '—', startedAt: Date.now(), tokens: 0 };
+      const lvV3st = live && live.v3rid ? v3StateById.get(live.v3rid) : null; // [v3-pin-stale-1006] elapsed 钉锚用
       let reqSpeed = 0;
       let reqPhase;
       let justEnteredDecode = false;
@@ -5672,8 +5937,19 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
       // DECODE-phase elapsed time (自 TTFT 之后起算)。这样「输出中」行显示的值
       // 就是它真实产出 token 的平均速度，prefill/TTFT 等待不再拉低分母；
       // 引擎真正停顿时（本轮增量 0、token 不再累计）均值会如实回落。
-      const liveElapsed = (Date.now() - live.startedAt) / 1000;
-      const decodeElapsed = (Date.now() - (live.decodeStart || live.startedAt)) / 1000;
+      // [v3-pin-stale-1006] v3 行 elapsed 钉在 min(now, lastOut+2s)：冻结滞留窗
+      // 内卡片仍显示"输出中"，秒表随墙钟走会与钉住的 avg 互相矛盾（"8 tok ·
+      // 34s · 0.2 tok/s"形态的显示层源头）；+2s 容差防行轮转时秒表倒跳。
+      const _lastOutS = live.v3rid && (live.tokens || 0) > 0 && lvV3st && lvV3st.gLastT
+        ? lvV3st.gLastT
+        : (live.v3goneAt ? live.v3goneAt / 1000 : null);
+      // [v3-pin-stale-1006] 秒表钉 min(now, 最后产出+2)：冻结滞留窗内 elapsed
+      // 不再随墙钟增长（"8 tok·34s·0.2"形态的显示层源头）；行出生晚于最后
+      // 产出（接管即停倒挂）钳 0，绝不发放 dilute 分母。
+      const liveElapsed = _lastOutS !== null
+        ? Math.max(0, Math.min(Date.now() / 1000, _lastOutS + 2) - live.startedAt / 1000)
+        : (Date.now() - live.startedAt) / 1000;
+      const decodeElapsed = live.v3rid ? liveElapsed : (Date.now() - (live.decodeStart || live.startedAt)) / 1000; // [v3-pin-stale-1006] v3 行分母同源（avg_speed 非 v3Avg 支路），冻结期不随墙钟稀释
       const avgDenom = decodeElapsed >= 0.5 ? decodeElapsed : liveElapsed;
       // Tokens THIS request produced in the last 1 second (server-side ticker):
       // the batch's measured last-second token total split across decode rows.
@@ -10452,6 +10728,7 @@ const server = http.createServer(async (req, res) => {
             const cmdline = fs.readFileSync(`/proc/${inst.pid}/cmdline`, 'utf8').split('\0').filter(Boolean);
             const p = parseServerParams(cmdline, runtime, inst.port);
             if (runtime === 'sglang') p.attention_backend = null; // sglang 无此参数，避免显示 vLLM 默认值
+            else if (!p.vllm_version) p.vllm_version = detectVllmVersion(inst.pid, inst.port, cmdline); // [vllm-version-1006]
             applyGenConfigDefaults(p, cmdline); // 未显式传采样参数时回落模型 generation_config
             // [ple-display 0923] Flash-Next 脚本化实例：附 PLE 表精度/驻留（日志判据）。
             // 注意：同端口可能注册着多个脚本模型条目（18420 先后有 NVFP4/W4A16 两栈，
@@ -10498,6 +10775,7 @@ const server = http.createServer(async (req, res) => {
       const cmdline = fs.readFileSync(`/proc/${out}/cmdline`, 'utf8').split('\0').filter(Boolean);
       const params = parseServerParams(cmdline, runtime, wantPort);
       applyGenConfigDefaults(params, cmdline); // 未显式传采样参数时回落模型 generation_config
+      if (runtime === 'vllm' && !params.vllm_version) params.vllm_version = detectVllmVersion(parseInt(out) || null, wantPort, cmdline); // [vllm-version-1006]
       // [ple-display 0923] 单端口模式同样附 PLE 表状态（脚本化模型端口才有效）
       const smPle1 = scriptModelForPort(wantPort);
       if (smPle1) {
@@ -10549,7 +10827,19 @@ const server = http.createServer(async (req, res) => {
           // 旧写法 `i.model === m.path` 永远为 false → 运行中的模型卡片恒显示「未运行」。
           const isModelRunning = (m) => {
             const sm0 = scriptModelForName(m.name);
-            if (sm0 && (instances.some(i => i.port === sm0.port) || scriptModelAlive(sm0))) return true;
+            if (sm0) {
+              // [script-entry-route-1006] 脚本卡片：条目在跑还不够，须引擎实际加载的
+              // 就是这个目录（或其 YaRN 上下文副本）才算「运行中」。
+              const ins0 = scriptModelInstance(sm0);
+              if (ins0) {
+                if (!ins0.engineModelPath) {
+                  // 拿不到引擎路径（极端形态）：退回端口级旧语义，宁多报不漏报运行态
+                  return instances.some(i => i.port === sm0.port);
+                }
+                return modelDirMatchesEnginePath(m.path, ins0.engineModelPath);
+              }
+              return instances.some(i => i.port === sm0.port);
+            }
             return !!instances.find(i =>
               i.model === m.name || i.model === m.path || m.path === i.model ||
               (m.path && i.model && m.path.endsWith('/' + i.model)));
@@ -10560,21 +10850,34 @@ const server = http.createServer(async (req, res) => {
             const sm1 = scriptModelForName(m.name);
             if (sm1) {
               const inst = scriptModelInstance(sm1);
+              // [script-entry-route-1006] 卡片级运行判定细化：条目在跑但引擎加载的不是
+              // 本卡片目录 → 本卡显示未运行（可启动），路径行提示实际在服务的目录。
+              let smRunning = !!inst;
+              let siblingNote = '';
+              if (inst && inst.engineModelPath && !modelDirMatchesEnginePath(m.path, inst.engineModelPath)) {
+                smRunning = false;
+                siblingNote = '（本启动条目当前由 ' + String(inst.engineModelPath).replace(/^.*\//, '') + ' 在服务于端口 ' + inst.port + '）';
+              }
               // [sglang-adapt-1003] SGLang 脚本栈在位 → 卡片注记显示真实引擎（否则写着
               // 「容器镜像 PP2 脚本启动」误导：现行 18420 是 sglang.launch_server）。
               let onSgStack = false;
               try { onSgStack = !!(sm1.scriptSglang && sglangActive() && require('fs').existsSync(sm1.scriptSglang)); } catch (e) {}
               return Object.assign({}, m, {
-                name: sm1.key, dir_name: m.name, script_model: true,
-                port: inst ? inst.port : sm1.port, pid: inst ? inst.pid : null,
+                // [dir-name-distinct-1006] 展示名=真实目录名：同注册键（dirNames 多目录）的
+                // 卡片不再同名；name 同时作为 modelName 回传，后端 scriptModelForName 按
+                // dirNames 正常解析路由（点哪张卡启动哪个目录的模型）。script_name=注册键，
+                // 供前端 defaults（脚本模型弹窗基准参数）查找。
+                name: m.name, script_name: sm1.key, dir_name: m.name, script_model: true,
+                port: inst ? inst.port : sm1.port, pid: smRunning ? (inst ? inst.pid : null) : null, // [script-entry-route-1006] 未运行卡片不带 pid（防「关闭」按钮误现）
                 served_name: sm1.served,
                 note: onSgStack
                   ? 'SGLang 脚本启动（sglang-18420 脚本对 · NEXTN 投机 + PLE BF16 锁页 · 加载约 6~10 分钟）'
                   : (sm1.note || ''),
                 engine: onSgStack ? 'sglang' : 'vllm',
-                running: !!inst,
+                running: smRunning,
                 defaults: scriptModelDefaults(sm1),
                 schemes: flashNextSchemes(),
+                script_note_extra: siblingNote || null,
               });
             }
             return Object.assign({}, m, { running: isModelRunning(m) });

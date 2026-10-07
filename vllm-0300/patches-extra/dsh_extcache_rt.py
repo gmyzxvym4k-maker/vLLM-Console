@@ -24,9 +24,13 @@ finalize 后挂到 **EngineCoreOutput.prefill_stats**（scheduler.py:2216）发�
   #12-A ``vllm.Request.take_prefill_stats``
         返回前记下 (ext, loc, cached, pt)；cached 此刻是 set() 写的 local+external，
         官方在同处有 assert 背书，一致性最强。顺带 register_scheduler(self._sched)。
-  #12-B ``SchedulerInterface.update_from_output``
+  #12-B ``Scheduler.update_from_output``（vllm.v1.core.sched.scheduler）
         遍历返回的 EngineCoreOutputs.outputs，读 prefill_stats 分项，
         并在 output.finish_reason 非空时落盘该请求（主完成信号）。
+        ⚠ 必须挂在这个**具体类**上：官方 Scheduler 自己定义了同名方法
+        （scheduler.py:1988 起）遮蔽了接口那份，只包 SchedulerInterface 的话
+        真实引擎里钩子根本不会执行（10-07 生产 venv 上实测复现：打到接口的
+        包装一次都没进）。interface 那道仍保留，纯粹防未来换成别的调度器实现。
 
 落盘：vllm-ext-cache.jsonl，一行一个 rid：
     {"rid","t","ext","loc","cached","pt","consistent","port"}
@@ -251,39 +255,43 @@ def _patch_request(module) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 钩子 #12-B：SchedulerInterface.update_from_output（完成信号 + 冗余补全）
+# 钩子 #12-B：<Class>.update_from_output（完成信号 + 冗余补全）
+# 同一个包装挂到多处：具体类 Scheduler（真实生效点）+ 抽象 SchedulerInterface
+# （防将来换调度器实现）。挂到已被具体类遮蔽的抽象方法上没有副作用，留着只是保险。
 # ---------------------------------------------------------------------------
-def _hook_scheduler_iface(module) -> None:
-    cls = getattr(module, "SchedulerInterface", None)
-    if cls is None or not hasattr(cls, "update_from_output"):
-        _log("没找到 SchedulerInterface.update_from_output ⇒ #12-B 跳过（上游结构变了）")
-        return
-    if getattr(cls, "_dsh_extcache_b", False):
-        return
-    orig = cls.update_from_output
+def _make_iface_hook(class_attr):
+    def hook(module):
+        cls = getattr(module, class_attr, None)
+        if cls is None or not hasattr(cls, "update_from_output"):
+            _log(f"没找到 {module.__name__}.{class_attr}.update_from_output ⇒ #12-B 跳过（上游结构变了）")
+            return
+        if getattr(cls, "_dsh_extcache_b", False):
+            return
+        orig = cls.update_from_output
 
-    def update_from_output(self, scheduler_output, model_output):
-        ret = orig(self, scheduler_output, model_output)
-        try:
-            register_scheduler(self)
-            eos = ret.values() if isinstance(ret, dict) else []
-            for eo in eos:
-                for o in getattr(eo, "outputs", ()) or ():
-                    ps = getattr(o, "prefill_stats", None)
-                    if ps is not None:
-                        # 冗余一道：take 钩子若因上游改名失效，这里仍能拿到同一对象
-                        _note_take(getattr(o, "request_id", None), ps)
-                    if getattr(o, "finish_reason", None) is not None:
-                        _flush(o.request_id, getattr(o, "num_prefill_tokens", None))
-        except Exception as exc:
-            if not _state.get("warn_b"):
-                _state["warn_b"] = True
-                _log(f"#12-B 遍历输出异常（忽略）：{type(exc).__name__}: {exc}")
-        return ret
+        def update_from_output(self, scheduler_output, model_output):
+            ret = orig(self, scheduler_output, model_output)
+            try:
+                register_scheduler(self)
+                eos = ret.values() if isinstance(ret, dict) else []
+                for eo in eos:
+                    for o in getattr(eo, "outputs", ()) or ():
+                        ps = getattr(o, "prefill_stats", None)
+                        if ps is not None:
+                            # 冗余一道：take 钩子若因上游改名失效，这里仍能拿到同一对象
+                            _note_take(getattr(o, "request_id", None), ps)
+                        if getattr(o, "finish_reason", None) is not None:
+                            _flush(o.request_id, getattr(o, "num_prefill_tokens", None))
+            except Exception as exc:
+                if not _state.get("warn_b"):
+                    _state["warn_b"] = True
+                    _log(f"#12-B 遍历输出异常（忽略）：{type(exc).__name__}: {exc}")
+            return ret
 
-    cls.update_from_output = update_from_output
-    cls._dsh_extcache_b = True
-    _log("SchedulerInterface.update_from_output 已挂钩（rt-patch #12 完成信号）")
+        cls.update_from_output = update_from_output
+        cls._dsh_extcache_b = True
+        _log(f"{class_attr}.update_from_output 已挂钩（rt-patch #12 完成信号）")
+    return hook
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +328,10 @@ def build_patches() -> dict:
         return {}
     return {
         "vllm.v1.request": _patch_request,
-        "vllm.v1.core.sched.interface": _hook_scheduler_iface,
+        # ↓ 真实生效点：具体调度器类（它会遮蔽接口上的同名方法）
+        "vllm.v1.core.sched.scheduler": _make_iface_hook("Scheduler"),
+        # ↓ 保险：万一将来用别的 SchedulerInterface 实现
+        "vllm.v1.core.sched.interface": _make_iface_hook("SchedulerInterface"),
     }
 
 

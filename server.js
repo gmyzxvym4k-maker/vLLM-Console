@@ -10704,7 +10704,9 @@ async function strataRemoteCmd(req, res) {
     return reply(200, Object.assign({ action: act }, r));
   }
   if (act === 'shutdown') {
-    const r = await strataSshExec('shutdown /s /t 0', 12000);
+    // 10-08 实锤：.38 是精简 Win11，64 位与 WOW64 两份 shutdown.exe 都缺依赖（cmd 报"找不到文件"），
+    // 必须走 PowerShell Stop-Computer（直调 advapi32 关机 API，不经 shutdown.exe）。-WhatIf 已实测可用。
+    const r = await strataSshExec('powershell -NoProfile -Command "Stop-Computer -Force"', 12000);
     return reply(200, Object.assign({ action: act }, r, r.ok ? { msg: '关机指令已下发（远端立即开始关机，页面稍后转「远端不可达」属正常）' } : {}));
   }
   if (act === 'startbat') {
@@ -10716,7 +10718,14 @@ async function strataRemoteCmd(req, res) {
       return reply(200, { ok: false, action: act, msg: 'Strata 已在运行（' + cfg.baseUrl + ' /health 正常），无需重复启动；如需换档请先关机再唤醒后启动' });
     } catch (e) { /* 不可达 = 未运行，正是该启动的场景 */ }
     const r = await strataSshExec('start "" /min ' + cfg.bat, 15000);
-    return reply(200, Object.assign({ action: act }, r, r.ok ? { msg: '已启动 ' + cfg.bat + '（模型加载 2~6 分钟，页面会自动转绿）' } : {}));
+    if (!r.ok) return reply(200, Object.assign({ action: act }, r));
+    // 自校验（10-08）：start 分离执行 ssh 退出码 0 ≠ 真启动了；等 4s 查 python 进程坐实。
+    await new Promise((res2) => setTimeout(res2, 4000));
+    const chk = await strataSshExec('tasklist /fi "IMAGENAME eq python.exe" /nh /fo csv', 10000);
+    const hasPy = chk.ok && /python\.exe/i.test(chk.msg || '');
+    return reply(200, { action: act, ok: true, msg: hasPy
+      ? '已启动 ' + cfg.bat + '（已检测到 python 进程，模型加载 2~6 分钟，页面会自动转绿）'
+      : '启动命令已发出，但 4 秒后未检测到 python 进程——可能未生效（bat 内层重定向被占用/路径失效），可再点一次或看远端桌面窗口' });
   }
   return reply(400, { ok: false, msg: 'action 必须是 wake | shutdown | startbat' });
 }

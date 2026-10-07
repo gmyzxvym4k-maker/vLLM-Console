@@ -159,6 +159,19 @@ try:
     _PATCHES.update(dsh_stream_rt.PATCHES)
 except Exception as _stexc:  # 加载失败绝不拖垮启动，但必须出声
     _log(f"dsh_stream_rt 加载失败（每请求输出真值流未激活，并发卡速度回落估算）：{_stexc}")
+# --------------------------------------------------------------------------
+# rt-patch #12：每请求「二级缓存（CPU KV offload）命中」真值（2026-10-07）
+# 只挂 vllm.v1.request 与 vllm.v1.core.sched.interface 两个模块：在官方摘取
+# PrefillStats（take_prefill_stats）的一瞬记下 local/external 分项，请求完成时
+# 落盘 vllm-ext-cache.jsonl，控制台按 rid join 到「最近完成请求」表新增的
+# 二级缓存命中 列。紧急回退：DSH_EXTCACHE_RT_DISABLE=1 ⇒ 不挂钩（该列显示 --）。
+# --------------------------------------------------------------------------
+try:
+    import dsh_extcache_rt
+
+    _PATCHES.update(dsh_extcache_rt.PATCHES)
+except Exception as _xcexc:  # 加载失败绝不拖垮启动，但必须出声
+    _log(f"dsh_extcache_rt 加载失败（每请求二级缓存命中列无数据）：{_xcexc}")
 
 
 # 幂等哨兵：用 sys 模块属性，**不要用环境变量** —— 环境变量会被 vLLM 的 mp 子进程

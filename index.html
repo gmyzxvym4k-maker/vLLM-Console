@@ -2037,7 +2037,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20261006-r18'; // r18 = 10-06 仪表盘曲线提速平滑 + 停刷防御：① PD 动态图轮询 1s→500ms、序列 EMA(α=0.3) 平滑、折线改 Catmull-Rom 贝塞尔、当前值读数用平滑值（曲线跟进更快、无逐秒锯齿）；② 并发卡（500ms 独立轮询）成功渲染即盖 _lastRenderAt——原实现只在主链整轮结束后盖章，后端毛刺期（stats 实测 p95≈1.9s、峰值 4s）主链一轮拖十几秒时看门狗误判正常不自愈，现并发卡心跳成为独立渲染推进信号；③ 后端 stats 加 350ms 结果缓存（同窗口多消费者只算一次）。 //  r17 = 10-06 并发实时测速稀释修复：v3TouchRow 活跃期全程均值分母钉在 min(now, 最后产出/新行)（停增/暂离期不发稀释值，截图 g=8·34s·0.2 形态根治）；v3goneAt 冻结滞留窗 15s→5s；bindRow 复活清 stale goneAt 锚；active_requests.elapsed_s 同源钉锚。 // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r16 = 10-05 修复 vLLM 运行日志空白：祖先链 argv 判据对「重定向在 wrapper shell 内部」的现行启动链失明（引擎属 root 读不到其 fd），新增祖先链 fd1/fd2 指向 .log + 内容校验判据 ancestorFdLogFile，接入选日志两条链（pickLogFromProcs ⓪ / pickScriptModelLogFile ①″）；端点透传 fallback、前端红条明示兜底 vllm.log；页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r15 = EPYC 板两处口径修复：① 封装温度——该机 /sys/class/thermal 为空、k10temp 只挂 hwmon，采样器加 hwmon 回落（Tctl/Package 优先、避开逐 CCD 的 Tccd 分量）；② CPU 缓存——后端从只读 cpu0 改为全核扫共享域聚合并行输出（7F52 的 16 个 16MB L3 域合计 256MB 如实呈现，前端加「N域×slice」标注）；r14 = 10-05 换装适配（AMD EPYC 7F52 16C/32T + H12D-8D + 3×CMP 170HX + 32GB 内存）：主端口自愈三层防御（6s 定时兜底重探 / ticker busy>15s 强制放行 / stats 空数据触发纠偏——换装开机时序竞态会令主端口永久粘滞缺省 8000、仪表盘整页假 {}）；cpu-ctl v3 跨平台化（睿频通道 intel_pstate/no_turbo⇄cpufreq/boost 自适应、温度 coretemp⇄k10temp 回落、platform 串运行时生成）；SCRIPT_MODELS.base 换 32GB 账（pp:3、kvoff:0、PLE INT8+disk）；新 standard 预设 current-pp3-1m-mtp4-int8disk-32g；双卡文案改卡数自适应；r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20261007-r19'; // r19 = 10-07 「最近完成请求」表新增 二级缓存命中 列（在 缓存命中 右侧）：数据是逐请求真值，非估算——vLLM 侧由 rt-patch #12（dsh_extcache_rt）在 Request.take_prefill_stats 摘取官方 PrefillStats 的一瞬记下 num_external_cached_tokens/num_local_cached_tokens 分项，请求完成时落盘 vllm-ext-cache.jsonl，后端按 rid join（含 -8hex 内部后缀）；SGLang 侧直接映射官方 exporter 的 cached_tokens_storage_backend/cached_tokens_local。无该项数据时如实显示 --（绝不用「缓存命中」总数冒充），并在表尾给一句原因说明；组头聚合并列显示 二级缓存命中率＝Σ二级命中/Σprompt。新列生效需引擎带补丁重启（控制台重启不影响）。 // r18 = 10-06 仪表盘曲线提速平滑 + 停刷防御：① PD 动态图轮询 1s→500ms、序列 EMA(α=0.3) 平滑、折线改 Catmull-Rom 贝塞尔、当前值读数用平滑值（曲线跟进更快、无逐秒锯齿）；② 并发卡（500ms 独立轮询）成功渲染即盖 _lastRenderAt——原实现只在主链整轮结束后盖章，后端毛刺期（stats 实测 p95≈1.9s、峰值 4s）主链一轮拖十几秒时看门狗误判正常不自愈，现并发卡心跳成为独立渲染推进信号；③ 后端 stats 加 350ms 结果缓存（同窗口多消费者只算一次）。 //  r17 = 10-06 并发实时测速稀释修复：v3TouchRow 活跃期全程均值分母钉在 min(now, 最后产出/新行)（停增/暂离期不发稀释值，截图 g=8·34s·0.2 形态根治）；v3goneAt 冻结滞留窗 15s→5s；bindRow 复活清 stale goneAt 锚；active_requests.elapsed_s 同源钉锚。 // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r16 = 10-05 修复 vLLM 运行日志空白：祖先链 argv 判据对「重定向在 wrapper shell 内部」的现行启动链失明（引擎属 root 读不到其 fd），新增祖先链 fd1/fd2 指向 .log + 内容校验判据 ancestorFdLogFile，接入选日志两条链（pickLogFromProcs ⓪ / pickScriptModelLogFile ①″）；端点透传 fallback、前端红条明示兜底 vllm.log；页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r15 = EPYC 板两处口径修复：① 封装温度——该机 /sys/class/thermal 为空、k10temp 只挂 hwmon，采样器加 hwmon 回落（Tctl/Package 优先、避开逐 CCD 的 Tccd 分量）；② CPU 缓存——后端从只读 cpu0 改为全核扫共享域聚合并行输出（7F52 的 16 个 16MB L3 域合计 256MB 如实呈现，前端加「N域×slice」标注）；r14 = 10-05 换装适配（AMD EPYC 7F52 16C/32T + H12D-8D + 3×CMP 170HX + 32GB 内存）：主端口自愈三层防御（6s 定时兜底重探 / ticker busy>15s 强制放行 / stats 空数据触发纠偏——换装开机时序竞态会令主端口永久粘滞缺省 8000、仪表盘整页假 {}）；cpu-ctl v3 跨平台化（睿频通道 intel_pstate/no_turbo⇄cpufreq/boost 自适应、温度 coretemp⇄k10temp 回落、platform 串运行时生成）；SCRIPT_MODELS.base 换 32GB 账（pp:3、kvoff:0、PLE INT8+disk）；新 standard 预设 current-pp3-1m-mtp4-int8disk-32g；双卡文案改卡数自适应；r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -3425,6 +3425,7 @@ let lastLogLen = 0;
 
 let __recentReqs = [];       // 最近 30 条（分组重渲染用，免重拉）
 let __recentSgExportOff = null; // [sglang-adapt-1003] 在跑 sglang 实例缺 --export-metrics-to-file 的端口列表（后端回传）
+let __recentExtCache = null;    // [extcache-1007] 二级缓存命中列数据源状态（none/stale/ok），后端回传，用于表尾透明化说明
 
 // GPU0 / GPU1 各自独立的显示行数（不再共用一个总行数）
 // [recent-rows-1005] 默认 30 → 10；控件全部常驻卡片头部；绑定只做一次。
@@ -3507,7 +3508,7 @@ function loadRecentRequests() {
     const limit = Math.min(200, recentRowsFor(0) + recentRowsFor(1) + recentCrossRowsMax() + 20);
     _fetchWithTimeout('/v1/internal/recent-requests?limit=' + limit, null, 8000)
         .then(r => r.json())
-        .then(d => { __recentReqs = (d && d.requests) || []; __recentSgExportOff = (d && d.sglang_export_off) || null; renderRecentRequests(); })
+        .then(d => { __recentReqs = (d && d.requests) || []; __recentSgExportOff = (d && d.sglang_export_off) || null; __recentExtCache = (d && d.ext_cache_source) || null; renderRecentRequests(); })
         .catch(() => {});
 }
 
@@ -3550,10 +3551,11 @@ function setRecentCrossRows(v, suffix) {
     loadRecentRequests();
 }
 
-const RECENT_EMPTY_AGG = () => ({ n: 0, tps: 0, cachePct: 0, mtpPct: null });
+const RECENT_EMPTY_AGG = () => ({ n: 0, tps: 0, cachePct: 0, extPct: null, extHasData: false, mtpPct: null });
 
 function computeRecentAggregates(reqs) {
-    const empty = () => ({ gen: 0, decodeS: 0, prompt: 0, cached: 0, drafted: 0, accepted: 0, n: 0 });
+    // extN = 有二级缓存命中真值的行数：一行都没有时组头该维度显示 --（不用 0 冒充「没命中」）
+    const empty = () => ({ gen: 0, decodeS: 0, prompt: 0, cached: 0, ext: 0, extN: 0, drafted: 0, accepted: 0, n: 0 });
     const byKey = {};
     for (const r of reqs) {
         const key = recentGroupKey(r);   // 一条请求只进一个分组：跨卡数据不会被计两遍
@@ -3562,6 +3564,7 @@ function computeRecentAggregates(reqs) {
         a.decodeS += (parseFloat(r.decode_s) || 0);
         a.prompt += (parseInt(r.prompt_tokens) || 0);
         a.cached += (parseInt(r.cached_tokens) || 0);
+        if (r.ext_cached_tokens != null) { a.ext += (parseInt(r.ext_cached_tokens) || 0); a.extN++; }
         a.drafted += (parseInt(r.mtp_drafted) || 0);
         a.accepted += (parseInt(r.mtp_accepted) || 0);
         a.n++;
@@ -3572,6 +3575,8 @@ function computeRecentAggregates(reqs) {
         out[key] = { n: a.n,
             tps: a.decodeS > 0 ? a.gen / a.decodeS : 0,
             cachePct: a.prompt > 0 ? a.cached / a.prompt * 100 : 0,
+            extPct: (a.extN > 0 && a.prompt > 0) ? a.ext / a.prompt * 100 : null,
+            extHasData: a.extN > 0,
             mtpPct: a.drafted > 0 ? a.accepted / a.drafted * 100 : null };
     }
     return out;
@@ -3608,13 +3613,15 @@ function buildRecentGroupHeader(key, rows, a) {
         : '';
     const tps = a.tps > 0 ? a.tps.toFixed(1) + ' tok/s' : '--';
     const cache = a.n > 0 ? a.cachePct.toFixed(1) + '%' : '--';
+    // [extcache-1007] 二级缓存命中率 = Σ二级命中 / Σprompt（与本组「缓存命中」同分母，可比）
+    const ext = (a.extPct != null) ? a.extPct.toFixed(1) + '%' : '--';
     const mtp = (a.mtpPct != null) ? a.mtpPct.toFixed(1) + '%' : '--';
     return '<div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:12px 0 6px;padding:6px 10px;background:var(--bg-card-hover);border:1px solid var(--border-light);border-radius:6px">' +
         badge +
         '<span style="font-size:11px;color:var(--text-tertiary)">' + a.n + ' 条</span>' +
         portTip + crossNote +
         (isCross ? recentCrossSelectHtml(key) : '') +
-        '<span style="margin-left:auto;font-size:11px;color:var(--text-secondary)">tg TPS <b style="color:var(--text)">' + tps + '</b> · 缓存命中 <b style="color:var(--text)">' + cache + '</b> · MTP <b style="color:var(--text)">' + mtp + '</b></span>' +
+        '<span style="margin-left:auto;font-size:11px;color:var(--text-secondary)">tg TPS <b style="color:var(--text)">' + tps + '</b> · 缓存命中 <b style="color:var(--text)">' + cache + '</b> · 二级缓存命中 <b style="color:var(--blue)">' + ext + '</b> · MTP <b style="color:var(--text)">' + mtp + '</b></span>' +
         '</div>';
 }
 
@@ -3627,7 +3634,8 @@ function buildRecentTable(rows) {
         '<th style="padding:3px 8px;font-weight:500" title="控制台任务号：同一任务在 GPU0/GPU1 显示同号同色">任务号</th>' +
         '<th style="padding:3px 8px;font-weight:500" title="该请求运行的 GPU（多卡多实例下按实例区分）">卡</th>' +
         '<th style="padding:3px 8px;font-weight:500">Prompt</th>' +
-        '<th style="padding:3px 8px;font-weight:500" title="KV 前缀缓存命中的 token 数（无需重新计算）">缓存命中</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="KV 前缀缓存命中的 token 数（无需重新计算）＝本级 GPU 命中 ＋ 二级缓存命中">缓存命中</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="二级缓存（CPU KV offload）回载命中的 token 数：这部分不占本级 GPU 前缀缓存、也不必重新计算。真值来自引擎逐请求上报（vLLM rt-patch #12 / SGLang exporter 分项）；显示 -- 表示该实例未带此项数据">二级缓存命中</th>' +
         '<th style="padding:3px 8px;font-weight:500" title="实际参与预填充计算的 token 数 = Prompt − 缓存命中">预填充</th>' +
         '<th style="padding:3px 8px;font-weight:500">生成</th>' +
         '<th style="padding:3px 8px;font-weight:500">pp TPS</th>' +
@@ -3660,6 +3668,28 @@ function buildRecentTable(rows) {
         // pp TPS = (prompt_tokens - cached_tokens) / prefill_s  ← 只算未命中缓存的部分
         const cachedTokens = Math.max(0, parseInt(r.cached_tokens) || 0);
         const uncachedTokens = Math.max(0, (parseInt(r.prompt_tokens) || 0) - cachedTokens);
+        // [extcache-1007] 二级缓存命中列：后端逐请求真值（vLLM=rt-patch #12 落盘按 rid join；
+        // SGLang=官方 exporter cached_tokens_storage_backend）。字段缺失=该实例无此项数据，
+        // 如实显示 --，绝不用「缓存命中」总数冒充（那等于把 GPU 命中说成 CPU 命中）。
+        const extRaw = (r.ext_cached_tokens === undefined || r.ext_cached_tokens === null)
+            ? null : (Math.max(0, parseInt(r.ext_cached_tokens) || 0));
+        const locRaw = (r.loc_cached_tokens === undefined || r.loc_cached_tokens === null)
+            ? null : (Math.max(0, parseInt(r.loc_cached_tokens) || 0));
+        const extShare = (extRaw != null && cachedTokens > 0) ? extRaw / cachedTokens * 100 : null;
+        const extCol = {
+            txt: extRaw == null ? '--' : extRaw.toLocaleString(),
+            locTxt: locRaw == null ? '' : locRaw.toLocaleString(),
+            color: extRaw == null ? 'var(--text-tertiary)'
+                 : (extRaw > 0 ? 'var(--blue)' : 'var(--text-tertiary)'),
+            tip: extRaw == null
+                ? (r.runtime === 'sglang'
+                    ? '该 SGLang 实例的导出记录无二级缓存分项（未启用 hierarchical cache/storage backend）'
+                    : '该实例未上报每请求二级缓存命中（引擎需带控制台 rt-patch #12 启动；或未启用 CPU 二级缓存）')
+                : ('二级缓存（CPU KV offload）回载命中 ' + extRaw.toLocaleString() + ' token'
+                    + (locRaw != null ? '　｜　本级 GPU 前缀命中 ' + locRaw.toLocaleString() : '')
+                    + (extShare != null ? '　｜　占总缓存命中 ' + extShare.toFixed(1) + '%' : '')
+                    + '\n二级命中免重算，与本级 GPU 命中同为「缓存命中」的组成部分'),
+        };
         const ppTime = parseFloat(r.prefill_s) || 0;
         const ppTps = ppTime > 0 ? (uncachedTokens / ppTime).toFixed(0) : '--';
         const ppColor = parseFloat(ppTps) >= 4000 ? 'var(--green)' : 'var(--orange)';
@@ -3681,7 +3711,8 @@ function buildRecentTable(rows) {
             '<td style="padding:4px 8px">' + (r.taskId ? gqTaskChip(r.taskId) : '<span style="color:var(--text-tertiary)">—</span>') + '</td>' +
             '<td style="padding:4px 8px">' + gpuBadge + '</td>' +
             '<td style="padding:4px 8px">' + (parseInt(r.prompt_tokens) || 0).toLocaleString() + '</td>' +
-            '<td style="padding:4px 8px;color:var(--green)" title="缓存命中 + 预填充 = Prompt">' + cachedTokens.toLocaleString() + '</td>' +
+            '<td style="padding:4px 8px;color:var(--green)" title="缓存命中 + 预填充 = Prompt' + (extCol.locTxt ? '　｜　本级 GPU 命中 ' + extCol.locTxt + ' ＋ 二级 ' + (extCol.extTxt || '--') : '') + '">' + cachedTokens.toLocaleString() + '</td>' +
+            '<td style="padding:4px 8px;color:' + extCol.color + '"' + (extCol.tip ? ' title="' + extCol.tip + '"' : '') + '>' + extCol.txt + '</td>' +
             '<td style="padding:4px 8px">' + uncachedTokens.toLocaleString() + '</td>' +
             '<td style="padding:4px 8px">' + (r.gen_tokens || 0).toLocaleString() + '</td>' +
             '<td style="padding:4px 8px;font-weight:700;color:' + ppColor + '">' + ppTps + ' tok/s</td>' +
@@ -3691,7 +3722,23 @@ function buildRecentTable(rows) {
             '<td style="padding:4px 8px;font-weight:700;color:' + mtpColor + '" title="' + mtpTip + '">' + mtpText + '</td></tr>';
     }
     html += '</table>';
+    html += extColumnNotice(rows);
     return html;
+}
+
+// [extcache-1007] 二级缓存命中列的透明化脚注：整表都没这项数据时说清楚「为什么是 --」，
+// 免得看着像面板坏了。有部分数据就不啰嗦。
+function extColumnNotice(rows) {
+    const any = rows && rows.some(r => r && r.ext_cached_tokens != null);
+    if (any) return '';
+    const st = __recentExtCache;
+    const txt = st === 'none'
+        ? '二级缓存命中列暂无数据：当前引擎未上报该项（需带控制台 rt-patch #12 启动，且启用 CPU 二级缓存）。'
+        : (st === 'stale'
+            ? '二级缓存命中列暂无新数据：上报文件已超过 30 分钟未更新（多为引擎刚重启或已停止）。'
+            : '二级缓存命中列暂无数据：这批请求没有对上逐请求上报记录（引擎未带 rt-patch #12 或未启用 CPU 二级缓存）。');
+    return '<div style="font-size:11px;color:var(--text-tertiary);padding:6px 8px 2px;line-height:1.6">' +
+        'ℹ ' + txt + '</div>';
 }
 
 function renderRecentRequests() {

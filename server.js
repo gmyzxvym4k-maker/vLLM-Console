@@ -406,6 +406,66 @@ function buildRidPidMap() {
   return map;
 }
 
+// [extcache-1007] 每请求二级缓存命中（rt-patch #12 → vllm-ext-cache.jsonl）。
+// 插件行 {rid,t,ext,loc,cached,pt,consistent,port}：ext=CPU 二级缓存回载命中 token，
+// loc=本级 GPU 前缀命中，cached=二者总和（= request-traces 的 cached_tokens 口径）。
+// 按 rid 建索引（含 vLLM 内部 -<8hex> 后缀去尾索引，口径同 buildRidPidMap），
+// 2s 缓存 + 只读尾部 512KB（文件自身 >4MiB 轮转，读量恒定廉价）。
+// 缺文件/引擎未带补丁 → 空 Map，前端新列如实显示 --（绝不回落估算值）。
+let __extCacheIndex = { at: 0, map: new Map() };
+function extCacheLookup(rid) {
+  if (!rid) return null;
+  const now = Date.now();
+  if (now - __extCacheIndex.at > 2000) {
+    const map = new Map();
+    try {
+      const fp = path.join(__dirname, 'vllm-ext-cache.jsonl');
+      const sz = fs.statSync(fp).size;
+      const LEN = Math.min(512 * 1024, sz);
+      const fd = fs.openSync(fp, 'r');
+      let text = '';
+      try {
+        const buf = Buffer.alloc(LEN);
+        fs.readSync(fd, buf, 0, LEN, sz - LEN);
+        text = buf.toString('utf8');
+      } finally { fs.closeSync(fd); }
+      for (const l of text.split('\n')) {
+        if (!l.trim()) continue;
+        let r; try { r = JSON.parse(l); } catch (e) { continue; }
+        if (!r || !r.rid) continue;
+        map.set(String(r.rid), r);
+        const base = String(r.rid).replace(/-[0-9a-f]{8}$/, '');
+        if (base !== r.rid && !map.has(base)) map.set(base, r);
+      }
+    } catch (e) { /* 文件不存在/读失败 → 空索引 */ }
+    __extCacheIndex = { at: now, map };
+  }
+  return __extCacheIndex.map.get(String(rid)) || null;
+}
+// 数据可用性探针（供端点回传，前端做透明化说明）：
+//   none = 文件不存在（引擎未带 rt-patch #12，或从未有请求完成）
+//   stale = 存在但长时间没写（引擎起了却没出数，值得提示）
+//   ok    = 近期有写入
+function extCacheState() {
+  try {
+    const fp = path.join(__dirname, 'vllm-ext-cache.jsonl');
+    const st = fs.statSync(fp);
+    const ageMin = (Date.now() - st.mtimeMs) / 60000;
+    return { state: ageMin > 30 ? 'stale' : 'ok', ageMin: Math.round(ageMin * 10) / 10, size: st.size };
+  } catch (e) { return { state: 'none', ageMin: null, size: 0 }; }
+}
+function extCacheAvailable() { const x = extCacheState(); return x.state === 'ok' || x.state === 'stale'; }
+function extCacheSource() { return extCacheState().state; }
+
+// 给一批 recent-requests 记录挂上 ext_cached_tokens（无数据不写字段，前端显示 --）。
+function extAttachToRecs(recs) {
+  for (const r of recs) {
+    if (!r || !r.request_id) continue;
+    const hit = extCacheLookup(r.request_id);
+    if (hit && hit.ext != null) r.ext_cached_tokens = hit.ext;
+  }
+}
+
 // 运行中的 SGLang 实例列表（port + pid + gpu），3s 缓存。
 // sglang 的 request-metrics 记录不带 pid/端口，无法逐请求精确归属；
 // 「最近完成请求」表格用「恰好 1 个实例在跑」的启发式归属 GPU（0 个或多个则显示 —）。
@@ -2129,16 +2189,14 @@ setInterval(() => {
   const en = global.__energy;
   if (en.busy) return;
   en.busy = true;
-  const q = spawn('nvidia-smi', ['--query-gpu=power.draw', '--format=csv,noheader,nounits']);
-  const t = setTimeout(() => { try { q.kill('SIGKILL'); } catch (e) {} }, 3000);
-  t.unref();
-  let out = '';
-  q.stdout.on('data', d => { out += d; });
-  q.on('close', () => {
+  // 10-07 测试修复：原 spawn + "只 SIGKILL 不结算"的定时器，对 D 状态 nvidia-smi 无效
+  // （'close' 永不触发）→ en.busy 永久停在 true，能耗积分从此静默冻结，永不恢复。
+  // 改走 gpuQuery：自建定时器放弃等待，必定 settle，且共享 GPU 熔断。
+  gpuQuery(['--query-gpu=power.draw', '--format=csv,noheader,nounits'], 3000).then((out) => {
     en.busy = false;
     // 全部 GPU 功率求和（单卡机即该卡功耗；双卡机兼容，防未来扩卡口径漂移）
     let gpuW = 0;
-    for (const line of String(out).split('\n')) {
+    for (const line of String(out || '').split('\n')) {
       const w = parseFloat(line.trim());
       if (!isNaN(w) && w > 0) gpuW += w;
     }
@@ -2166,7 +2224,6 @@ setInterval(() => {
     en.lastSampleAt = now;
     if (now - en.lastFlush > 10000) saveEnergyState();
   });
-  q.on('error', () => { en.busy = false; });
 }, 1000).unref();
 
 // 系统内存（/proc/meminfo）：2 秒缓存，避免 buildEnergyInfo 高频调用时重复读盘
@@ -3453,31 +3510,19 @@ function portInUse(port) {
 
 // ====== GPU Info ======
 function getGpuInfo(callback) {
-  let processes = [];
-  let gpuInfo = { utilization: 0, total: 0, used: 0, power: 0, temperature: 0, temperature_mem: 0 };
-  let done = 0;
-  let fired = false;
-
-  function checkDone() {
-    if (fired) return; // spawn 的 'error' 与 'close' 可能先后触发，防止重复回调/二次写响应
-    done++;
-    if (done >= 2) { fired = true; callback({ processes, gpu: gpuInfo }); }
-  }
-
-  const proc = spawn('nvidia-smi', [
-    '--query-compute-apps=pid,name,used_memory',
-    '--format=csv'
-  ]);
-  // nvidia-smi 偶发挂起（GPU 驱动异常）时强杀，避免 stats 回调永远不触发
-  const procTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch (e) {} }, 5000);
-  procTimer.unref();
-  let output = '';
-  proc.stdout.on('data', (data) => { output += data.toString(); });
-  // nvidia-smi 不存在/不可执行时 spawn 会 emit 'error'；不监听会打崩整个进程
-  proc.on('error', () => checkDone());
-  proc.on('close', (code) => {
-    if (code === 0 && output.trim()) {
-      output.trim().split('\n').forEach(line => {
+  // 10-07 测试修复：改走统一放弃式通道（gpuQuery）。原实现两处 spawn 的 5s 定时器只
+  // SIGKILL 不结算——nvidia-smi 进 D 状态时 SIGKILL 无效、'close' 永不触发，done 到不了 2，
+  // callback 永不触发 → stats 链条挂死，且每轮轮询都泄漏一个僵尸 nvidia-smi
+  // （09-20 现场累积 43 个 D 状态进程正是这种泄漏的累积形态）。
+  // gpuQuery 必定 settle（自建定时器放弃 + 连续失败熔断），callback 必然触发。
+  const gpuInfo = { utilization: 0, total: 0, used: 0, power: 0, temperature: 0, temperature_mem: 0 };
+  Promise.all([
+    gpuQuery(['--query-compute-apps=pid,name,used_memory', '--format=csv'], 5000),
+    gpuQuery(['--query-gpu=index,utilization.gpu,memory.total,memory.used,power.draw,temperature.gpu,temperature.memory', '--format=csv'], 5000),
+  ]).then(([output, gpuOutput]) => {
+    const processes = [];
+    if (output && String(output).trim()) {
+      String(output).trim().split('\n').forEach(line => {
         if (line.toLowerCase().includes('pid')) return;
         const parts = line.split(',').map(p => p.trim());
         if (parts.length >= 3) {
@@ -3493,21 +3538,9 @@ function getGpuInfo(callback) {
         }
       });
     }
-    checkDone();
-  });
-
-  const gpuQuery = spawn('nvidia-smi', [
-    '--query-gpu=index,utilization.gpu,memory.total,memory.used,power.draw,temperature.gpu,temperature.memory',
-    '--format=csv'
-  ]);
-  const gpuTimer = setTimeout(() => { try { gpuQuery.kill('SIGKILL'); } catch (e) {} }, 5000);
-  gpuTimer.unref();
-  let gpuOutput = '';
-  gpuQuery.stdout.on('data', (data) => { gpuOutput += data.toString(); });
-  gpuQuery.on('error', () => checkDone());
-  gpuQuery.on('close', (code) => {
-    if (code === 0 && gpuOutput.trim()) {
-      const lines = gpuOutput.trim().split('\n');
+    let info = gpuInfo;
+    if (gpuOutput && String(gpuOutput).trim()) {
+      const lines = String(gpuOutput).trim().split('\n');
       let total = 0, used = 0, utilSum = 0, utilCount = 0, power = 0, temperature = 0, temperatureMem = 0;
       const perGpu = [];
       for (const line of lines) {
@@ -3533,7 +3566,7 @@ function getGpuInfo(callback) {
           });
         }
       }
-      gpuInfo = {
+      info = {
         utilization: utilCount ? Math.round(utilSum / utilCount) : 0,
         total, used, power, temperature,
         temperature_mem: temperatureMem,
@@ -3541,8 +3574,8 @@ function getGpuInfo(callback) {
         perGpu,
       };
     }
-    checkDone();
-  });
+    callback({ processes, gpu: info });
+  }).catch(() => callback({ processes: [], gpu: gpuInfo }));
 }
 
 // ====== Metrics Parser ======
@@ -3634,10 +3667,14 @@ function counterByLabel(m, base, label, value) {
 }
 // Histogram：取 _count / _sum（忽略 _bucket），按标签名独立累加
 function histogramSumCount(m, base) {
+  // 10-07 测试修复：原实现用 `=` 赋值，同一指标族有多个标签序列（多引擎 / PP 分段 /
+  // 多 model_name）时只保留最后一条，sum/count 双双少算（单元测试实锤：两条序列
+  // {100,10}+{70,7} 得 {70,7} 而非 {170,17}）。直方图的 _sum/_count 本就该跨标签累加，
+  // 与同文件 counterTotal 的口径一致。当前线上每族恰好只有一条序列，属潜伏 bug。
   let sum = 0, count = 0;
   for (const k of Object.keys(m)) {
-    if (k.indexOf(base + '_count') === 0) count = m[k];
-    else if (k.indexOf(base + '_sum') === 0) sum = m[k];
+    if (k.indexOf(base + '_count') === 0) count += m[k];
+    else if (k.indexOf(base + '_sum') === 0) sum += m[k];
   }
   return { sum, count };
 }
@@ -6775,34 +6812,35 @@ function collectOrphanVllmPids() {
 // 双卡场景：其他存活实例占用的显存不在差额里，不会被误判为"没释放"。
 async function waitGpuMemRelease(pids) {
   if (!pids || pids.length === 0) return;
-  const { execSync } = require('child_process');
-  // 记录被清理进程当前占用的显存，用于确认显存真的释放（而非只看进程消失）
+  // 10-07 测试修复：原实现 4 处 execSync(nvidia-smi) 违反 09-20 铁律——驱动进 D 状态时
+  // timeout 无效，停止/清理流程会把整个控制台（含所有页面请求）一起永久按住。
+  // 全部改走放弃式异步通道；显存不可探测时不再空转 30s 去"验证释放"。
+  const appsOut = await gpuQuery(['--query-compute-apps=pid,used_memory', '--format=csv,noheader,nounits'], 6000);
   let freedTargetMiB = 0;
-  try {
-    const out = execSync("nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null || true", { encoding: 'utf8', timeout: 8000 }).trim();
-    if (out) out.split('\n').forEach(l => {
-      const [pid, mem] = l.split(',').map(s => s.trim());
-      if (pid && pids.includes(parseInt(pid))) freedTargetMiB += parseInt(mem) || 0;
-    });
-  } catch (e) {}
-  let usedBeforeMiB = 0;
-  try {
-    const out = execSync("nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null || true", { encoding: 'utf8', timeout: 8000 }).trim();
-    if (out) out.split('\n').forEach(l => { const v = parseInt(l.trim()); if (!isNaN(v)) usedBeforeMiB += v; });
-  } catch (e) {}
+  if (appsOut) String(appsOut).split('\n').forEach(l => {
+    const [pid, mem] = l.split(',').map(s => s.trim());
+    if (pid && pids.includes(parseInt(pid))) freedTargetMiB += parseInt(mem) || 0;
+  });
+  const readUsedMiB = async () => {
+    const out = await gpuQuery(['--query-gpu=memory.used', '--format=csv,noheader,nounits'], 6000);
+    if (out == null) return null;
+    let sum = 0;
+    String(out).split('\n').forEach(l => { const v = parseInt(l.trim()); if (!isNaN(v)) sum += v; });
+    return sum;
+  };
+  const usedBeforeMiB = await readUsedMiB();
 
   for (const pid of pids) {
-    try { execSync('kill -9 ' + pid, { encoding: 'utf8', timeout: 3000 }); } catch (e2) {}
+    // 不再 execSync('kill -9 ' + pid)：省掉一次同步子进程，同时消除把 pid 拼进 shell 的注入面
+    try { process.kill(parseInt(pid, 10), 'SIGKILL'); } catch (e2) {}
   }
 
+  if (usedBeforeMiB == null) return; // 显存不可探测（驱动异常/熔断冷却）：无法验证，直接返回不空等
   const targetMiB = usedBeforeMiB - freedTargetMiB + 1024; // 1024 MiB 容差
   for (let i = 0; i < 15; i++) {
-    try {
-      let usedNowMiB = 0;
-      const out = execSync("nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null || true", { encoding: 'utf8', timeout: 8000 }).trim();
-      if (out) out.split('\n').forEach(l => { const v = parseInt(l.trim()); if (!isNaN(v)) usedNowMiB += v; });
-      if (usedNowMiB <= targetMiB) return;
-    } catch (e3) {}
+    const usedNowMiB = await readUsedMiB();
+    if (usedNowMiB == null) return; // 中途探测失效同样不再空等
+    if (usedNowMiB <= targetMiB) return;
     await sleep(2000);
   }
 }
@@ -6907,13 +6945,18 @@ async function startVllmModel(modelName, params, callback) {
   const gpuDevices = Array.from({ length: gpuN }, (_, i) => gpuId + i).join(',');
 
   // 校验可用显卡数：请求卡数超过物理显卡时直接报错，避免杀掉现有服务后才发现启动失败
-  let availableGpus = 1;
+  // 10-07 测试修复：① 原 execSync(nvidia-smi) 违反 09-20 铁律；② 原兜底"探不到当 1 张卡"
+  // 属"探测失败被当成真值"——驱动抖动时，三卡机上请求 2 卡会被误拒
+  // （"超出当前可用显卡数(1)"）。现改为探不到就跳过校验，让引擎自己如实报错。
+  let availableGpus = null;
   try {
-    const gpuCountOut = execSync("nvidia-smi --query-gpu=index --format=csv,noheader | wc -l", { encoding: 'utf8', timeout: 8000 }).trim();
-    const parsed = parseInt(gpuCountOut);
-    if (parsed > 0) availableGpus = parsed;
+    const gpuCountOut = await gpuQuery(['--query-gpu=index', '--format=csv,noheader'], 6000);
+    if (gpuCountOut != null) {
+      const parsed = String(gpuCountOut).split('\n').filter((l) => l.trim().length).length;
+      if (parsed > 0) availableGpus = parsed;
+    }
   } catch (e) {}
-  if (gpuId < 0 || gpuId + gpuN > availableGpus) {
+  if (availableGpus != null && (gpuId < 0 || gpuId + gpuN > availableGpus)) {
     callback({ success: false, error: `启用显卡数量(${gpuN}，起始卡 ${gpuId}) 超出当前可用显卡数(${availableGpus})，请调整后重试` });
     return;
   }
@@ -7841,11 +7884,21 @@ function readCpuUtilPct() {
 }
 
 function samplePowerCycle() {
+  // 10-07 测试修复（高危）：本函数每 2s 跑一次，原实现里有 3 处 execSync
+  // （sudo cat RAPL + 两处 nvidia-smi，timeout 5s）。nvidia-smi 进 D 状态时 timeout 无效，
+  // 每 2 秒就把 Node 事件循环按住一次且永不返回 → 全站接口无响应（09-20/09-29 实锤形态，
+  // 也正是 10-03 立下的"2s 轮询链里做同步重 IO 即地雷"）。全部改为放弃式异步通道，
+  // 并加防重入：一轮没结束不叠加下一轮。
+  if (global.__powerCycleBusy) return;
+  global.__powerCycleBusy = true;
+  samplePowerCycleInner().catch(() => {}).then(() => { global.__powerCycleBusy = false; });
+}
+async function samplePowerCycleInner() {
   // 1) CPU 封装功率（RAPL 差值）
   let e = null;
   try {
-    const out = require('child_process').execSync('sudo -n cat ' + RAPL_PKG_PATH, { encoding: 'utf8', timeout: 3000 }).trim();
-    const v = parseInt(out, 10);
+    const out = await spawnCollect('sudo', ['-n', 'cat', RAPL_PKG_PATH], 3000, false);
+    const v = parseInt(String(out || '').trim(), 10);
     if (!isNaN(v)) e = v;
   } catch (err) {}
   if (e !== null) {
@@ -7858,22 +7911,17 @@ function samplePowerCycle() {
     lastEnergyUj = e;
     lastEnergyTs = now;
   }
-  // 2) GPU 功率 + 使用 GPU 的进程（nvidia-smi）
+  // 2) GPU 功率 + 使用 GPU 的进程（nvidia-smi，走放弃式通道 + 熔断）
   try {
-    const g = require('child_process').execSync(
-      'nvidia-smi --query-gpu=power.draw,utilization.gpu --format=csv,noheader',
-      { encoding: 'utf8', timeout: 5000 }
-    ).trim().split('\n')[0] || '';
-    if (g) {
-      const p = g.split(',').map(s => s.trim());
+    const g = await gpuQuery(['--query-gpu=power.draw,utilization.gpu', '--format=csv,noheader'], 4000);
+    const first = g ? String(g).trim().split('\n')[0] : '';
+    if (first) {
+      const p = first.split(',').map(s => s.trim());
       gpuPowerW = parseFloat(p[0]) || null;
       gpuUtil = parseInt(p[1]) || null;
     }
-    const a = require('child_process').execSync(
-      'nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader',
-      { encoding: 'utf8', timeout: 5000 }
-    ).trim();
-    gpuProcs = a ? a.split('\n').map(l => {
+    const a = await gpuQuery(['--query-compute-apps=pid,used_memory', '--format=csv,noheader'], 4000);
+    gpuProcs = a ? String(a).trim().split('\n').map(l => {
       const [pid, mem] = l.split(',').map(s => s.trim());
       return { pid: parseInt(pid, 10) || 0, memMiB: parseInt(mem, 10) || 0 };
     }).filter(x => x.pid > 0) : [];
@@ -8194,9 +8242,63 @@ if (!global.__cpuSampler) {
 // 数据源：nvidia-smi --query-gpu CSV（本机实测 ~33ms/次；驱动 610.43.03 支持 pcie.link.* 字段）。
 // 静态规格 5min 缓存（global.__gpuStatic）；动态（利用率/显存/温度/功耗/频率/P状态/PCIe 当前链路）1s 采样（global.__gpuLive）。
 // 需求：显示 GPU 当前工作在 PCIe x16 等链路信息，并与链路能力对比（宽度/代数降级检测）。
-function gpuSmi(fields) {
-  const { execFileSync } = require('child_process');
-  return execFileSync('nvidia-smi', ['--query-gpu=' + fields, '--format=csv,noheader,nounits'], { timeout: 4000, encoding: 'utf8' });
+// ====== GPU 查询统一通道（10-07 测试补全，落实 09-20 铁律）======
+// 铁律：绝不同步调 nvidia-smi。驱动 GSP/Falcon 异常时 nvidia-smi 会进 D 状态
+// （不可中断睡眠），execSync/execFileSync 会把 Node 事件循环永久按住 → 8889 全站无响应
+// （09-20 GSP 引导失败、09-29 开机 GSP 0x31 两次实锤）。
+// 关键认知：execFile/execSync 的 timeout 选项靠"给子进程发信号"实现，对 D 状态进程
+// 完全无效（SIGKILL 都不生效，回调也永不触发）。所以超时必须由**我们自己的定时器**驱动：
+// 到点就 SIGKILL 并立刻放弃等待（哪怕 kill 没生效也不再拖住调用方）。
+// 再加熔断：连续失败 N 次进入冷却，期间直接返回 null 不再往驱动上撞，
+// 避免每次轮询都新起一个永不退出的 nvidia-smi（09-20 现场累积 43 个 D 状态进程）。
+let __gpuQFails = 0;
+let __gpuQBlockUntil = 0;
+const GPU_Q_FAIL_MAX = 3;               // 连续失败次数阈值
+const GPU_Q_COOLDOWN_MS = 5 * 60 * 1000; // 熔断冷却：5 分钟内不再尝试
+function gpuQueryAvailable() { return Date.now() >= __gpuQBlockUntil; }
+function gpuQFail(why) {
+  __gpuQFails++;
+  if (__gpuQFails >= GPU_Q_FAIL_MAX) {
+    __gpuQFails = 0;
+    __gpuQBlockUntil = Date.now() + GPU_Q_COOLDOWN_MS;
+    console.warn(`[gpu] nvidia-smi 连续 ${GPU_Q_FAIL_MAX} 次失败（${why}），熔断 ${GPU_Q_COOLDOWN_MS / 60000} 分钟内不再调用（GPU 采样/静态规格暂缺，其余功能不受影响）`);
+  }
+}
+// 通用"放弃式"子进程采集：resolve(stdout) 或 resolve(null)（失败/超时/熔断），永不 reject。
+// countFail=false 时不计入 GPU 熔断（用于 python3 这类"缺了只是少个字段"的辅助采集）。
+function spawnCollect(file, args, ms, countFail) {
+  return new Promise((resolve) => {
+    let proc = null;
+    try { proc = spawn(file, args, { stdio: ['ignore', 'pipe', 'ignore'] }); }
+    catch (e) { resolve(null); return; }
+    let out = '';
+    let done = false;
+    const finish = (v, why) => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      try { proc.stdout.destroy(); } catch (e) {}
+      if (v === null && why && countFail !== false) gpuQFail(why);
+      resolve(v);
+    };
+    const t = setTimeout(() => {
+      try { proc.kill('SIGKILL'); } catch (e) {}
+      finish(null, `超时 ${ms}ms（疑似 D 状态，已放弃等待）`);
+    }, ms || 4000);
+    proc.stdout.on('data', (d) => { if (out.length < 4 * 1024 * 1024) out += d; });
+    proc.on('error', (e) => finish(null, (e && e.code) || 'spawn 失败'));
+    proc.on('close', (code) => { if (code === 0) { __gpuQFails = 0; finish(out); } else finish(null, '退出码 ' + code); });
+  });
+}
+// nvidia-smi 专用通道（带熔断判断）
+function gpuQuery(args, ms) {
+  if (!gpuQueryAvailable()) return Promise.resolve(null);
+  return spawnCollect('nvidia-smi', args, ms);
+}
+async function gpuSmi(fields) {
+  const out = await gpuQuery(['--query-gpu=' + fields, '--format=csv,noheader,nounits'], 4000);
+  if (out == null) throw new Error('nvidia-smi 查询失败（超时 / 驱动不可用 / 熔断冷却中）');
+  return out;
 }
 function gpuParseRows(out) {
   return String(out).split('\n').filter((l) => l.trim().length).map((l) => l.split(',').map((s) => s.trim()));
@@ -8220,15 +8322,17 @@ const GPU_LIVE_FIELDS = 'index,utilization.gpu,utilization.memory,memory.used,me
 // JSON；失败/无 python3 → 返回 {}，前端显示 "--"，绝不让 GPU 静态信息整体构建失败。
 // 结果并入 __gpuStatic 的 5min 缓存，无常离子进程负担。
 // 注意：cuInit 会建 CUDA 上下文（轻量、毫秒级、不占显存池），只在静态缓存重建时发生（5min 一次）。
-function gpuPyCollect(py) {
-  const { execFileSync } = require('child_process');
+async function gpuPyCollect(py) {
+  // 同样禁止同步：cuInit/nvmlInit 在驱动异常时也会进 D 状态（与 nvidia-smi 同病），
+  // 故走放弃式采集。python3 缺失属环境差异，不计入 GPU 熔断计数。
+  const out = await spawnCollect('python3', ['-c', py], 5000, false);
+  if (!out) return {};
   try {
-    const out = execFileSync('python3', ['-c', py], { timeout: 5000, encoding: 'utf8' });
-    const j = JSON.parse(out.trim().split('\n').pop());
+    const j = JSON.parse(String(out).trim().split('\n').pop());
     return (j && typeof j === 'object') ? j : {};
   } catch (e) { return {}; }
 }
-function gpuSmCounts() {
+async function gpuSmCounts() {
   return gpuPyCollect([
     'import ctypes,json',
     'cu=ctypes.CDLL("libcuda.so.1")',
@@ -8245,7 +8349,7 @@ function gpuSmCounts() {
   ].join('\n'));
 }
 // NVML 固件静态表的 CUDA 核数（仅作规格参考，不随 SM-RECONFIG 解锁变化）
-function gpuCoresNVML() {
+async function gpuCoresNVML() {
   return gpuPyCollect([
     'import ctypes,json',
     'm=ctypes.CDLL("libnvidia-ml.so.1")',
@@ -8262,12 +8366,12 @@ function gpuCoresNVML() {
     'print(json.dumps(o))',
   ].join('\n'));
 }
-function buildGpuStatic() {
+async function buildGpuStatic() {
   const out = { supported: false, gpus: [], driver_version: null };
   let rows;
-  try { rows = gpuParseRows(gpuSmi(GPU_STATIC_FIELDS)); } catch (e) { out.error = 'nvidia-smi 不可用: ' + (e && e.message || e); return out; }
-  const smMap = gpuSmCounts(); // [sm-count 1006 rev3] CUDA 属性直读真实 SM 数
-  const coreMap = gpuCoresNVML(); // [sm-count 1006 rev3] NVML 静态 CUDA 核数表
+  try { rows = gpuParseRows(await gpuSmi(GPU_STATIC_FIELDS)); } catch (e) { out.error = 'nvidia-smi 不可用: ' + (e && e.message || e); return out; }
+  const smMap = await gpuSmCounts(); // [sm-count 1006 rev3] CUDA 属性直读真实 SM 数
+  const coreMap = await gpuCoresNVML(); // [sm-count 1006 rev3] NVML 静态 CUDA 核数表
   for (const r of rows) {
     // [index,name,uuid,bus_id,driver,vbios,cc,gen_max,width_max,pl,pl_min,pl_max]
     const g = {
@@ -8287,22 +8391,37 @@ function buildGpuStatic() {
   out.supported = out.gpus.length > 0;
   return out;
 }
+// 静态规格缓存：调用方（请求处理链、PCIe 拓扑富化）都是同步上下文，绝不能在这里
+// 同步等 nvidia-smi（09-20 铁律）。改为"过期即后台重建 + 先回上一帧"：
+// 首帧可能为空（前端显示 --），最迟 1s 后的下一帧补上；重建期间单飞不叠加。
+let __gpuStaticBuilding = false;
+function gpuStaticRebuild() {
+  if (__gpuStaticBuilding) return;
+  __gpuStaticBuilding = true;
+  buildGpuStatic()
+    .then((st) => { global.__gpuStatic = st; global.__gpuStaticAt = Date.now(); })
+    .catch((e) => {
+      // 失败不覆盖上一帧（否则驱动抖动一次，硬件页整表清空），只推迟下次重试
+      global.__gpuStaticAt = Date.now();
+      if (!global.__gpuStatic) global.__gpuStatic = { supported: false, gpus: [], error: String((e && e.message) || e) };
+    })
+    .finally(() => { __gpuStaticBuilding = false; });
+}
 function getGpuStatic() {
   const now = Date.now();
-  if (!global.__gpuStatic || now - (global.__gpuStaticAt || 0) > 300000) {
-    try { global.__gpuStatic = buildGpuStatic(); } catch (e) { global.__gpuStatic = { supported: false, error: e.message }; }
-    global.__gpuStaticAt = now;
-  }
-  return global.__gpuStatic;
+  if (!global.__gpuStatic || now - (global.__gpuStaticAt || 0) > 300000) gpuStaticRebuild();
+  return global.__gpuStatic || { supported: false, gpus: [], driver_version: null, pending: true };
 }
 function sampleGpuStats() {
-  // 09-18 修复：execFileSync 同步阻塞主循环 50~300ms → 改异步 execFile + 防重入守卫
+  // 09-18：execFileSync 同步阻塞主循环 → 改异步 + 防重入。
+  // 10-07：再改走统一放弃式通道。原 execFile 的 timeout 靠发信号实现，对 D 状态进程无效，
+  // 回调永不触发 → __gpuSampleBusy 永久停在 true，GPU 实时数据再也不会恢复（静默死掉）。
+  // 现在 gpuQuery 必定 settle，且连续失败会进熔断冷却，不再反复往驱动上撞。
   if (global.__gpuSampleBusy) return;
   global.__gpuSampleBusy = true;
-  const { execFile } = require('child_process');
-  execFile('nvidia-smi', ['--query-gpu=' + GPU_LIVE_FIELDS, '--format=csv,noheader,nounits'], { timeout: 4000, encoding: 'utf8' }, (err, outStr) => {
+  gpuQuery(['--query-gpu=' + GPU_LIVE_FIELDS, '--format=csv,noheader,nounits'], 4000).then((outStr) => {
     global.__gpuSampleBusy = false;
-    if (err || !outStr) return; // nvidia-smi 失败保留上次采样，下一轮重试
+    if (!outStr) return; // nvidia-smi 失败保留上次采样，下一轮重试
     try {
       const rows = gpuParseRows(outStr);
     const gpus = [];
@@ -8327,15 +8446,20 @@ if (!global.__gpuSampler) {
   global.__gpuSampler = setInterval(sampleGpuStats, 1000);
   if (global.__gpuSampler.unref) global.__gpuSampler.unref();
   sampleGpuStats();
+  // 静态规格（5min 缓存）改为后台重建：启动即预热一次，避免首个 /v1/internal/gpu
+  // 请求撞上空缓存（前端表现为硬件监视页首帧全 "--"）
+  gpuStaticRebuild();
 }
 
 // —— PCIe 通道带宽占用采样：nvidia-smi dmon -s t（NVML rxpci/txpci，MB/s，本机实测可用）——
 // dmon 自身阻塞 ~1s，用异步 execFile + 完成后再排下一轮（不占事件循环、不并发重入）；历史 1800 点 ≈ 36 分钟。
 function sampleGpuPcie() {
-  const { execFile } = require('child_process');
-  execFile('nvidia-smi', ['dmon', '-s', 't', '-c', '1', '-d', '1'], { timeout: 5000, encoding: 'utf8' }, (err, out) => {
+  // 10-07 测试修复：改走放弃式通道。原 execFile 的 timeout 对 D 状态进程无效（SIGKILL 不生效、
+  // 回调永不触发），而本函数靠"回调里续排"维持循环 → 一次驱动抖动就把 PCIe 带宽采样永久打死，
+  // 且再也无法自愈（图表停在最后一帧）。gpuQuery 必定 settle，循环得以持续。
+  gpuQuery(['dmon', '-s', 't', '-c', '1', '-d', '1'], 4000).then((out) => {
     try {
-      if (!err && out) {
+      if (out) {
         const byIndex = {};
         for (const line of String(out).split('\n')) {
           const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)$/);
@@ -9805,10 +9929,13 @@ function strataGpuMemUsed() {
   if (__strataGpuCache.data && now - __strataGpuCache.at <= 2000) return Promise.resolve(__strataGpuCache.data);
   if (__strataGpuFly) return __strataGpuFly;
   __strataGpuFly = new Promise((resolve) => {
-    execFileAsync('nvidia-smi', ['--query-gpu=index,memory.used', '--format=csv,noheader,nounits'], { timeout: 4000, encoding: 'utf8' })
+    // 10-07 测试修复：原 execFileAsync 的 timeout 靠发信号实现，对 D 状态 nvidia-smi 无效
+    // → 该 Promise 永不 settle → 单飞句柄 __strataGpuFly 永久挂住，之后所有调用都 await
+    // 同一个死 Promise，启动资源门禁彻底卡死。改走 gpuQuery（自建定时器放弃，必定 settle）。
+    gpuQuery(['--query-gpu=index,memory.used', '--format=csv,noheader,nounits'], 4000)
       .then((out) => {
         const gpus = [];
-        String(out).split('\n').forEach((line) => {
+        if (out) String(out).split('\n').forEach((line) => {
           const p = line.split(',').map((x) => x.trim());
           if (p.length >= 2 && /^\d+$/.test(p[0])) gpus.push({ index: parseInt(p[0], 10), used_mb: parseInt(p[1], 10) || 0 });
         });
@@ -11430,6 +11557,13 @@ const server = http.createServer(async (req, res) => {
                   prompt_tokens: pp,
                   gen_tokens: gen,
                   cached_tokens: parseInt(rec.cached_tokens) || 0,
+                  // [extcache-1007] 二级缓存命中真值：SGLang 官方 exporter 在完成记录里
+                  // 分开给 storage_backend（磁盘/CPU 二级回载）与 local（本级 radix）两分项，
+                  // 缺字段（旧版 sglang）时不写该键 → 前端显示 --，不用总数冒充。
+                  ext_cached_tokens: (rec.cached_tokens_storage_backend !== undefined)
+                    ? (parseInt(rec.cached_tokens_storage_backend) || 0) : undefined,
+                  loc_cached_tokens: (rec.cached_tokens_local !== undefined)
+                    ? (parseInt(rec.cached_tokens_local) || 0) : undefined,
                   queued_s: typeof rec.queue_time === 'number' ? parseFloat(rec.queue_time.toFixed(3)) : 0,
                   prefill_s: parseFloat(prefillS.toFixed(3)),
                   decode_s: parseFloat(decodeS.toFixed(3)),
@@ -11455,6 +11589,10 @@ const server = http.createServer(async (req, res) => {
 
       // 关联 GPU（vLLM 记录经 rid→pid→实例；sglang 记录按「唯一在跑实例」启发式归属）
       for (const rec of out) tagGpu(rec);
+      // [extcache-1007] 关联每请求二级缓存命中：vLLM 走 rt-patch #12 落盘文件按 rid join；
+      // SGLang 官方 exporter 已在完成记录里直接给分项（cached_tokens_storage_backend），
+      // 在上面 sglang 转换段已映射为 ext_cached_tokens，这里不覆盖已有的真值。
+      extAttachToRecs(out);
       // 关联控制台任务号（T 号）：rid → taskId 映射由代理 tee 响应流时记录
       const ridTask = global.__ridTaskId;
       for (const rec of out) { if (rec.request_id && ridTask.has(rec.request_id)) rec.taskId = ridTask.get(rec.request_id); }
@@ -11476,6 +11614,10 @@ const server = http.createServer(async (req, res) => {
       const hasSglRows = plausible.some(r => r.runtime === 'sglang');
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ requests: plausible.slice(0, limit),
+        // [extcache-1007] 透明化二级缓存命中列的数据可用性，前端据此在表尾如实说明，
+        // 不再让用户对着满屏 -- 猜是不是坏了。
+        ext_cache_available: extCacheAvailable(),
+        ext_cache_source: extCacheSource(),
         sglang_export_off: (sgExportOff.length && !hasSglRows) ? sgExportOff : undefined })); // newest first
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });

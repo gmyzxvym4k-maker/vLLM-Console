@@ -75,6 +75,10 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 tr:last-child td{border-bottom:none}
 .btn{display:inline-block;background:#fff;border:1px solid var(--bd2);color:var(--tx);border-radius:8px;padding:5px 12px;font-size:12.5px;cursor:pointer;transition:.15s;font-weight:500}
 .btn:hover{border-color:var(--ac);color:var(--ac)}
+.btn.pwr.primary{border-color:var(--ac);color:var(--ac);background:var(--ac2)}
+.btn.pwr.danger{border-color:#fecaca;color:var(--bad)}
+.btn.pwr.danger:hover{background:#fef2f2;border-color:var(--bad)}
+.btn:disabled{opacity:.5;cursor:wait}
 .reqHead{display:flex;align-items:center;gap:10px;margin-bottom:10px}
 .reqHead h3{margin-bottom:0}
 /* 事实表 */
@@ -96,6 +100,18 @@ dl.facts dd{font-weight:600;font-variant-numeric:tabular-nums}
 </header>
 <div class="sub" id="meta">目标 <code>--</code> · 克隆自 Strata Web UI Monitor（每 1s 自动刷新，后台标签页自动暂停）</div>
 <div id="errBar"></div>
+
+<!-- 电源控制：网络唤醒（魔术包，控制台机代发）/ 远程启动 Strata / 远程关机（ssh 免密，密钥在 .38 administrators_authorized_keys） -->
+<div class="card" id="pwrCard">
+  <h3>电源控制 <span class="muted" style="letter-spacing:0;font-weight:400">目标 192.168.1.38 · MAC/地址见 strata-remote.json（改配置即热生效）</span></h3>
+  <div id="pwrBtns" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+    <button class="btn pwr" id="pwrWake" onclick="pwrPost('wake',this)">⚡ 网络唤醒</button>
+    <button class="btn pwr primary" id="pwrBat" onclick="pwrPost('startbat',this)">▶ 启动 Strata（start-strata-0140.bat）</button>
+    <button class="btn pwr danger" id="pwrOff" onclick="pwrPost('shutdown',this)">⏻ 关机</button>
+    <span id="pwrMsg" class="small" style="color:var(--tx3)"></span>
+  </div>
+  <p class="muted small" style="margin-top:8px">唤醒=UDP9 魔术包（网卡已在 wake_armed 列）；关机立即执行——<b style="color:var(--warn)">跑在这台机上的推理服务（含正在对话的 AI 会话）会一并中断</b>；启动后模型加载 2~6 分钟，页面自动转绿。</p>
+</div>
 
 <!-- 模型状态 -->
 <div class="card">
@@ -428,6 +444,29 @@ function renderMcp(info){
   }).join('');
 }
 $('reqAll').addEventListener('click',()=>{ reqShowAll=!reqShowAll; });
+
+// ====== 电源控制（POST /v1/internal/strata-remote/cmd，口径同 cpu.html：/v1/internal/ 自动带 X-Console-Token，401 补录重试）======
+// 后端动作白名单 wake|shutdown|startbat；MAC/sshHost/bat 真源=strata-remote.json（服务端热加载）。
+function pwrPost(action){
+  if(action==='shutdown' && !confirm('确定关机 192.168.1.38？\n跑在这台机上的推理服务（含正在对话的 AI 会话）会一并中断。')) return;
+  const msg=$('pwrMsg');
+  const btns=Array.prototype.slice.call(document.querySelectorAll('#pwrBtns button'));
+  btns.forEach((b)=>{ b.disabled=true; });
+  msg.style.color='var(--tx3)';
+  msg.textContent=action==='wake'?'正在发送魔术包…':action==='shutdown'?'正在下发关机指令…':'正在远程启动 Strata…';
+  const withTok=(t)=>Object.assign({'Content-Type':'application/json'}, t?{'X-Console-Token':t}:{});
+  const doFetch=(t)=>fetch('/v1/internal/strata-remote/cmd',{ method:'POST', headers:withTok(t), body:JSON.stringify({action:action}) });
+  const show=(d)=>{ msg.style.color=d&&d.ok?'var(--ok)':'var(--bad)'; msg.textContent=(d&&d.ok?'✓ ':'✗ ')+((d&&d.msg)||'无响应'); };
+  const t0=localStorage.getItem('consoleToken');
+  doFetch(t0).then((r)=>{
+    if(r.status===401){
+      const t=prompt('请输入控制台管理口令');
+      if(t&&t.trim()){ localStorage.setItem('consoleToken',t.trim()); return doFetch(t.trim()).then((r2)=>r2.json()); }
+    }
+    return r.json();
+  }).then(show).catch((e)=>{ msg.style.color='var(--bad)'; msg.textContent='✗ 请求失败：'+((e&&e.message)||e); })
+    .finally(()=>{ btns.forEach((b)=>{ b.disabled=false; }); });
+}
 
 startMon();
 </script>

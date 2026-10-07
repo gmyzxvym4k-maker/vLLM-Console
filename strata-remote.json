@@ -1,3 +1,7 @@
 {
-  "baseUrl": "http://192.168.1.38:8080"
+  "baseUrl": "http://192.168.1.38:8080",
+  "mac": "00:e0:23:55:d0:37",
+  "sshHost": "ll@192.168.1.38",
+  "bat": "D:\\Strata-0.1.40\\start-strata-0140.bat",
+  "broadcast": "192.168.1.255"
 }

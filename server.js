@@ -10573,23 +10573,40 @@ async function cpuCtlHandle(req, res, urlObj) {
 // 用途：克隆 Strata Web UI（http://192.168.1.38:8080/#monitor）的 Monitor 页到控制台「Strata 监控」标签。
 // 数据源 = 远端 Strata 自带的 /metrics + /health + /mcp（Strata 服务端不发 CORS 头，浏览器跨源直连会被拦，
 // 由控制台服务端代理转发；远端机在 Windows 上，控制台机已实测可达）。
-// 目标地址 = strata-remote.json（{"baseUrl":"http://192.168.1.38:8080"}），按 mtime 热加载；文件缺失用缺省值。
+// 目标地址 = strata-remote.json（{"baseUrl":"http://192.168.1.38:8080","mac":"..","sshHost":"ll@192.168.1.38",
+// "bat":"D:\\Strata-0.1.40\\start-strata-0140.bat","broadcast":"192.168.1.255"}），按 mtime 热加载；文件缺失用缺省值。
+// 电源控制（POST /v1/internal/strata-remote/cmd，走 /v1/internal/ POST 口令拦截）：
+//   wake      dgram 发魔术包（零外部依赖、无需 root；UDP 9 广播，.38 网卡已确认在 powercfg wake_armed 列内）
+//   shutdown  ssh 远端 shutdown /s /t 0（.127 公钥已入 .38 administrators_authorized_keys，ll 为管理员）
+//   startbat  ssh 远端 start "" /min <bat>（bat 末尾有 pause，必须 start 分离，否则 ssh 挂到超时）
 // 铁律：fetch + AbortController 带超时（metrics 3s / health·mcp 4s）；800ms TTL 缓存 + 单飞防轮询叠发；
-//       失败返回 {ok:false,msg}——前端保留上一帧 + 黄条，绝不伪造空 metrics 帧覆盖好数据（10-03 三态铁律）。
+//       失败返回 {ok:false,msg}——前端保留上一帧 + 黄条，绝不伪造空 metrics 帧覆盖好数据（10-03 三态铁律）；
+//       电源命令 execFile(ssh) + 自建定时器直接结算（10-07 铁律：定时器放弃等待，不依赖 'close'），
+//       BatchMode=yes 防 ssh 挂起等密码；action 白名单 + MAC/路径正则，配置文件即信任边界。
 const STRATA_REMOTE_DEFAULT_BASE = 'http://192.168.1.38:8080';
-let __strataRemoteCfg = { mtime: -1, baseUrl: STRATA_REMOTE_DEFAULT_BASE };
-function strataRemoteBase() {
+const STRATA_REMOTE_MAC_RE = /^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/;
+const STRATA_REMOTE_BAT_RE = /^[A-Za-z0-9 :\\._\-]{1,200}$/;
+let __strataRemoteCfg = { mtime: -1, baseUrl: STRATA_REMOTE_DEFAULT_BASE, mac: '', sshHost: 'll@192.168.1.38', bat: '', broadcast: '192.168.1.255' };
+function strataRemoteCfgGet() {
   const p = path.join(__dirname, 'strata-remote.json');
   try {
     const st = fs.statSync(p);
     if (st.mtimeMs !== __strataRemoteCfg.mtime) {
       const j = JSON.parse(fs.readFileSync(p, 'utf8'));
       const b = String((j && j.baseUrl) || STRATA_REMOTE_DEFAULT_BASE).replace(/\/+$/, '');
-      __strataRemoteCfg = { mtime: st.mtimeMs, baseUrl: b || STRATA_REMOTE_DEFAULT_BASE };
+      __strataRemoteCfg = {
+        mtime: st.mtimeMs,
+        baseUrl: b || STRATA_REMOTE_DEFAULT_BASE,
+        mac: String((j && j.mac) || ''),
+        sshHost: String((j && j.sshHost) || 'll@192.168.1.38'),
+        bat: String((j && j.bat) || ''),
+        broadcast: String((j && j.broadcast) || '192.168.1.255'),
+      };
     }
   } catch (e) { /* 文件缺失/解析失败：保持上一次值（首跑即缺省 .38:8080） */ }
-  return __strataRemoteCfg.baseUrl;
+  return __strataRemoteCfg;
 }
+function strataRemoteBase() { return strataRemoteCfgGet().baseUrl; }
 function strataRemoteGet(base, sub, timeoutMs) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
@@ -10627,8 +10644,85 @@ function strataRemoteSnapshot(all) {
   return p.then((d) => { c.data = d; c.key = key; c.at = Date.now(); return d; })
           .finally(() => { if (c.inflight === p) { c.inflight = null; c.inflightKey = ''; } });
 }
+// 魔术包：6×FF + MAC×16，UDP 9；向子网定向广播 + 全局广播各发一份（目标关机后单播无意义，广播是正解）。
+// dgram.send 对广播地址不会挂；仍给 4s 兜底结算，绝不把调用方挂死。
+function strataWake(mac, broadcast) {
+  return new Promise((resolve) => {
+    let sock;
+    try { sock = require('dgram').createSocket('udp4'); } catch (e) { return resolve({ ok: false, msg: 'dgram 不可用：' + String((e && e.message) || e) }); }
+    let settled = false;
+    const done = (r) => { if (settled) return; settled = true; try { sock.close(); } catch (e) {} resolve(r); };
+    setTimeout(() => done({ ok: false, msg: '唤醒包发送超时（放弃等待）' }), 4000).unref();
+    // Node dgram 的 fd 是懒创建的：未 bind 就 setBroadcast 会 EBADF（10-08 实锤），先 bind(0) 再设选项。
+    sock.on('error', (e) => done({ ok: false, msg: 'UDP 错误：' + String((e && e.message) || e) }));
+    sock.bind(0, () => {
+      try {
+        sock.setBroadcast(true);
+        const macBuf = Buffer.from(mac.replace(/[^0-9a-fA-F]/g, ''), 'hex');
+        const parts = [Buffer.alloc(6, 0xff)];
+        for (let i = 0; i < 16; i++) parts.push(macBuf);
+        const pkt = Buffer.concat(parts);
+        const targets = [];
+        if (broadcast) targets.push(broadcast);
+        targets.push('255.255.255.255');
+        let sent = 0, pending = targets.length;
+        targets.forEach((t) => sock.send(pkt, 9, t, (err) => {
+          if (!err) sent++;
+          if (--pending === 0) done({ ok: sent > 0, msg: sent ? '魔术包已发往 ' + targets.join(' / ') + '（MAC ' + mac + '）；开机到服务恢复通常 1~3 分钟，页面会自动转绿' : '魔术包发送失败' });
+        }));
+      } catch (e) { done({ ok: false, msg: String((e && e.message) || e) }); }
+    });
+  });
+}
+// ssh 固定目标执行（信任边界=strata-remote.json 的 sshHost；BatchMode 防交互挂起；
+// 自建定时器直接结算——10-07 铁律，不依赖子进程 'close'）。
+function strataSshExec(cmd, timeoutMs) {
+  const cfg = strataRemoteCfgGet();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (r) => { if (settled) return; settled = true; resolve(r); };
+    let proc;
+    try {
+      proc = require('child_process').execFile('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=accept-new', cfg.sshHost, cmd],
+        (err, stdout, stderr) => finish({ ok: !err, msg: String(stderr || stdout || (err && err.message) || '').trim().slice(0, 300) }));
+    } catch (e) { return finish({ ok: false, msg: String((e && e.message) || e) }); }
+    if (proc && proc.on) proc.on('error', (e) => finish({ ok: false, msg: String((e && e.message) || e) }));
+    setTimeout(() => {
+      if (!settled) { try { proc.kill('SIGKILL'); } catch (e) {} finish({ ok: false, msg: 'SSH 执行超时（' + timeoutMs + 'ms 放弃等待；命令可能已在远端生效，以页面状态为准）' }); }
+    }, timeoutMs).unref();
+  });
+}
+async function strataRemoteCmd(req, res) {
+  const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  const body = await cpuCtlReadBody(req);
+  if (!body) return reply(400, { ok: false, msg: '请求体不是合法 JSON' });
+  const cfg = strataRemoteCfgGet();
+  const act = String(body.action || '');
+  if (act === 'wake') {
+    if (!STRATA_REMOTE_MAC_RE.test(cfg.mac)) return reply(200, { ok: false, msg: 'strata-remote.json 缺 mac 字段或格式非法（应为 aa:bb:cc:dd:ee:ff）' });
+    const r = await strataWake(cfg.mac, cfg.broadcast);
+    return reply(200, Object.assign({ action: act }, r));
+  }
+  if (act === 'shutdown') {
+    const r = await strataSshExec('shutdown /s /t 0', 12000);
+    return reply(200, Object.assign({ action: act }, r, r.ok ? { msg: '关机指令已下发（远端立即开始关机，页面稍后转「远端不可达」属正常）' } : {}));
+  }
+  if (act === 'startbat') {
+    if (!STRATA_REMOTE_BAT_RE.test(cfg.bat)) return reply(200, { ok: false, msg: 'strata-remote.json 的 bat 路径为空或含非法字符' });
+    // 预检：Strata 已在跑就别再拉第二个实例——bat 的内层 cmd 重定向 >> srv_256k.log 会被在跑实例
+    // 独占锁挡掉（cmd 重定向只开 share-read），第二实例静默死亡且不留日志（10-08 实锤）。
+    try {
+      await strataRemoteGet(cfg.baseUrl, '/health', 1500);
+      return reply(200, { ok: false, action: act, msg: 'Strata 已在运行（' + cfg.baseUrl + ' /health 正常），无需重复启动；如需换档请先关机再唤醒后启动' });
+    } catch (e) { /* 不可达 = 未运行，正是该启动的场景 */ }
+    const r = await strataSshExec('start "" /min ' + cfg.bat, 15000);
+    return reply(200, Object.assign({ action: act }, r, r.ok ? { msg: '已启动 ' + cfg.bat + '（模型加载 2~6 分钟，页面会自动转绿）' } : {}));
+  }
+  return reply(400, { ok: false, msg: 'action 必须是 wake | shutdown | startbat' });
+}
 function strataRemoteHandle(req, res, urlObj) {
   const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  if (req.method === 'POST' && urlObj.pathname === '/v1/internal/strata-remote/cmd') return strataRemoteCmd(req, res);
   const all = urlObj.searchParams.get('requests') === 'all';
   return strataRemoteSnapshot(all).then((d) => reply(200, d))
     .catch((e) => reply(200, { ok: false, msg: String((e && e.message) || e), ts: Date.now() }));
@@ -10791,8 +10885,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   // === Strata 远端监控 API（克隆 .38:8080 Web UI Monitor 页，见 [strata-remote-monitor] 模块）===
-  // 注册在 /v1/internal/strata 前缀路由之前；本路由精确匹配，不吞 strata/* 子路由。
-  if (pathname === '/v1/internal/strata-remote') {
+  // 注册在 /v1/internal/strata 前缀路由之前；只匹配 strata-remote 与 strata-remote/cmd，不吞 strata/* 子路由。
+  if (pathname === '/v1/internal/strata-remote' || pathname === '/v1/internal/strata-remote/cmd') {
     return strataRemoteHandle(req, res, urlObj).catch((e) => {
       try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}
     });

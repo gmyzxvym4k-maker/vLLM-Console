@@ -134,6 +134,16 @@ const scenarios = {
     { name: 'metrics 字段残缺（live/hardware 缺失）→ 渲染抛错不得打死轮询', ms: 20000,
       fetch: (u) => (u.indexOf('strata-remote') >= 0 ? { ok: true, base: 'http://x', metrics: { requests: [] }, health: null, mcp: null } : live(u)),
       assert: (w, env, r) => (r.fetchCalls.filter((x) => x.indexOf('strata-remote') >= 0).length >= 10 ? null : ['字段残缺抛错后轮询停止']) },
+    { name: '电源控制：点唤醒 → POST /cmd 发出且结果回显、按钮恢复可用', ms: 3000,
+      fetch: (u) => (u.indexOf('strata-remote/cmd') >= 0 ? { ok: true, action: 'wake', msg: '魔术包已发往 192.168.1.255 / 255.255.255.255' } : live(u)),
+      setup: async (w) => { w.pwrPost('wake'); await new Promise((r) => setImmediate(r)); },
+      assert: (w, env, r) => {
+        const bad = [];
+        if (!r.fetchCalls.some((x) => x.indexOf('strata-remote/cmd') >= 0)) bad.push('未向 /v1/internal/strata-remote/cmd 发 POST');
+        const msg = w.document.getElementById('pwrMsg').textContent;
+        if (!msg || msg.indexOf('魔术包') < 0) bad.push('pwrMsg 未回显后端 msg（实际：' + JSON.stringify(msg) + '）');
+        return bad;
+      } },
   ],
 };
 

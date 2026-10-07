@@ -1,0 +1,1 @@
+[{"id":"local","port":18420,"name":"受管实例 · :18420","desc":"控制台当前 vLLM 后端（跟随端口自愈）","baseUrl":"http://127.0.0.1:18420","hasKey":false,"healthy":true,"model":"qwen3.8-flash-next"}]

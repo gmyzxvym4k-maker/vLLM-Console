@@ -2192,7 +2192,7 @@ setInterval(() => {
   // 10-07 测试修复：原 spawn + "只 SIGKILL 不结算"的定时器，对 D 状态 nvidia-smi 无效
   // （'close' 永不触发）→ en.busy 永久停在 true，能耗积分从此静默冻结，永不恢复。
   // 改走 gpuQuery：自建定时器放弃等待，必定 settle，且共享 GPU 熔断。
-  gpuQuery(['--query-gpu=power.draw', '--format=csv,noheader,nounits'], 3000).then((out) => {
+  gpuQuery(['--query-gpu=power.draw', '--format=csv,noheader,nounits'], GPU_Q_MS_LIVE).then((out) => {
     en.busy = false;
     // 全部 GPU 功率求和（单卡机即该卡功耗；双卡机兼容，防未来扩卡口径漂移）
     let gpuW = 0;
@@ -3517,8 +3517,8 @@ function getGpuInfo(callback) {
   // gpuQuery 必定 settle（自建定时器放弃 + 连续失败熔断），callback 必然触发。
   const gpuInfo = { utilization: 0, total: 0, used: 0, power: 0, temperature: 0, temperature_mem: 0 };
   Promise.all([
-    gpuQuery(['--query-compute-apps=pid,name,used_memory', '--format=csv'], 5000),
-    gpuQuery(['--query-gpu=index,utilization.gpu,memory.total,memory.used,power.draw,temperature.gpu,temperature.memory', '--format=csv'], 5000),
+    gpuQuery(['--query-compute-apps=pid,name,used_memory', '--format=csv'], GPU_Q_MS_LIVE),
+    gpuQuery(['--query-gpu=index,utilization.gpu,memory.total,memory.used,power.draw,temperature.gpu,temperature.memory', '--format=csv'], GPU_Q_MS_LIVE),
   ]).then(([output, gpuOutput]) => {
     const processes = [];
     if (output && String(output).trim()) {
@@ -6815,14 +6815,14 @@ async function waitGpuMemRelease(pids) {
   // 10-07 测试修复：原实现 4 处 execSync(nvidia-smi) 违反 09-20 铁律——驱动进 D 状态时
   // timeout 无效，停止/清理流程会把整个控制台（含所有页面请求）一起永久按住。
   // 全部改走放弃式异步通道；显存不可探测时不再空转 30s 去"验证释放"。
-  const appsOut = await gpuQuery(['--query-compute-apps=pid,used_memory', '--format=csv,noheader,nounits'], 6000);
+  const appsOut = await gpuQuery(['--query-compute-apps=pid,used_memory', '--format=csv,noheader,nounits'], GPU_Q_MS_LIVE);
   let freedTargetMiB = 0;
   if (appsOut) String(appsOut).split('\n').forEach(l => {
     const [pid, mem] = l.split(',').map(s => s.trim());
     if (pid && pids.includes(parseInt(pid))) freedTargetMiB += parseInt(mem) || 0;
   });
   const readUsedMiB = async () => {
-    const out = await gpuQuery(['--query-gpu=memory.used', '--format=csv,noheader,nounits'], 6000);
+    const out = await gpuQuery(['--query-gpu=memory.used', '--format=csv,noheader,nounits'], GPU_Q_MS_LIVE);
     if (out == null) return null;
     let sum = 0;
     String(out).split('\n').forEach(l => { const v = parseInt(l.trim()); if (!isNaN(v)) sum += v; });
@@ -6950,7 +6950,7 @@ async function startVllmModel(modelName, params, callback) {
   // （"超出当前可用显卡数(1)"）。现改为探不到就跳过校验，让引擎自己如实报错。
   let availableGpus = null;
   try {
-    const gpuCountOut = await gpuQuery(['--query-gpu=index', '--format=csv,noheader'], 6000);
+    const gpuCountOut = await gpuQuery(['--query-gpu=index', '--format=csv,noheader'], GPU_Q_MS_LIVE);
     if (gpuCountOut != null) {
       const parsed = String(gpuCountOut).split('\n').filter((l) => l.trim().length).length;
       if (parsed > 0) availableGpus = parsed;
@@ -7913,14 +7913,14 @@ async function samplePowerCycleInner() {
   }
   // 2) GPU 功率 + 使用 GPU 的进程（nvidia-smi，走放弃式通道 + 熔断）
   try {
-    const g = await gpuQuery(['--query-gpu=power.draw,utilization.gpu', '--format=csv,noheader'], 4000);
+    const g = await gpuQuery(['--query-gpu=power.draw,utilization.gpu', '--format=csv,noheader'], GPU_Q_MS_LIVE);
     const first = g ? String(g).trim().split('\n')[0] : '';
     if (first) {
       const p = first.split(',').map(s => s.trim());
       gpuPowerW = parseFloat(p[0]) || null;
       gpuUtil = parseInt(p[1]) || null;
     }
-    const a = await gpuQuery(['--query-compute-apps=pid,used_memory', '--format=csv,noheader'], 4000);
+    const a = await gpuQuery(['--query-compute-apps=pid,used_memory', '--format=csv,noheader'], GPU_Q_MS_LIVE);
     gpuProcs = a ? String(a).trim().split('\n').map(l => {
       const [pid, mem] = l.split(',').map(s => s.trim());
       return { pid: parseInt(pid, 10) || 0, memMiB: parseInt(mem, 10) || 0 };
@@ -8253,15 +8253,20 @@ if (!global.__cpuSampler) {
 // 避免每次轮询都新起一个永不退出的 nvidia-smi（09-20 现场累积 43 个 D 状态进程）。
 let __gpuQFails = 0;
 let __gpuQBlockUntil = 0;
-const GPU_Q_FAIL_MAX = 3;               // 连续失败次数阈值
-const GPU_Q_COOLDOWN_MS = 5 * 60 * 1000; // 熔断冷却：5 分钟内不再尝试
+const GPU_Q_FAIL_MAX = 4;                 // 连续失败次数阈值
+const GPU_Q_COOLDOWN_MS = 2 * 60 * 1000;  // 熔断冷却 2 分钟（必须明显大于各调用方重试间隔，否则重试永远撞边界）
+// 10-07 线上实测口径（别再拍脑袋）：本机冷启动后**第一次** nvidia-smi（NVML 初始化）实测
+// 就要 3.3s，load 10+ 时更久；热态仅 0.06~0.5s。原统一 4000ms 会在服务启动瞬间
+// （采样器 + 静态预热 + 功耗链同时开火）连吃超时 → 熔断 → 硬件页整块空白。
+const GPU_Q_MS_STATIC = 12000; // 静态规格（字段多 + 冷初始化）
+const GPU_Q_MS_LIVE = 8000;    // 实时采样 / 功耗 / 显存校验
 function gpuQueryAvailable() { return Date.now() >= __gpuQBlockUntil; }
 function gpuQFail(why) {
   __gpuQFails++;
   if (__gpuQFails >= GPU_Q_FAIL_MAX) {
     __gpuQFails = 0;
     __gpuQBlockUntil = Date.now() + GPU_Q_COOLDOWN_MS;
-    console.warn(`[gpu] nvidia-smi 连续 ${GPU_Q_FAIL_MAX} 次失败（${why}），熔断 ${GPU_Q_COOLDOWN_MS / 60000} 分钟内不再调用（GPU 采样/静态规格暂缺，其余功能不受影响）`);
+    console.warn(`[gpu] nvidia-smi 连续 ${GPU_Q_FAIL_MAX} 次失败（${why}），熔断 ${GPU_Q_COOLDOWN_MS / 1000}s 内不再调用（GPU 采样/静态规格暂缺，其余功能不受影响；冷却后自动恢复）`);
   }
 }
 // 通用"放弃式"子进程采集：resolve(stdout) 或 resolve(null)（失败/超时/熔断），永不 reject。
@@ -8290,13 +8295,18 @@ function spawnCollect(file, args, ms, countFail) {
     proc.on('close', (code) => { if (code === 0) { __gpuQFails = 0; finish(out); } else finish(null, '退出码 ' + code); });
   });
 }
-// nvidia-smi 专用通道（带熔断判断）
+// nvidia-smi 专用通道（带熔断判断）。
+// 10-07 线上回归教训：并发调用会把"冷初始化 3.3s"叠加成超时（启动瞬间采样器/静态预热/
+// 功耗链/前端 stats 同时开火），故同一时刻只允许一个 nvidia-smi 在飞，其余排队。
+let __gpuQChain = Promise.resolve();
 function gpuQuery(args, ms) {
   if (!gpuQueryAvailable()) return Promise.resolve(null);
-  return spawnCollect('nvidia-smi', args, ms);
+  const run = () => (gpuQueryAvailable() ? spawnCollect('nvidia-smi', args, ms) : Promise.resolve(null));
+  __gpuQChain = __gpuQChain.then(run, run);
+  return __gpuQChain;
 }
 async function gpuSmi(fields) {
-  const out = await gpuQuery(['--query-gpu=' + fields, '--format=csv,noheader,nounits'], 4000);
+  const out = await gpuQuery(['--query-gpu=' + fields, '--format=csv,noheader,nounits'], GPU_Q_MS_STATIC);
   if (out == null) throw new Error('nvidia-smi 查询失败（超时 / 驱动不可用 / 熔断冷却中）');
   return out;
 }
@@ -8325,7 +8335,7 @@ const GPU_LIVE_FIELDS = 'index,utilization.gpu,utilization.memory,memory.used,me
 async function gpuPyCollect(py) {
   // 同样禁止同步：cuInit/nvmlInit 在驱动异常时也会进 D 状态（与 nvidia-smi 同病），
   // 故走放弃式采集。python3 缺失属环境差异，不计入 GPU 熔断计数。
-  const out = await spawnCollect('python3', ['-c', py], 5000, false);
+  const out = await spawnCollect('python3', ['-c', py], GPU_Q_MS_LIVE, false);
   if (!out) return {};
   try {
     const j = JSON.parse(String(out).trim().split('\n').pop());
@@ -8369,7 +8379,10 @@ async function gpuCoresNVML() {
 async function buildGpuStatic() {
   const out = { supported: false, gpus: [], driver_version: null };
   let rows;
-  try { rows = gpuParseRows(await gpuSmi(GPU_STATIC_FIELDS)); } catch (e) { out.error = 'nvidia-smi 不可用: ' + (e && e.message || e); return out; }
+  // 10-07 线上回归修复：这里原来 catch 后 return 一个错误帧，于是 gpuStaticRebuild 的
+  // .then 会把"空帧"当正常结果覆盖上一帧好数据——一次抖动即整表清空且无自愈。
+  // 现改为向上抛，由 gpuStaticRebuild 决定保留旧帧。
+  rows = gpuParseRows(await gpuSmi(GPU_STATIC_FIELDS));
   const smMap = await gpuSmCounts(); // [sm-count 1006 rev3] CUDA 属性直读真实 SM 数
   const coreMap = await gpuCoresNVML(); // [sm-count 1006 rev3] NVML 静态 CUDA 核数表
   for (const r of rows) {
@@ -8401,15 +8414,23 @@ function gpuStaticRebuild() {
   buildGpuStatic()
     .then((st) => { global.__gpuStatic = st; global.__gpuStaticAt = Date.now(); })
     .catch((e) => {
-      // 失败不覆盖上一帧（否则驱动抖动一次，硬件页整表清空），只推迟下次重试
+      // 失败不覆盖上一帧（否则驱动抖动一次，硬件页整表清空），只推迟下次重试；
+      // 已有好帧时把原因挂在 stale_error 上，前端可显示"数据可能偏旧"而不是整块消失。
+      const msg = String((e && e.message) || e);
+      if (global.__gpuStatic && global.__gpuStatic.gpus && global.__gpuStatic.gpus.length) {
+        global.__gpuStatic = Object.assign({}, global.__gpuStatic, { stale_error: msg });
+      } else {
+        global.__gpuStatic = { supported: false, gpus: [], error: msg };
+      }
       global.__gpuStaticAt = Date.now();
-      if (!global.__gpuStatic) global.__gpuStatic = { supported: false, gpus: [], error: String((e && e.message) || e) };
     })
     .finally(() => { __gpuStaticBuilding = false; });
 }
 function getGpuStatic() {
   const now = Date.now();
-  if (!global.__gpuStatic || now - (global.__gpuStaticAt || 0) > 300000) gpuStaticRebuild();
+  // 重试间隔 60s，必须明显小于熔断冷却（GPU_Q_COOLDOWN_MS）：两者相等时重试永远落在
+  // 冷却边界差几毫秒的位置，每次都撞墙 → 自我维持的永久空白（10-07 线上实锤）。
+  if (!global.__gpuStatic || now - (global.__gpuStaticAt || 0) > 60000) gpuStaticRebuild();
   return global.__gpuStatic || { supported: false, gpus: [], driver_version: null, pending: true };
 }
 function sampleGpuStats() {
@@ -8419,7 +8440,7 @@ function sampleGpuStats() {
   // 现在 gpuQuery 必定 settle，且连续失败会进熔断冷却，不再反复往驱动上撞。
   if (global.__gpuSampleBusy) return;
   global.__gpuSampleBusy = true;
-  gpuQuery(['--query-gpu=' + GPU_LIVE_FIELDS, '--format=csv,noheader,nounits'], 4000).then((outStr) => {
+  gpuQuery(['--query-gpu=' + GPU_LIVE_FIELDS, '--format=csv,noheader,nounits'], GPU_Q_MS_LIVE).then((outStr) => {
     global.__gpuSampleBusy = false;
     if (!outStr) return; // nvidia-smi 失败保留上次采样，下一轮重试
     try {
@@ -8457,7 +8478,7 @@ function sampleGpuPcie() {
   // 10-07 测试修复：改走放弃式通道。原 execFile 的 timeout 对 D 状态进程无效（SIGKILL 不生效、
   // 回调永不触发），而本函数靠"回调里续排"维持循环 → 一次驱动抖动就把 PCIe 带宽采样永久打死，
   // 且再也无法自愈（图表停在最后一帧）。gpuQuery 必定 settle，循环得以持续。
-  gpuQuery(['dmon', '-s', 't', '-c', '1', '-d', '1'], 4000).then((out) => {
+  gpuQuery(['dmon', '-s', 't', '-c', '1', '-d', '1'], GPU_Q_MS_LIVE).then((out) => {
     try {
       if (out) {
         const byIndex = {};
@@ -9932,7 +9953,7 @@ function strataGpuMemUsed() {
     // 10-07 测试修复：原 execFileAsync 的 timeout 靠发信号实现，对 D 状态 nvidia-smi 无效
     // → 该 Promise 永不 settle → 单飞句柄 __strataGpuFly 永久挂住，之后所有调用都 await
     // 同一个死 Promise，启动资源门禁彻底卡死。改走 gpuQuery（自建定时器放弃，必定 settle）。
-    gpuQuery(['--query-gpu=index,memory.used', '--format=csv,noheader,nounits'], 4000)
+    gpuQuery(['--query-gpu=index,memory.used', '--format=csv,noheader,nounits'], GPU_Q_MS_LIVE)
       .then((out) => {
         const gpus = [];
         if (out) String(out).split('\n').forEach((line) => {
@@ -10548,6 +10569,72 @@ async function cpuCtlHandle(req, res, urlObj) {
   return reply(404, { ok: false, msg: 'cpuctl: 未知路由' });
 }
 
+// ==== [strata-remote-monitor] BEGIN module ====
+// 用途：克隆 Strata Web UI（http://192.168.1.38:8080/#monitor）的 Monitor 页到控制台「Strata 监控」标签。
+// 数据源 = 远端 Strata 自带的 /metrics + /health + /mcp（Strata 服务端不发 CORS 头，浏览器跨源直连会被拦，
+// 由控制台服务端代理转发；远端机在 Windows 上，控制台机已实测可达）。
+// 目标地址 = strata-remote.json（{"baseUrl":"http://192.168.1.38:8080"}），按 mtime 热加载；文件缺失用缺省值。
+// 铁律：fetch + AbortController 带超时（metrics 3s / health·mcp 4s）；800ms TTL 缓存 + 单飞防轮询叠发；
+//       失败返回 {ok:false,msg}——前端保留上一帧 + 黄条，绝不伪造空 metrics 帧覆盖好数据（10-03 三态铁律）。
+const STRATA_REMOTE_DEFAULT_BASE = 'http://192.168.1.38:8080';
+let __strataRemoteCfg = { mtime: -1, baseUrl: STRATA_REMOTE_DEFAULT_BASE };
+function strataRemoteBase() {
+  const p = path.join(__dirname, 'strata-remote.json');
+  try {
+    const st = fs.statSync(p);
+    if (st.mtimeMs !== __strataRemoteCfg.mtime) {
+      const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+      const b = String((j && j.baseUrl) || STRATA_REMOTE_DEFAULT_BASE).replace(/\/+$/, '');
+      __strataRemoteCfg = { mtime: st.mtimeMs, baseUrl: b || STRATA_REMOTE_DEFAULT_BASE };
+    }
+  } catch (e) { /* 文件缺失/解析失败：保持上一次值（首跑即缺省 .38:8080） */ }
+  return __strataRemoteCfg.baseUrl;
+}
+function strataRemoteGet(base, sub, timeoutMs) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  return fetch(base + sub, { signal: ac.signal, headers: { Accept: 'application/json' } })
+    .then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .finally(() => clearTimeout(timer));
+}
+const __strataRemoteCache = { at: 0, key: '', data: null, inflight: null, inflightKey: '', health: null, healthAt: 0, mcp: null, mcpAt: 0 };
+function strataRemoteSnapshot(all) {
+  const key = all ? 'all' : 'top';
+  const c = __strataRemoteCache;
+  const now = Date.now();
+  if (c.data && c.key === key && now - c.at < 800) return Promise.resolve(c.data);
+  if (c.inflight && c.inflightKey === key) return c.inflight;
+  const base = strataRemoteBase();
+  const p = (async () => {
+    const out = { ok: true, ts: Date.now(), base };
+    try {
+      out.metrics = await strataRemoteGet(base, all ? '/metrics?requests=all' : '/metrics', 3000);
+    } catch (e) {
+      out.ok = false;
+      out.msg = '远端 Strata /metrics 不可达：' + String((e && e.message) || e);
+    }
+    if (!c.health || Date.now() - c.healthAt > 5000) {
+      try { c.health = await strataRemoteGet(base, '/health', 4000); c.healthAt = Date.now(); } catch (e) { /* 保留旧值 */ }
+    }
+    out.health = c.health;
+    if (!c.mcp || Date.now() - c.mcpAt > 10000) {
+      try { c.mcp = await strataRemoteGet(base, '/mcp', 4000); c.mcpAt = Date.now(); } catch (e) { /* 保留旧值 */ }
+    }
+    out.mcp = c.mcp;
+    return out;
+  })();
+  c.inflight = p; c.inflightKey = key;
+  return p.then((d) => { c.data = d; c.key = key; c.at = Date.now(); return d; })
+          .finally(() => { if (c.inflight === p) { c.inflight = null; c.inflightKey = ''; } });
+}
+function strataRemoteHandle(req, res, urlObj) {
+  const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  const all = urlObj.searchParams.get('requests') === 'all';
+  return strataRemoteSnapshot(all).then((d) => reply(200, d))
+    .catch((e) => reply(200, { ok: false, msg: String((e && e.message) || e), ts: Date.now() }));
+}
+// ==== [strata-remote-monitor] END module ====
+
 // ====== [gpu-ctl 1003] GPU 功耗/频率控制模块（硬件监视页，模式对齐 CPU CTL）======
 // 提权边界：只 execFile 固定路径 /usr/local/bin/gpu-ctl（root:root 0755，sudoers 单命令白名单），
 // 参数全部白名单 action + 正则数值校验，杜绝注入；nvidia-smi 本体不放行 sudo。
@@ -10671,7 +10758,7 @@ const server = http.createServer(async (req, res) => {
   const pathname = urlObj.pathname;
 
   // 09-20：内部 API/页面/静态资源启用 gzip；代理路径（chat/completions 流式）绝不压缩
-  if (pathname === '/' || pathname === '/index.html' || pathname === '/m' || pathname === '/mobile.html' || pathname === '/bench.html' || pathname === '/cpu.html' || pathname === '/sglang.html' || pathname === '/vllm.html'
+  if (pathname === '/' || pathname === '/index.html' || pathname === '/m' || pathname === '/mobile.html' || pathname === '/bench.html' || pathname === '/cpu.html' || pathname === '/sglang.html' || pathname === '/vllm.html' || pathname === '/strata-monitor.html'
       || pathname.startsWith('/static/') || pathname.startsWith('/v1/internal/')) {
     installGzip(req, res);
   }
@@ -10699,6 +10786,14 @@ const server = http.createServer(async (req, res) => {
   // === CPU 控制 API（移植自 bench-console/cpu-control，见 CPU CTL 模块头注释）===
   if (pathname === '/v1/internal/cpuctl' || pathname.startsWith('/v1/internal/cpuctl/')) {
     return cpuCtlHandle(req, res, urlObj).catch((e) => {
+      try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}
+    });
+  }
+
+  // === Strata 远端监控 API（克隆 .38:8080 Web UI Monitor 页，见 [strata-remote-monitor] 模块）===
+  // 注册在 /v1/internal/strata 前缀路由之前；本路由精确匹配，不吞 strata/* 子路由。
+  if (pathname === '/v1/internal/strata-remote') {
+    return strataRemoteHandle(req, res, urlObj).catch((e) => {
       try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}
     });
   }
@@ -14174,6 +14269,22 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       res.writeHead(404);
       res.end('vllm.html not found');
+    }
+    return;
+  }
+
+  // === Serve Strata 远端监控 UI（「Strata 监控」标签的内嵌页，克隆 .38:8080 Web UI Monitor，纯只读）===
+  if (pathname === '/strata-monitor.html' || pathname === '/strata-monitor') {
+    const smPath = path.join(__dirname, 'strata-monitor.html');
+    try {
+      const content = fs.readFileSync(smPath, 'utf8');
+      const etag = 'W/"' + Buffer.byteLength(content) + '-' + fs.statSync(smPath).mtimeMs.toString(36) + '"';
+      if (req.headers['if-none-match'] === etag) { res.writeHead(304); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', 'ETag': etag });
+      res.end(content);
+    } catch (e) {
+      res.writeHead(404);
+      res.end('strata-monitor.html not found');
     }
     return;
   }

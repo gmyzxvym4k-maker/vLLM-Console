@@ -10711,28 +10711,37 @@ async function strataRemoteCmd(req, res) {
   }
   if (act === 'startbat') {
     if (!STRATA_REMOTE_BAT_RE.test(cfg.bat)) return reply(200, { ok: false, msg: 'strata-remote.json 的 bat 路径为空或含非法字符' });
-    // 10-08 用户定：按钮语义=「用指定脚本重启」——在跑就先杀掉（释放 srv_256k.log 独占锁与 8080 端口），
-    // 再执行 bat，保证跑起来的永远是 bat 指定的配置（如 256K），而不是残留的旧实例。
-    let killed = false;
-    try {
-      await strataRemoteGet(cfg.baseUrl, '/health', 1500);
-      // 在跑 → 杀 python.exe + strata.exe + strata-vision.exe（bat 起的整棵进程树的叶子们）。
-      // taskkill /f /im 逐镜像杀；杀完等 2s 让端口/文件锁释放。
-      await strataSshExec('taskkill /f /im python.exe', 10000);
-      await strataSshExec('taskkill /f /im strata.exe', 10000);
-      await strataSshExec('taskkill /f /im strata-vision.exe', 10000);
-      killed = true;
-      await new Promise((res2) => setTimeout(res2, 2000));
-    } catch (e) { /* 不可达 = 未在跑，直接启动 */ }
+    // 10-08 用户定：按钮语义=「用指定脚本重启」——先把占着 8080 的旧实例干掉（无论它叫
+    // python.exe 还是 pythonw.exe、是脚本起的还是手动双击起的），释放端口与 srv_256k.log 独占锁，
+    // 再跑 bat，保证跑起来的永远是 bat 指定的配置（256K）。
+    // 10-08 二次实锤：现场旧实例是 pythonw.exe（手动起），只 taskkill python.exe 杀不到它 →
+    // 端口一直被占、新实例绑不上、静默失败。故主判据改成「按 8080 端口拿 PID 精确杀」，
+    // 镜像名 taskkill 仅作兜底。
+    const occ = await strataSshExec('netstat -ano | findstr :8080 | findstr LISTENING', 10000);
+    const pids = Array.from(new Set(((occ.ok && occ.msg) || '').split('\n').map((ln) => {
+      const m = ln.trim().match(/(\d+)\s*$/); return m ? m[1] : '';
+    }).filter((x) => /^\d+$/.test(x))));
+    let killed = pids.length > 0;
+    for (const pid of pids) await strataSshExec('taskkill /f /pid ' + pid, 8000);
+    // 兜底：万一端口已松但进程树还有残留（vision 子进程等），按镜像名再扫一遍。
+    await strataSshExec('taskkill /f /im python.exe', 8000);
+    await strataSshExec('taskkill /f /im pythonw.exe', 8000);
+    await strataSshExec('taskkill /f /im strata.exe', 8000);
+    await strataSshExec('taskkill /f /im strata-vision.exe', 8000);
+    if (killed) await new Promise((res2) => setTimeout(res2, 2000));
     const r = await strataSshExec('start "" /min ' + cfg.bat, 15000);
     if (!r.ok) return reply(200, Object.assign({ action: act }, r));
-    // 自校验（10-08）：start 分离执行 ssh 退出码 0 ≠ 真启动了；等 4s 查 python 进程坐实。
-    await new Promise((res2) => setTimeout(res2, 4000));
-    const chk = await strataSshExec('tasklist /fi "IMAGENAME eq python.exe" /nh /fo csv', 10000);
-    const hasPy = chk.ok && /python\.exe/i.test(chk.msg || '');
-    return reply(200, { action: act, ok: true, msg: hasPy
-      ? (killed ? '已停掉旧实例并启动 ' : '已启动 ') + cfg.bat + '（已检测到 python 进程，模型加载 2~6 分钟，页面会自动转绿）'
-      : '启动命令已发出，但 4 秒后未检测到 python 进程——可能未生效（路径失效/日志被占用），可再点一次或看远端桌面窗口' });
+    // 自校验：start 分离执行 ssh 退出码 0 ≠ 真启动；等 5s 看 8080 是否已被重新占用（最硬的判据，
+    // 且不依赖进程叫什么名字），再看 python 系进程存在与否作次要佐证。
+    await new Promise((res2) => setTimeout(res2, 5000));
+    const occ2 = await strataSshExec('netstat -ano | findstr :8080 | findstr LISTENING', 10000);
+    const listening = occ2.ok && /:8080\s/.test(occ2.msg || '');
+    const chk = await strataSshExec('tasklist /nh /fo csv', 10000);
+    const hasPy = chk.ok && /pythonw?\.(exe)/i.test(chk.msg || '');
+    const up = listening || hasPy;
+    return reply(200, { action: act, ok: true, msg: up
+      ? (killed ? '已停掉旧实例并启动 ' : '已启动 ') + cfg.bat + '（' + (listening ? '8080 已重新监听' : '已检测到 python 进程') + '，模型加载 2~6 分钟，页面会自动转绿）'
+      : '启动命令已发出，但 5 秒后既未见 8080 监听也无 python 进程——多半未生效（路径失效/日志被占用），可再点一次或看远端桌面窗口' });
   }
   return reply(400, { ok: false, msg: 'action 必须是 wake | shutdown | startbat' });
 }

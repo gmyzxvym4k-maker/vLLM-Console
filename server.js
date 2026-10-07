@@ -10711,12 +10711,19 @@ async function strataRemoteCmd(req, res) {
   }
   if (act === 'startbat') {
     if (!STRATA_REMOTE_BAT_RE.test(cfg.bat)) return reply(200, { ok: false, msg: 'strata-remote.json 的 bat 路径为空或含非法字符' });
-    // 预检：Strata 已在跑就别再拉第二个实例——bat 的内层 cmd 重定向 >> srv_256k.log 会被在跑实例
-    // 独占锁挡掉（cmd 重定向只开 share-read），第二实例静默死亡且不留日志（10-08 实锤）。
+    // 10-08 用户定：按钮语义=「用指定脚本重启」——在跑就先杀掉（释放 srv_256k.log 独占锁与 8080 端口），
+    // 再执行 bat，保证跑起来的永远是 bat 指定的配置（如 256K），而不是残留的旧实例。
+    let killed = false;
     try {
       await strataRemoteGet(cfg.baseUrl, '/health', 1500);
-      return reply(200, { ok: false, action: act, msg: 'Strata 已在运行（' + cfg.baseUrl + ' /health 正常），无需重复启动；如需换档请先关机再唤醒后启动' });
-    } catch (e) { /* 不可达 = 未运行，正是该启动的场景 */ }
+      // 在跑 → 杀 python.exe + strata.exe + strata-vision.exe（bat 起的整棵进程树的叶子们）。
+      // taskkill /f /im 逐镜像杀；杀完等 2s 让端口/文件锁释放。
+      await strataSshExec('taskkill /f /im python.exe', 10000);
+      await strataSshExec('taskkill /f /im strata.exe', 10000);
+      await strataSshExec('taskkill /f /im strata-vision.exe', 10000);
+      killed = true;
+      await new Promise((res2) => setTimeout(res2, 2000));
+    } catch (e) { /* 不可达 = 未在跑，直接启动 */ }
     const r = await strataSshExec('start "" /min ' + cfg.bat, 15000);
     if (!r.ok) return reply(200, Object.assign({ action: act }, r));
     // 自校验（10-08）：start 分离执行 ssh 退出码 0 ≠ 真启动了；等 4s 查 python 进程坐实。
@@ -10724,8 +10731,8 @@ async function strataRemoteCmd(req, res) {
     const chk = await strataSshExec('tasklist /fi "IMAGENAME eq python.exe" /nh /fo csv', 10000);
     const hasPy = chk.ok && /python\.exe/i.test(chk.msg || '');
     return reply(200, { action: act, ok: true, msg: hasPy
-      ? '已启动 ' + cfg.bat + '（已检测到 python 进程，模型加载 2~6 分钟，页面会自动转绿）'
-      : '启动命令已发出，但 4 秒后未检测到 python 进程——可能未生效（bat 内层重定向被占用/路径失效），可再点一次或看远端桌面窗口' });
+      ? (killed ? '已停掉旧实例并启动 ' : '已启动 ') + cfg.bat + '（已检测到 python 进程，模型加载 2~6 分钟，页面会自动转绿）'
+      : '启动命令已发出，但 4 秒后未检测到 python 进程——可能未生效（路径失效/日志被占用），可再点一次或看远端桌面窗口' });
   }
   return reply(400, { ok: false, msg: 'action 必须是 wake | shutdown | startbat' });
 }

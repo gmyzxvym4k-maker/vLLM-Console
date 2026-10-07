@@ -106,11 +106,11 @@ dl.facts dd{font-weight:600;font-variant-numeric:tabular-nums}
   <h3>电源控制 <span class="muted" style="letter-spacing:0;font-weight:400">目标 192.168.1.38 · MAC/地址见 strata-remote.json（改配置即热生效）</span></h3>
   <div id="pwrBtns" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
     <button class="btn pwr" id="pwrWake" onclick="pwrPost('wake',this)">⚡ 网络唤醒</button>
-    <button class="btn pwr primary" id="pwrBat" onclick="pwrPost('startbat',this)">▶ 启动 Strata（start-strata-0140.bat）</button>
+    <button class="btn pwr primary" id="pwrBat" onclick="pwrPost('startbat',this)">▶ 启动/重启 Strata（start-strata-0140.bat）</button>
     <button class="btn pwr danger" id="pwrOff" onclick="pwrPost('shutdown',this)">⏻ 关机</button>
     <span id="pwrMsg" class="small" style="color:var(--tx3)"></span>
   </div>
-  <p class="muted small" style="margin-top:8px">唤醒=UDP9 魔术包（网卡已在 wake_armed 列）；关机立即执行——<b style="color:var(--warn)">跑在这台机上的推理服务（含正在对话的 AI 会话）会一并中断</b>；启动后模型加载 2~6 分钟，页面自动转绿。</p>
+  <p class="muted small" style="margin-top:8px">唤醒=UDP9 魔术包（网卡已在 wake_armed 列）；启动/重启=先杀旧实例再跑指定 bat（保证跑的就是脚本里的配置）；关机立即执行——<b style="color:var(--warn)">跑在这台机上的推理服务（含正在对话的 AI 会话）会一并中断</b>；启动后模型加载 2~6 分钟，页面自动转绿。</p>
 </div>
 
 <!-- 模型状态 -->

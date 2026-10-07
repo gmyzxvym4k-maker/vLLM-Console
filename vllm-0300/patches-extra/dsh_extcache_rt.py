@@ -265,9 +265,17 @@ def _make_iface_hook(class_attr):
         if cls is None or not hasattr(cls, "update_from_output"):
             _log(f"没找到 {module.__name__}.{class_attr}.update_from_output ⇒ #12-B 跳过（上游结构变了）")
             return
-        if getattr(cls, "_dsh_extcache_b", False):
+        # ★ 幂等判据必须看**类自己的 __dict__**，不能用 getattr 的继承查找：
+        #   Scheduler 继承自 SchedulerInterface，若先挂了接口那份，getattr(cls,"标记位")
+        #   会从基类读到 True，导致针对具体类 Scheduler 的这一钩子直接 return、
+        #   官方实现原地不动 ⇒ 真实引擎里永不落盘（10-07 第二轮实测抓到）。
+        if "_dsh_extcache_b" in cls.__dict__:
             return
-        orig = cls.update_from_output
+        if getattr(cls, "_dsh_extcache_b", False):
+            _log(f"{class_attr} 的标记位来自基类继承，仍需为本类单独挂钩")
+        # 取本类自己的实现（Scheduler 自定义了同名方法，会遮蔽接口那份）；
+        # 若本类没有则退回继承所得（例如某个未覆写的调度器实现）。
+        orig = cls.__dict__.get("update_from_output", None) or cls.update_from_output
 
         def update_from_output(self, scheduler_output, model_output):
             ret = orig(self, scheduler_output, model_output)
@@ -326,11 +334,12 @@ def build_patches() -> dict:
     if os.environ.get(PATCH_DISABLED_KEY, "") == "1":
         _log(f"{PATCH_DISABLED_KEY}=1 ⇒ #12 不动作（控制台二级缓存命中列显示 --）")
         return {}
+    # 顺序有意义：先挂具体类 Scheduler（真实生效点），再挂抽象 Interface（保险）。
+    # 两处都用 cls.__dict__ 判据，互不干扰；sitecustomize 是按本 dict 的键逐个
+    # 注册 meta-path 回调，实际触发时机取决于模块导入次序，故判据不能依赖顺序。
     return {
         "vllm.v1.request": _patch_request,
-        # ↓ 真实生效点：具体调度器类（它会遮蔽接口上的同名方法）
         "vllm.v1.core.sched.scheduler": _make_iface_hook("Scheduler"),
-        # ↓ 保险：万一将来用别的 SchedulerInterface 实现
         "vllm.v1.core.sched.interface": _make_iface_hook("SchedulerInterface"),
     }
 

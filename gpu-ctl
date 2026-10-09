@@ -144,6 +144,22 @@ case "${1:-}" in
     systemctl daemon-reload 2>/dev/null || die "drop-in 已写入，但 systemctl daemon-reload 失败"
     echo "开机持久化 PL=$2 已写入 $(basename "$PL_DROPIN")"
     ;;
+  halt)
+    # GPU 高温自动关机守护（[gpu-hotshield 1009]）的执行末端：先 sync 把脏页落盘
+    # （保护模型权重/日志/追踪文件不被突然断电毁掉），再 systemctl poweroff 正常关机。
+    # 刻意不走 nvidia-smi：驱动 D 状态时 $NVS 通道会挂死，本命令仍能执行。
+    # 不可逆操作：倒计时、取消、冷却判定全部在调用方（server.js hotshield 模块）完成。
+    { date '+%F %T'; echo "GPU 高温保护关机（gpu-hotshield，由 vLLM 控制台发起）"; } > /run/gpu-hotshield-halt.reason 2>/dev/null
+    sync &
+    SYNC_PID=$!
+    # sync 最长等 8s：存储栈卡住时也要保障关机时效
+    ( sleep 8; kill "$SYNC_PID" 2>/dev/null ) &
+    WAITER=$!
+    wait "$SYNC_PID" 2>/dev/null
+    kill "$WAITER" 2>/dev/null
+    echo "已下发关机（sync 完成，systemctl poweroff）"
+    exec systemctl poweroff
+    ;;
   help|"")
     cat <<'EOH'
 用法: gpu-ctl <命令>
@@ -152,6 +168,7 @@ case "${1:-}" in
   lock <min> <max> [卡]  锁图形频率（MHz）
   unlock [卡]            解除频率锁
   persist-pl <瓦>        写开机持久化 drop-in（pl-console.conf 的 Environment=PL）
+  halt                   sync 落盘后关机（GPU 高温保护专用，不可逆）
 EOH
     ;;
   *)

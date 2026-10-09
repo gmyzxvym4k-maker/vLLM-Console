@@ -775,6 +775,24 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   altModelPaths: ['/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M'],  // [w4a16-restore-1006] 1M=YaRN×4 W4A16 副本
   longCtxModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M',  // [w4a16-restore-1006]
   pleInt8Dir: '/media/ll/data/ple',  // [w4a16-restore-1006] W4A16 专属 INT8 表产物目录（不存在则 inner 回落 BF16 磁盘驻留）；禁止跨 checkpoint 复用（inner 缺省是 ple-w8a8）
+  // [model-variant-1008] 一个脚本条目挂多个 checkpoint（dirNames 多目录）时的「按目录识别」
+  // 映射表：点哪张卡/哪个预设，就按对应 variant 下发 FN_MODEL_PATH/FN_1M_MODEL_PATH/
+  // FN_PLE_INT8_DIR，不再一律落到注册键的 sm.modelPath（旧 bug：点 Channel 启动 W4A16）。
+  // pp/minGpus/kvoffCap 为该 checkpoint 的硬约束护栏（依据见各 variant 行内注释）。
+  modelVariants: {
+    'Qwen3.8-Flash-Next-W4A16-AutoRound': {
+      modelPath: '/media/ll/data/models/Qwen3.8-Flash-Next-W4A16-AutoRound',
+      longCtxModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M',
+      pleInt8Dir: '/media/ll/data/ple',
+    },
+    'Qwen3.8-Flash-Next-Channel-INT8-w8a8': {
+      modelPath: '/media/ll/data/models/Qwen3.8-Flash-Next-Channel-INT8-w8a8',
+      longCtxModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-Channel-INT8-w8a8-1M',
+      pleInt8Dir: '/media/ll/data/ple-w8a8',  // w8a8 专属 INT8 表产物（ple_ngram_meta 完整校验通过 10-08）
+      pp: 3, minGpus: 3,        // 权重 ~132GB：PP2 每段 66GB > 单卡 64GB 显存，必须 PP3（本机 3 卡在位）
+      kvoff: 'simple', kvoffGiB: 96, kvoffCap: 96,  // [10-08 用户要求开启] PLE=INT8 mmap(48.3 mlock) 时 96GiB 成立：156 pinned/lock + 权重页缓存 132(可回收) 压进 251GB；若内存告警第一刀降 48
+    },
+  },  // __modelvariant_1008__
   maxModelLenLong: 1048576,
 };
 MODEL_ALIASES['qwen3.8-flash-next-w4a16'] = 'qwen3.8-flash-next';
@@ -1007,7 +1025,7 @@ function scriptModelDefaults(sm) {
   const b = sm.base || {};
   return {
     port: sm.port, servedName: sm.served, maxModelLen: String(b.maxModelLen), ctxLen: '',
-    gpuId: 0, gpuCount: b.pp || 2, parallelMode: 'pp', pdMode: '0',
+    gpuId: 0, gpuCount: sm.variantPp || b.pp || 2, parallelMode: 'pp', pdMode: '0',  // [model-variant-1008]
     maxSeqs: b.maxNumSeqs, maxBatchedTokens: b.maxBatchedTokens,
     blockSize: b.blockSize, temperature: b.temperature, topP: b.topP, topK: b.topK,
     minP: b.minP, presencePenalty: b.presencePenalty, repetitionPenalty: b.repetitionPenalty,
@@ -1032,7 +1050,7 @@ function scriptModelDefaults(sm) {
     // 写明 kvoff/pleInt8/pleLoc）。本机 32GB 内存下 INT8 heap/BF16 heap/大 GiB 二级缓存均必 OOM，
     // base 未声明时回落安全档：INT8+disk、二级缓存关。旧版前端把这三档写死导致启动页误炸。
     pleInt8: String(b.pleInt8 || '1'), pleLoc: String(b.pleLoc || 'disk'),
-    kvoff: String(b.kvoff || '0'), kvoffGiB: b.kvoffGiB,  // __pagefix_1005__
+    kvoff: String(sm.variantKvoff || b.kvoff || '0'), kvoffGiB: sm.variantKvoffGiB || b.kvoffGiB,  // __pagefix_1005__ [model-variant-1008]
   };
 }
 // ====== Flash-Next 启动方案（2026-09-14）======
@@ -1183,7 +1201,42 @@ function flashNextSchemes() {
   return out;
 }
 // 弹窗参数 → chroot 启动环境变量（FN_*）；与基准相同的项不产生额外 flag。
-function scriptModelLaunchPlan(sm, d) {
+// [model-variant-1008] 按弹窗/预设传入的目录名（或模型路径）解析出携带该 checkpoint
+// 路径与护栏的 sm 浅拷贝。命中判据=目录名与 variant 键相等或为其前缀延伸
+// （xxx-1M / xxx-512K 副本目录同样归位到母 variant）。未命中返回原条目=旧行为零漂移。
+function scriptModelVariantResolve(sm, d) {
+  const variants = sm && sm.modelVariants;
+  if (!variants) return sm;
+  const keys = Object.keys(variants);
+  const cands = d ? [d.modelPath, d.dir_name, d.dirName, d.modelName, d.model] : [];
+  let hit = null;
+  for (const c of cands) {
+    if (!c) continue;
+    const base = String(c).trim().replace(/\/+$/, '').split('/').pop();
+    if (!base) continue;
+    for (const k of keys) {
+      if (base === k || base.indexOf(k + '-') === 0) { hit = k; break; }
+    }
+    if (hit) break;
+  }
+  if (!hit) return sm;
+  const v = variants[hit] || {};
+  const out = Object.assign({}, sm);
+  out.variantName = hit;
+  if (v.modelPath) out.modelPath = v.modelPath;
+  if (v.longCtxModelPath) { out.longCtxModelPath = v.longCtxModelPath; out.altModelPaths = [v.longCtxModelPath]; }
+  if (v.pleInt8Dir !== undefined) out.pleInt8Dir = v.pleInt8Dir;
+  if (v.pp) { out.variantPp = v.pp; out.variantMinGpus = v.minGpus || v.pp; }
+  if (v.kvoff) out.variantKvoff = String(v.kvoff);
+  if (v.kvoffGiB) out.variantKvoffGiB = v.kvoffGiB;
+  if (v.kvoffCap !== undefined) out.variantKvoffCap = v.kvoffCap;
+  return out;
+}
+
+function scriptModelLaunchPlan(smIn, d) {
+  // [model-variant-1008] 先把「用户点的是哪个 checkpoint」解析成条目浅拷贝：
+  // 旧版把 FN_MODEL_PATH 写死 sm.modelPath —— 点 Channel 卡启动的却是 W4A16（10-08 实锤）。
+  const sm = scriptModelVariantResolve(smIn, d);  // __modelvariant_1008__
   const b = sm.base || {};
   const warnings = [];
   // 不写死 FN_LOG：wrapper 按端口命名为 vllm-flash-next-${PORT}.log
@@ -1245,14 +1298,20 @@ function scriptModelLaunchPlan(sm, d) {
   // 通知 inner 不设该变量（inner 侧配套改动，见 flash-next-0300-inner.sh）。
   const _parMode = String(d.parallelMode || '').toLowerCase();
   const _gpus = int(d.gpuCount, 0);
-  if (_parMode === 'tp' && _gpus >= 1) {
+  if (_parMode === 'tp' && _gpus >= 1 && !(sm.variantMinGpus && _gpus < sm.variantMinGpus)) {
     env.FN_TP = String(_gpus);
     env.FN_PP = '1';
     env.FN_PP_PARTITION = 'none';
     if (_gpus !== 2) warnings.push('TP×' + _gpus + '：请确认与在位 GPU 数匹配（10-05 换装后本机 3 卡；TP 档内存/PLE 分片账另行评估）');
   } else {
     env.FN_TP = '1';
-    env.FN_PP = String(_parMode === 'pp' && _gpus >= 1 ? _gpus : (b.pp || 2));
+    // [model-variant-1008] 变体可强制并行下限（Channel-INT8 权重 132GB：PP2 每段 66GB 超显存）
+    let _pp = _parMode === 'pp' && _gpus >= 1 ? _gpus : (sm.variantPp || b.pp || 2);
+    if (sm.variantMinGpus && _pp < sm.variantMinGpus) {
+      warnings.push(sm.variantName + ' 权重合计超出 PP' + _pp + ' 的单卡显存（每段 ≥66 GiB > 64 GiB），启动必 OOM——已自动抬升为 PP=' + sm.variantMinGpus + '（请确认 ' + sm.variantMinGpus + ' 张卡空闲）');
+      _pp = sm.variantMinGpus;
+    }
+    env.FN_PP = String(_pp);
   }
   env.FN_PREFIX_CACHE = String(String(d.prefixCaching) === '0' ? 0 : 1);
   env.FN_CHUNKED = String(String(d.chunkedPrefill) === '0' ? 0 : 1);
@@ -1280,7 +1339,13 @@ function scriptModelLaunchPlan(sm, d) {
   const kvMode = String(d.kvoff || '0');
   if (kvMode === 'simple') {
     env.FN_KVOFF = '0';
-    env.FN_SIMPLE_OFFLOAD = String(Math.max(8, Math.min(200, int(d.kvoffGiB, 96))));
+    // [model-variant-1008] 变体可钳制 CPU 二级缓存上限（Channel: 权重页缓存+PLE mlock 已 ~192GB）
+    let _sg = Math.max(8, Math.min(200, int(d.kvoffGiB, 96)));
+    if (sm.variantKvoffCap !== undefined && _sg > sm.variantKvoffCap) {
+      warnings.push(sm.variantName + '：权重页缓存(~132 GiB) + PLE 表 mlock(~48.3 GiB) + 引擎常驻后，二级缓存 ' + _sg + ' GiB 会顶穿物理内存（历史 96GiB 档秒崩同族）——已自动降到 ' + sm.variantKvoffCap + ' GiB；如内存吃紧可选「关」');
+      _sg = Math.max(8, sm.variantKvoffCap);
+    }
+    env.FN_SIMPLE_OFFLOAD = String(_sg);
   } else if (kvMode === '1') {
     env.FN_KVOFF = '1';
     const koG = int(d.kvoffGiB, 96);
@@ -1387,6 +1452,7 @@ function scriptModelLaunchPlan(sm, d) {
 // 因此本栈单独建 plan：语义与 vLLM plan 同字段，落到 SG_*；SGLang 不支持的项显式警告，
 // 不静默丢弃。sglang-18420/ACTIVE 哨兵在位时，两个启动入口（弹窗/快启）自动走这里。
 function scriptModelLaunchPlanSglang(sm, d) {
+  sm = scriptModelVariantResolve(sm, d);  // [model-variant-1008] sglang 栈同样按目录识别模型路径
   const b = sm.base || {};
   const warnings = [];
   const env = {};
@@ -10729,19 +10795,25 @@ async function strataRemoteCmd(req, res) {
     await strataSshExec('taskkill /f /im strata.exe', 8000);
     await strataSshExec('taskkill /f /im strata-vision.exe', 8000);
     if (killed) await new Promise((res2) => setTimeout(res2, 2000));
-    const r = await strataSshExec('start "" /min ' + cfg.bat, 15000);
-    if (!r.ok) return reply(200, Object.assign({ action: act }, r));
-    // 自校验：start 分离执行 ssh 退出码 0 ≠ 真启动；等 5s 看 8080 是否已被重新占用（最硬的判据，
-    // 且不依赖进程叫什么名字），再看 python 系进程存在与否作次要佐证。
-    await new Promise((res2) => setTimeout(res2, 5000));
-    const occ2 = await strataSshExec('netstat -ano | findstr :8080 | findstr LISTENING', 10000);
-    const listening = occ2.ok && /:8080\s/.test(occ2.msg || '');
+    // 10-08 三次实锤（决定性）：bat 内层那句 start "StrataQ3" /min cmd /c "<带空格/>重定向的长 python 命令>"
+    // 经 ssh→cmd→cmd 三层引号剥壳后散架，start 返回 0 却没真撑起 python（这就是用户反复所见「bat 未触发」）。
+    // 直连跑 bat 里的 python 命令能起（health 256K 正常）证明脚本本身没问题，坏的是那层间接。
+    // 解法：用一次性计划任务在原生上下文里跑 bat（与 ssh 会话彻底解耦），bat 的内层 start 在原生 cmd 下正常，
+    // 实测进程树 python×2+strata.exe+strata-vision.exe 齐全、加载完成后 8080=256K。任务用完即删。
+    const TN = 'DSH_Strata_' + Date.now().toString(36);
+    const crt = await strataSshExec('schtasks /create /tn ' + TN + ' /tr "cmd /c ' + cfg.bat + '" /sc once /st 00:00 /f', 12000);
+    if (!crt.ok) return reply(200, { action: act, ok: false, msg: '创建一次性计划任务失败：' + (crt.msg || '') });
+    const run = await strataSshExec('schtasks /run /tn ' + TN, 12000);
+    await strataSshExec('schtasks /delete /tn ' + TN + ' /f', 10000); // 触发后即删（任务已入队执行，删定义不影响）
+    if (!run.ok) return reply(200, { action: act, ok: false, msg: '触发计划任务失败：' + (run.msg || '') });
+    // 自校验：schtasks 拉起后进程树应在数秒内出现（模型加载还要 2~6 分钟，此刻 8080 未必监听属正常，
+    // 故以「python/strata 进程是否出现」为准，不以端口为准）。
+    await new Promise((res2) => setTimeout(res2, 6000));
     const chk = await strataSshExec('tasklist /nh /fo csv', 10000);
-    const hasPy = chk.ok && /pythonw?\.(exe)/i.test(chk.msg || '');
-    const up = listening || hasPy;
-    return reply(200, { action: act, ok: true, msg: up
-      ? (killed ? '已停掉旧实例并启动 ' : '已启动 ') + cfg.bat + '（' + (listening ? '8080 已重新监听' : '已检测到 python 进程') + '，模型加载 2~6 分钟，页面会自动转绿）'
-      : '启动命令已发出，但 5 秒后既未见 8080 监听也无 python 进程——多半未生效（路径失效/日志被占用），可再点一次或看远端桌面窗口' });
+    const hasProc = chk.ok && /pythonw?\.exe|strata(\.exe|-vision\.exe)/i.test(chk.msg || '');
+    return reply(200, { action: act, ok: !!hasProc, msg: hasProc
+      ? (killed ? '已停掉旧实例并经计划任务启动 ' : '已通过计划任务启动 ') + cfg.bat + '（进程树已起，模型加载 2~6 分钟后 8080 自动可用）'
+      : '计划任务已触发，但 6 秒后未见 python/strata 进程——可能被杀软拦截或 bat 报错，请看远端桌面窗口/srv_256k.log' });
   }
   return reply(400, { ok: false, msg: 'action 必须是 wake | shutdown | startbat' });
 }
@@ -10859,6 +10931,252 @@ async function gpuCtlHandle(req, res, urlObj) {
   }
   return reply(404, { ok: false, msg: 'gpu-ctl: 未知路由' });
 }
+
+// ====== [gpu-hotshield 1009] GPU 高温自动关机守护 ======
+// 需求：任一张 GPU 温度 ≥ 阈值并持续一段时间 → 自动关闭当前电脑（控制台所在机）。
+// 设计：
+//  · 数据源复用 GPU 采样器 global.__gpuLive（1s 异步采样，09-20 铁律通道，不新增 nvidia-smi 压力）；
+//    比较口径 = max(核心温度 temp, 显存温度 temp_mem)——显存热点往往是真正的损伤源。
+//  · 双重防误触发：① 迟滞（降到 阈值-回差 以下才清空计时，抖动不反复重置）；
+//    ② 持续时间 holdSec 达标才行动；触发后先进入 graceSec 倒计时（页面大字告警 + 每秒刷新剩余秒数），
+//    倒计时内可在页面「取消关机」，也可随时降温自动取消；倒计时结束走 /usr/local/bin/gpu-ctl halt
+//    （root 提权脚本内 sync 落盘 + systemctl poweroff，异步 execFile + 自建定时器结算，10-07 铁律）。
+//  · 触发即停 vLLM/SGLang 推理实例（脚本化模型走各自 stop 脚本，其余 stopVllm 优雅停止，
+//    KV 池随之释放；整段限时 45s，超时直接进入关机，不因停服卡死耽误保护动作），再关机。
+//  · 配置热加载（mtime 判据，同 strata-remote.json 模式）：gpu-hotshield.json
+//    {enabled, thresholdC(40-105), holdSec(5-3600), graceSec(0-600), cooldownMin(0-1440)}
+//  · 状态落盘 gpu-hotshield-state.json（lastTriggeredTs/lastAction），重启后可追溯；日志 [hotshield] 前缀。
+//  · 安全底线：评估循环整体 try/catch，任何一步异常只记录不动作；GPU 数据缺失/过期（>15s）不参与判定
+//    （宁可不触发，绝不在盲态下关机）；cooldownMin 防"关机→开机→仍热→再关机"振荡。
+const HOTSHIELD_CONFIG_PATH = path.join(__dirname, 'gpu-hotshield.json');
+const HOTSHIELD_STATE_PATH = path.join(__dirname, 'gpu-hotshield-state.json');
+const HS_DEFAULTS = { enabled: false, thresholdC: 92, holdSec: 30, graceSec: 60, cooldownMin: 30 };
+let __hsCfg = Object.assign({ mtime: -1 }, HS_DEFAULTS);
+function hotShieldCfg() {
+  try {
+    const st = fs.statSync(HOTSHIELD_CONFIG_PATH);
+    if (st.mtimeMs !== __hsCfg.mtime) {
+      const j = JSON.parse(fs.readFileSync(HOTSHIELD_CONFIG_PATH, 'utf8'));
+      const clamp = (v, lo, hi, dft) => { const n = parseFloat(v); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : dft; };
+      __hsCfg = {
+        mtime: st.mtimeMs,
+        enabled: !!j.enabled,
+        thresholdC: clamp(j.thresholdC, 40, 105, HS_DEFAULTS.thresholdC),
+        holdSec: clamp(j.holdSec, 5, 3600, HS_DEFAULTS.holdSec),
+        graceSec: clamp(j.graceSec, 0, 600, HS_DEFAULTS.graceSec),
+        cooldownMin: clamp(j.cooldownMin, 0, 1440, HS_DEFAULTS.cooldownMin),
+      };
+    }
+  } catch (e) { /* 文件缺失/损坏：保持上一次值（首跑即缺省 disabled） */ }
+  return __hsCfg;
+}
+function hotShieldSaveCfg(patch) {
+  const cur = hotShieldCfg();
+  const next = Object.assign({}, HS_DEFAULTS, cur, patch, { mtime: -1 });
+  const out = { enabled: !!next.enabled, thresholdC: next.thresholdC, holdSec: next.holdSec, graceSec: next.graceSec, cooldownMin: next.cooldownMin };
+  fs.writeFileSync(HOTSHIELD_CONFIG_PATH, JSON.stringify(out, null, 2));
+  return hotShieldCfg(); // 立即重载（mtime 变了必然重读）
+}
+function hotShieldLoadState() {
+  try { return JSON.parse(fs.readFileSync(HOTSHIELD_STATE_PATH, 'utf8')) || {}; } catch (e) { return {}; }
+}
+function hotShieldSaveState(s) {
+  try { fs.writeFileSync(HOTSHIELD_STATE_PATH, JSON.stringify(s, null, 2)); } catch (e) {}
+}
+// 守护运行时状态（内存态，重启即清；lastTriggeredTs 从 state 文件恢复用于冷却判定）
+const __hs = {
+  aboveSince: 0, peakAbove: null, hottestIdx: null,
+  countdownEndsAt: 0, countdownPeak: null, cancelPending: false,
+  firing: false, firedOnce: false, lastLogAt: 0,
+};
+// 停服阶段的叫停闸门：关机倒计时进入尾声时 abort 掉仍在跑的停止脚本，优先保证 halt 按时发出
+const __hsAbort = (() => { try { return new AbortController(); } catch (e) { return { signal: undefined, abort() {} }; } })();
+function hsNowCooldownLeftMs() {
+  const cfg = hotShieldCfg();
+  const st = hotShieldLoadState();
+  const until = (st.lastActionTs || 0) + cfg.cooldownMin * 60000;
+  return Math.max(0, until - Date.now());
+}
+function hsEvaluate(frame, now) {
+  // frame = global.__gpuLive（{ts, gpus:[{index,temp,temp_mem,...}]}）
+  const cfg = hotShieldCfg();
+  if (!cfg.enabled) { __hs.aboveSince = 0; __hs.countdownEndsAt = 0; __hs.firedOnce = false; return; }
+  if (__hs.firing) return; // 正在执行停服+关机流程，不再重复判定
+  const gpus = (frame && Array.isArray(frame.gpus)) ? frame.gpus.filter((g) => g && g.index != null) : [];
+  const fresh = !!gpus.length && !!frame.ts && (now - frame.ts) < 15000;
+  let hottest = null, hottestIdx = null;
+  if (fresh) {
+    for (const g of gpus) {
+      const t = Math.max(g.temp == null ? -Infinity : g.temp, g.temp_mem == null ? -Infinity : g.temp_mem);
+      if (t === -Infinity) continue;
+      if (hottest == null || t > hottest) { hottest = t; hottestIdx = g.index; }
+    }
+  }
+  __hs.hottestIdx = hottestIdx;
+  __hs.peakAbove = hottest;
+  const cdLeft = hsNowCooldownLeftMs();
+  if (!fresh || hottest == null) {
+    // 数据缺失/过期：保守清空计时（宁可漏触发，不在盲态积累触发）
+    __hs.aboveSince = 0;
+    if (__hs.countdownEndsAt) { hsCancelCountdown('GPU 温度数据缺失或过期（守护转入盲态，取消倒计时）'); }
+    return;
+  }
+  if (hottest >= cfg.thresholdC) {
+    if (!__hs.aboveSince) __hs.aboveSince = now;
+  } else if (hottest <= cfg.thresholdC - 2) {
+    __hs.aboveSince = 0; // 迟滞：降回阈值-2°C 才算脱离高温
+    if (__hs.countdownEndsAt) hsCancelCountdown('温度已回落至 ' + Math.round(hottest) + '°C（低于阈值 ' + cfg.thresholdC + '°C），自动取消');
+    __hs.firedOnce = false;
+  }
+  if (cdLeft > 0) return; // 冷却期内不再武装（防关机-开机振荡）
+  const heldMs = __hs.aboveSince ? now - __hs.aboveSince : 0;
+  if (!__hs.countdownEndsAt && !__hs.firedOnce && heldMs >= cfg.holdSec * 1000) {
+    hsStartCountdown(cfg, hottest, hottestIdx, now);
+  }
+  if (__hs.countdownEndsAt && now >= __hs.countdownEndsAt) hsFire(now);
+}
+function hsStartCountdown(cfg, hottest, idx, now) {
+  if (cfg.graceSec <= 0) { hsFire(now); return; }
+  __hs.countdownEndsAt = now + cfg.graceSec * 1000;
+  __hs.countdownPeak = hottest;
+  console.warn('[hotshield] ⚠ GPU' + idx + ' 温度 ' + Math.round(hottest) + '°C ≥ 阈值 ' + cfg.thresholdC + '°C 持续 ' + Math.round(cfg.holdSec) + 's，' + cfg.graceSec + 's 后自动关机（可在页面取消）');
+  hotShieldPushEvent('warn', 'GPU' + idx + ' 已达 ' + Math.round(hottest) + '°C（阈值 ' + cfg.thresholdC + '°C），' + cfg.graceSec + ' 秒后自动关机——请立即保存工作或点击「取消关机」');
+}
+function hsCancelCountdown(reason) {
+  console.log('[hotshield] ✔ 已取消自动关机：' + reason);
+  __hs.countdownEndsAt = 0;
+  hotShieldPushEvent('info', '自动关机已取消：' + reason);
+}
+function hotShieldPushEvent(level, msg) {
+  const st = hotShieldLoadState();
+  const ev = { ts: Date.now(), level, msg: String(msg).slice(0, 300) };
+  const hist = Array.isArray(st.events) ? st.events : [];
+  hist.push(ev);
+  while (hist.length > 50) hist.shift();
+  st.events = hist;
+  hotShieldSaveState(st);
+}
+async function hsFire(now) {
+  if (__hs.firing) return;
+  __hs.firing = true;
+  __hs.countdownEndsAt = 0;
+  __hs.firedOnce = true;
+  const st0 = hotShieldLoadState();
+  st0.lastTriggeredTs = now;
+  hotShieldSaveState(st0);
+  const cfg = hotShieldCfg();
+  console.error('[hotshield] 🔥 触发高温保护：停止推理实例并关机（阈值 ' + cfg.thresholdC + '°C）');
+  hotShieldPushEvent('fire', '高温保护触发：正在停止 vLLM/SGLang 实例并执行关机');
+  // ① 尽力停服（限时 45s 总预算：高温场景下时间就是损失，超时直接关机）
+  try {
+    const stopAll = (async () => {
+      const seen = new Set();
+      const ports = [];
+      for (const [, inst] of (global.__GPU_INSTANCES instanceof Map ? global.__GPU_INSTANCES : [])) {
+        if (inst && inst.port != null && !seen.has(inst.port)) { seen.add(inst.port); ports.push({ port: inst.port, runtime: inst.runtime || 'vllm' }); }
+      }
+      for (const p of [...(global.__vllmModelPorts instanceof Set ? global.__vllmModelPorts : []), ...(global.__sglangModelPorts instanceof Set ? global.__sglangModelPorts : [])]) {
+        if (p != null && !seen.has(p)) { seen.add(p); ports.push({ port: p, runtime: 'vllm' }); }
+      }
+      for (const { port, runtime } of ports) {
+        try {
+          const smStop = scriptModelForPort(port);
+          if (smStop) {
+            // 脚本化模型（chroot root 引擎）：只能走宿主停止脚本；abort signal 尽力中途叫停
+            const stopPath = resolveStopScript(smStop);
+            if (stopPath && fs.existsSync(stopPath)) {
+              await execFileAsync('bash', [stopPath, String(smStop.port)], { encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024, signal: __hsAbort.signal }).catch(() => {});
+            }
+          } else {
+            await new Promise((resolve) => {
+              let done = false;
+              const fin = () => { if (!done) { done = true; resolve(); } };
+              try { stopVllm(fin, port); } catch (e) { fin(); }
+              setTimeout(fin, 20000).unref();
+            });
+          }
+          try { global.__GPU_INSTANCES && global.__GPU_INSTANCES.delete(port); } catch (e) {}
+          console.warn('[hotshield] 停服完成：端口 ' + port);
+        } catch (e) { console.warn('[hotshield] 停服端口 ' + port + ' 异常（不阻断关机）：' + String((e && e.message) || e)); }
+      }
+    })();
+    const budget = new Promise((resolve) => setTimeout(resolve, 45000).unref());
+    await Promise.race([stopAll, budget]);
+  } catch (e) { console.warn('[hotshield] 停服阶段异常（不阻断关机）：' + String((e && e.message) || e)); }
+  // ② 关机：走 gpu-ctl halt（root：sync 落盘 + systemctl poweroff）
+  const r = await gpuCtlRun(['halt'], 15000);
+  console.error('[hotshield] 关机指令结果：' + (r.ok ? '已下发' : '失败—' + String(r.output).slice(0, 200)));
+  hotShieldPushEvent(r.ok ? 'fire' : 'error', r.ok ? '关机指令已下发（sync + systemctl poweroff）' : '关机指令失败：' + String(r.output).slice(0, 200));
+  const st1 = hotShieldLoadState();
+  st1.lastActionTs = Date.now();
+  st1.lastAction = r.ok ? 'poweroff' : 'failed';
+  hotShieldSaveState(st1);
+  __hs.firing = false;
+  __hs.aboveSince = 0;
+}
+// 评估循环：1s 一拍（与 __gpuLive 采样同频）；关机倒计时进行中额外把剩余秒数广播给 GET 状态端点
+function hotShieldTick() {
+  try { hsEvaluate(global.__gpuLive || null, Date.now()); } catch (e) { console.warn('[hotshield] 评估异常（忽略本拍）：' + String((e && e.message) || e)); }
+}
+if (!global.__hotShieldTimer) {
+  global.__hotShieldTimer = setInterval(hotShieldTick, 1000);
+  if (global.__hotShieldTimer.unref) global.__hotShieldTimer.unref();
+}
+function hotShieldStatus() {
+  const cfg = hotShieldCfg();
+  const now = Date.now();
+  const armed = !!(cfg.enabled && !hsNowCooldownLeftMs());
+  return {
+    ok: true,
+    config: { enabled: cfg.enabled, thresholdC: cfg.thresholdC, holdSec: cfg.holdSec, graceSec: cfg.graceSec, cooldownMin: cfg.cooldownMin },
+    state: {
+      armed,
+      cooling_down: hsNowCooldownLeftMs() > 0,
+      cooldown_left_s: Math.ceil(hsNowCooldownLeftMs() / 1000),
+      holding_s: __hs.aboveSince ? Math.floor((now - __hs.aboveSince) / 1000) : 0,
+      peak_above: __hs.peakAbove,
+      hottest_idx: __hs.hottestIdx,
+      counting_down: !!__hs.countdownEndsAt,
+      seconds_left: __hs.countdownEndsAt ? Math.max(0, Math.ceil((__hs.countdownEndsAt - now) / 1000)) : 0,
+      firing: __hs.firing,
+      live_age_s: (global.__gpuLive && global.__gpuLive.ts) ? Math.round((now - global.__gpuLive.ts) / 1000) : null,
+      last_triggered_ts: hotShieldLoadState().lastTriggeredTs || null,
+      events: (hotShieldLoadState().events || []).slice(-10).reverse(),
+    },
+  };
+}
+async function hotShieldCmd(req, res) {
+  const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  const body = await cpuCtlReadBody(req);
+  if (!body) return reply(400, { ok: false, msg: '请求体不是合法 JSON' });
+  const act = String(body.action || '');
+  if (act === 'cancel') {
+    if (__hs.countdownEndsAt) hsCancelCountdown('用户在页面手动取消（关机前 ' + Math.max(0, Math.ceil((__hs.countdownEndsAt - Date.now()) / 1000)) + ' 秒）');
+    else hotShieldPushEvent('info', '收到取消请求（当前并无进行中的倒计时）');
+    return reply(200, Object.assign({ action: act, ok: true, msg: __hs.countdownEndsAt ? '已取消' : '当前没有进行中的关机倒计时' }, { state: hotShieldStatus().state }));
+  }
+  if (act === 'save') {
+    const patch = {};
+    if (body.enabled != null) patch.enabled = !!body.enabled;
+    if (body.thresholdC != null) { const v = parseFloat(body.thresholdC); if (!(v >= 40 && v <= 105)) return reply(400, { ok: false, msg: 'thresholdC 需在 40~105 之间' }); patch.thresholdC = v; }
+    if (body.holdSec != null) { const v = parseInt(body.holdSec, 10); if (!(v >= 5 && v <= 3600)) return reply(400, { ok: false, msg: 'holdSec 需在 5~3600 之间' }); patch.holdSec = v; }
+    if (body.graceSec != null) { const v = parseInt(body.graceSec, 10); if (!(v >= 0 && v <= 600)) return reply(400, { ok: false, msg: 'graceSec 需在 0~600 之间' }); patch.graceSec = v; }
+    if (body.cooldownMin != null) { const v = parseInt(body.cooldownMin, 10); if (!(v >= 0 && v <= 1440)) return reply(400, { ok: false, msg: 'cooldownMin 需在 0~1440 之间' }); patch.cooldownMin = v; }
+    hotShieldSaveCfg(patch);
+    // 关闭开关时同步清空运行时计时，避免"关了开关还剩个倒计时"
+    if (patch.enabled === false) { __hs.aboveSince = 0; __hs.countdownEndsAt = 0; __hs.firedOnce = false; }
+    console.log('[hotshield] 配置已更新：' + JSON.stringify(hotShieldCfg()).replace(/"mtime":-?\d+,/, ''));
+    return reply(200, Object.assign({ action: act, ok: true, msg: '设置已保存并即时生效' }, hotShieldStatus()));
+  }
+  return reply(400, { ok: false, msg: 'action 必须是 save | cancel' });
+}
+function hotShieldHandle(req, res, urlObj) {
+  const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  const sub = urlObj.pathname.slice('/v1/internal/hotshield'.length);
+  if (req.method === 'POST' && sub === '/cmd') return hotShieldCmd(req, res);
+  return reply(200, hotShieldStatus());
+}
+// ==== [gpu-hotshield 1009] END module ====
 
 const server = http.createServer(async (req, res) => {
 
@@ -11263,7 +11581,7 @@ const server = http.createServer(async (req, res) => {
                   : (sm1.note || ''),
                 engine: onSgStack ? 'sglang' : 'vllm',
                 running: smRunning,
-                defaults: scriptModelDefaults(sm1),
+                defaults: scriptModelDefaults(scriptModelVariantResolve(sm1, { modelName: m.name })),  // [model-variant-1008] 弹窗默认值跟随卡片实际目录
                 schemes: flashNextSchemes(),
                 script_note_extra: siblingNote || null,
               });
@@ -12237,7 +12555,7 @@ const server = http.createServer(async (req, res) => {
         if (!sm) { done({ success: false, error: '未注册的脚本化模型：' + preset.modelName }); return; }
         const inst0 = scriptModelInstance(sm);
         if (inst0) { done({ success: false, alreadyRunning: true, error: `已在运行（端口 ${inst0.port}，PID ${inst0.pid}）` }); return; }
-        const plan = scriptPlanFor(sm, preset.params || {}); // [sglang-adapt-1003] sglang 栈在位时下发 SG_*
+        const plan = scriptPlanFor(sm, Object.assign({ modelName: preset.modelName }, preset.params || {})); // [sglang-adapt-1003] + [model-variant-1008] 预设 modelName 参与变体识别
         const startScript = resolveStartScript(sm);
         // INNER 只对旧栈 wrapper 有意义；新栈 wrapper 的 INNER 缺省即自家 inner
         const envPrefix = (startScript === sm.script && sm.inner) ? `INNER=${sm.inner} ` : '';
@@ -12248,8 +12566,9 @@ const server = http.createServer(async (req, res) => {
         // 但本次 plan 未写到的 SG_* 若残留在文件里仍会被 source 出上次的值 → 必须先清）。
         const envFile = preset.envFile || (sm.scriptSglang && startScript === sm.scriptSglang
                         ? path.join(path.dirname(sm.scriptSglang), 'launch.env')
+                        : (startScript.match(/0310/) ? '/home/ll/deploy/vllm-0310/launch.env'  // [model-variant-1008] 0310 栈 envFile 此前算错→清错文件
                         : (startScript.match(/0300/) ? '/home/ll/deploy/vllm-0300/launch.env'
-                        : ((sm.script || '').match(/w4a16/) ? '/home/ll/deploy/flash-next-launch-w4a16.env' : '')));
+                        : ((sm.script || '').match(/w4a16/) ? '/home/ll/deploy/flash-next-launch-w4a16.env' : ''))));
         if (envFile) { try { fs.writeFileSync(envFile, ''); } catch (e) {} }
         const child = require('child_process').spawn('bash', ['-c', `${envPrefix}setsid bash ${startScript} >> ${scriptLaunchLog(sm)} 2>&1 < /dev/null & echo $!`], {
           detached: true,
@@ -13378,6 +13697,13 @@ const server = http.createServer(async (req, res) => {
   //   pl 成功后同步改写 gpu-power-limit.service 的 drop-in（09-26 铁律：不改 PL 重启必被打回）。
   if (pathname === '/v1/internal/gpu-ctl' || pathname.startsWith('/v1/internal/gpu-ctl/')) {
     return gpuCtlHandle(req, res, urlObj).catch((e) => {
+      try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}
+    });
+  }
+
+  // === GPU 高温自动关机守护 API（[gpu-hotshield 1009]：GET 状态 / POST cmd {action:save|cancel}）===
+  if (pathname === '/v1/internal/hotshield' || pathname.startsWith('/v1/internal/hotshield/')) {
+    return Promise.resolve(hotShieldHandle(req, res, urlObj)).catch((e) => {
       try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}
     });
   }

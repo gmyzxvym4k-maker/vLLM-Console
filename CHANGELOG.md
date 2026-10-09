@@ -2,6 +2,18 @@
 
 本文件记录对外发布的版本变更。版本号遵循语义化版本，标签形如 `v1.0.0`。
 
+---
+
+## Unreleased — 2026-10-09 GPU 高温自动关机守护（页面戳 20261009-r21）
+
+新功能：任一张 GPU 的核心/显存温度 ≥ 阈值并持续一段时间后，控制台**自动停止全部推理实例并关闭本机**（防散热失效烧卡）。
+
+- **后端 `[gpu-hotshield 1009]` 模块**（server.js）：判定复用 GPU 采样器 `global.__gpuLive`（1s 异步通道，09-20 铁律，不新增 nvidia-smi 压力），口径 = 各卡 max(核心温度, 显存温度)。防误触发三重：迟滞（回落到 阈值−2°C 才清计时）、`holdSec` 持续达标才行动、`graceSec` 关机倒计时（降温/数据盲态>15s 自动取消，可手动取消）；`cooldownMin` 防「关机→开机→仍热→再关机」振荡。触发流程 = 先优雅停 vLLM/SGLang 实例（脚本化模型走各自 stop 脚本、其余走 stopVllm，整段限时 45s 超时直达关机）→ `gpu-ctl halt`。
+- **API**：`GET /v1/internal/hotshield`（配置+实时状态+事件历史，1s 轮询）、`POST .../cmd` `{action:save|cancel}`（参数钳位 40~105°C / 5~3600s / 0~600s / 0~1440min）。配置 `gpu-hotshield.json` mtime 热加载、缺省 **enabled=false**；状态与最近 50 条事件落 `gpu-hotshield-state.json`。
+- **提权链扩展**：`gpu-ctl` 新增 `halt` 子命令（root：写 /run 关机原因 → sync 限时 8s → systemctl poweroff；刻意不走 nvidia-smi 通道，驱动 D 状态时仍可执行），sudoers 白名单（固定路径全参数）天然覆盖，无需改装。
+- **前端**（硬件监视页「GPU 高温自动关机守护」卡）：开关（带确认弹窗防误触）、四项参数编辑、状态瓦片（运行中/持续计时/倒计时/冷却中/正在关机五态）、触发历史列表；**倒计时全屏红色脉冲横幅在任何标签页顶部可见**（1s 刷秒数 + 取消按钮），并有跨标签 BroadcastChannel alert 兜底提醒。
+- **验证**：node 逻辑仿真 12 场景（触发/迟滞/降温取消/盲态取消/冷却/grace=0 直达关机）+ 前端 mock 仿真 7 场景（横幅生命周期/事件历史 XSS 转义/空字段不崩）+ tests/unit 39 项、tests/pages 14 场景全过；线上冒烟 save/非法参数/cancel 三路径 + 页面版本戳 r21。
+- 线上回滚：`/home/ll/deploy/{server.js,index.html}.bak-hotshield-1009-2143`、`/usr/local/bin/gpu-ctl.bak-hotshield-1009`。
 
 ---
 

@@ -4,6 +4,22 @@
 
 ---
 
+---
+
+## Unreleased — 2026-10-10 崩溃记录标签（页面戳 20261010-r22）
+
+新功能：控制台新增「崩溃记录」标签，记录 **vLLM/SGLang 引擎每次崩溃的时间与根因**（含证据原文），并回填上线前的历史崩溃。
+
+- **架构（零中断设计）**：不改 server.js、**不重启 dsh-console**（vLLM 在其 cgroup 内，重启连坐引擎）。新增独立守护进程 `crash-watch.mjs`（systemd --user `fnx-crash-watch.service`，ll 身份，Nice=10），把记录写成 `static/crash-records.json`（/static/ 路由每请求读盘），前端独立页 `static/crash.html` 走「iframe 懒加载」接入（口径同 bench/cpu 标签）。
+- **检测四路**：① model-manager 实例快照连续两轮缺席 + `/proc/<pid>` 校验 = 进程消失；② 看门狗日志 `fnx-*-watchdog.log`「确认离线」行（18420 最权威的精确时间戳）；③ dmesg OOM Killer / NVRM Xid（±6min 窗口归因）；④ 同端口 pid 突变（重启太快 API 不断档的补漏）。**抑制误报**：server.log 启停事件增量解析——人工停止（script-model/quickstart/pd-stop/hotshield）600s 内、控制台重启连坐 300s 内的离线不记崩溃；API 不可达时保留快照不判缺席。
+- **根因签名**（11 类，specific 优先）：CUDA OOM / 非法内存访问 / NCCL 超时 / 段错误 / 断言失败 / 磁盘满 / CUDA 驱动 / EngineDead / Worker 死亡 / Python 异常 / 终止信号；日志选取沿用 10-05 判据（祖先链 cmdline 的 .log token，root 进程 cmdline 全局可读）；时间戳自 vLLM 行内 `MM-DD HH:MM:SS` 解析、跨年回退。看门狗「拉起/安全模式」行给记录附「已自动恢复/已降级拉起」备注。
+- **历史回填**（首跑一次）：全量扫 `fnx-*-watchdog.log` + `vllm*.log`（≤300MB 流式，SIGNAL_TERM 不建事件防吞真因）+ dmesg，同端口 ±3min 归并、根因按具体度择优、ts 取更早者（崩溃时刻先于离线确认时刻）。
+- **前端**（crash.html）：KPI 四卡（总次数/近7天/最近一次/最高频根因）、端口/原因/来源筛选 + 全文搜索、证据原文折叠、徽章按根因上色；遵守 09-23/09-25/10-03 铁律（自建 AbortController 超时、失败保留上一帧不清屏、轮询链 safeRun、回前台补帧）。
+- **验证**：本地用线上真实日志（watchdog 116KB + vllm 日志尾部样本）重放回填——10-10 18:35 那次真实崩溃正确归因 ILLEGAL_MEM(port=18420) 并与看门狗离线合并附拉起备注；渲染仿真 84 条无异常；上线前后内联 JS node --check 全过。
+- 新增文件：`crash-watch.mjs`、`crash.html`（部署为 `static/crash.html`）、`systemd/fnx-crash-watch.service`。
+
+---
+
 ## Unreleased — 2026-10-09 GPU 高温自动关机守护（页面戳 20261009-r21）
 
 新功能：任一张 GPU 的核心/显存温度 ≥ 阈值并持续一段时间后，控制台**自动停止全部推理实例并关闭本机**（防散热失效烧卡）。

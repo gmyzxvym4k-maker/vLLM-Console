@@ -14,6 +14,8 @@ server-error.log.*
 *-state.json
 metrics-snapshot.json
 log-clear-state.json
+crash-records.json
+crash-watch-state.json
 bench-results/
 request-traces.jsonl
 vllm-live-prefill.jsonl

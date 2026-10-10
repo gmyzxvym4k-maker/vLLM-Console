@@ -6,6 +6,21 @@
 
 ---
 
+---
+
+## Unreleased — 2026-10-11 二级缓存 160G 崩溃根因修复（rt-patch #14，引擎已带补丁运行）
+
+「修复崩溃 bug」深挖闭环：六崩根因**不是** CPU 池越界（#13 握手 clamp 在位，4194→3355 生效），而是官方 vLLM 0.31 `SimpleCPUOffloadConnector` 的 **load 路径缺 compute-done 跨流屏障**——请求结束释放的 GPU 块立即复用给异步 CPU→GPU load 时，compute stream 上先前排队的 kernel（MTP 投机步）仍在读该块，DMA 写与计算读并发 → 索引/元数据行读出一半垃圾 → 后续 kernel 越界（Xid 13 illegal memory access，恒由最后一个 PP stage 报出）。上游同案实锤：issue #59768（Qwen3.8-Flash-Next 同栈同签名）、#47282，修复 PR #47324/#60078 **均未合并**——升级 release 无效，必须运行时补丁。
+
+- **rt-patch #14**（`vllm-0310/patches-extra/dsh_simple_offload_rt.py`）：钩 `SimpleCPUOffloadWorker.start_load_kv`——提交 load 前在 compute stream record **专用** event（独立于 store 的 `_store_compute_done`，防两提交点互相 re-record 漂移），经 `launch_copy(wait_event=…)` 交给 DMA 后台线程（`stream.wait_event` 机制现成，与 store 路径对称）。开关 `DSH_SIMPLE_WAR_SYNC=0`。验证三连：生产 venv 真实类 `__dict__`+`inspect.getsourcefile` 归属断言 / 假 torch 语义仿真（wait_event 传入+record 时序）/ 引擎启动日志四 worker 全挂线 + clamp 4194→3355 复现。
+- **量化佐证**：PP2 每块 16.27MiB vs PP0/1 13.02MiB（MTP draft KV 在末 stage）——池不一致方向差 25%，clamp 后仍崩 → 排除池越界路径，锁 WAR 竞态。
+- **恢复 160G 生产定版**：launch.env `FN_SIMPLE_OFFLOAD=160` + quickstart standard 档回 `kvoff=simple/160`（关缓存档降为 A/B 对照）。watchdog 崩溃计数已清零，自愈首拉即带档。
+- **crash-watch 防误报增强**：CLEAN_STOP 特征补 `Waiting for application shutdown / Shutting down / engine client stopped`（手工 stop 优雅停机的尾行曾被记成 PY_FATAL/ENGINE_DEAD 假崩溃）；CLEAN_STOP 判定任何来源一律不入库。
+- **运维新坑（本次自触发实锤）**：①`start-flash-next-0310.sh` **裸调**（调用方 shell 无 FN_*）会把 launch.env **重写为空**（复读链清零，inner 落内置缺省）——手工带档启动必须先 `set -a; . launch.env; set +a`；②watchdog 安全模式剥档经 wrapper 落盘会把降级**持久化**（00:12 那次 160→无档就是这么来的）；③重启链上 `python /tmp/x.py` 的 sys.path[0]=/tmp，验证补丁文件务必先部署到 patches-extra 再跑。
+- 上线时序：00:25 引擎带 #14+160G 重启就绪（init 26.7s，health 200，冒烟推理正常）；观察判据 = 崩溃记录页零新增 ILLEGAL_MEM + `kv_offload_ports` 有值。
+
+---
+
 ## Unreleased — 2026-10-10 崩溃记录标签（页面戳 20261010-r22）
 
 新功能：控制台新增「崩溃记录」标签，记录 **vLLM/SGLang 引擎每次崩溃的时间与根因**（含证据原文），并回填上线前的历史崩溃。

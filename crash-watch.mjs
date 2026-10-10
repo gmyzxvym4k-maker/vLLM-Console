@@ -58,7 +58,7 @@ const SIGS = [
   { code: 'SIGNAL_TERM',  label: '进程收到终止信号退出（外部 kill / 系统 OOM / 关机）', re: /received signal (?:SIGTERM|SIGINT|SIGQUIT|SIGHUP|SIGKILL)|Signal \d+ received|terminated with signal|killed with signal/i, specific: false },
 ];
 // 干净停机特征（回填时用于把「人为停止」从崩溃里剔除）
-const CLEAN_STOP = /Shutdown complete|SIGTERM signal received|Received signal SIGTERM|Received signal SIGINT|Runtime cleanup successful|优雅停止|cleanly/i;
+const CLEAN_STOP = /Shutdown complete|Waiting for application shutdown|Shutting down|SIGTERM signal received|Received signal SIGTERM|Received signal SIGINT|Runtime cleanup successful|engine client stopped|优雅停止|cleanly/i;
 
 // ---------- 小工具 ----------
 function selflog(msg) {
@@ -303,8 +303,8 @@ async function recordCrash({ port, model, runtime, tsEpoch, tsExact, source, pid
   if (logFile) {
     const rows = await tailEvents(logFile);
     const a = analyzeCause(rows, tsEpoch);
-    if (a.causeCode !== 'CLEAN_STOP') cause = a;
-    else if (source === 'backfill') return; // 回填里干净停机不入库
+    if (a.causeCode === 'CLEAN_STOP') { selflog(`抑制停机误报: port=${port} ${fmtTs(tsEpoch)}（日志尾部为优雅停机特征，非崩溃）`); return; }
+    cause = a;
   }
   // 硬件/OOM 侧证据优先补充
   const hw = await dmesgContext(tsEpoch);

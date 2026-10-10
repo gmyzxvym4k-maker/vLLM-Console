@@ -6,9 +6,9 @@
   "presets": [
    {
     "key": "w8a8-pp3-1m-mtp4",
-    "name": "Channel-INT8-w8a8 · 1M · PP3 · MTP4 · PLE-INT8盘 〔关二级缓存·修崩溃〕",
+    "name": "Channel-INT8-w8a8 · 1M · PP3 · MTP4 · 〔对照档·关二级缓存，仅供 A/B〕",
     "engine": "script",
-    "standard": true,
+    "standard": false,
     "port": 18420,
     "modelName": "Qwen3.8-Flash-Next-Channel-INT8-w8a8",
     "log": "/home/ll/deploy/vllm-flash-next-0310.log",
@@ -37,14 +37,13 @@
      "asyncScheduling": "1",
      "runtime": "vllm",
      "kvoffGiB": "160"
-    },
-    "note": "10-10 固化：官方 vLLM 0.31 SimpleCPUOffloadConnector 在「长上下文 decode + 请求结束块释放」时存在异步拷贝竞态（六次崩溃 dump 实锤，见控制台崩溃记录标签），关闭二级缓存换取稳定；看门狗 23:35 起同档已稳定验证。"
+    }
    },
    {
     "key": "w8a8-pp3-1m-mtp4",
-    "name": "Channel-INT8-w8a8 · 1M · PP3 · MTP4 · PLE-INT8盘 · 二级缓存160G〔二级缓存开·会触发官方KV offload竞态崩溃，仅取证用〕",
+    "name": "Channel-INT8-w8a8 · 1M · PP3 · MTP4 · PLE-INT8盘 · 二级缓存160G〔#14已修·生产定版〕",
     "engine": "script",
-    "standard": false,
+    "standard": true,
     "port": 18420,
     "modelName": "Qwen3.8-Flash-Next-Channel-INT8-w8a8",
     "log": "/home/ll/deploy/vllm-flash-next-0310.log",
@@ -73,7 +72,8 @@
      "asyncScheduling": "1",
      "runtime": "vllm",
      "kvoffGiB": "160"
-    }
+    },
+    "note": "10-11 定版：官方 vLLM 0.31 SimpleCPUOffload load 路径缺 compute-done 跨流屏障（上游 #60078/#47324 未合并）导致 CUDA illegal memory access，已由 rt-patch #14（dsh_simple_offload_rt.py）在引擎侧修复；#13 握手 clamp 同步在位（PP2 16.27MiB/块 > PP0/1 13.02MiB/块，CPU 池钳 3355）。"
    }
   ]
  },

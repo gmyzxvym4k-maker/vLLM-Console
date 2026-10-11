@@ -2114,7 +2114,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20261010-r22'; // r22 = 10-10 新增「崩溃记录」标签：独立页 /crash.html 展示引擎崩溃时间+根因+证据原文（筛选/搜索/KPI），数据源 = 独立守护进程 crash-watch.mjs（systemd --user fnx-crash-watch.service，不占控制台事件循环、不重启控制台）：model-manager 实例快照两轮缺席+/proc 校验=进程消失、看门狗「确认离线」精确时间戳、server.log 启停事件抑制人工停止/控制台重启连坐、日志尾部签名定根因（EngineDead/CUDA OOM/非法内存/NCCL/断言/段错误/磁盘满…）+ dmesg OOM/Xid 补充，首跑回填历史崩溃（watchdog 日志+vllm 日志+dmesg），产出 static/crash-records.json // r21 = 10-09 硬件监视页新增「GPU 高温自动关机守护」卡（[gpu-hotshield 1009]）：任一张 GPU max(核心,显存)温度 ≥ 阈值且持续 holdSec 秒 → 先优雅停全部 vLLM/SGLang 实例（限时 45s）→ gpu-ctl halt（root：sync + systemctl poweroff）关闭本机；graceSec 倒计时全屏红幅（任意标签可见+跨标签 alert 提醒）可手动取消，降温自动取消，数据盲态（>15s 无 GPU 采样）不判定并撤销倒计时，cooldownMin 防关机-开机振荡；配置 gpu-hotshield.json 热加载、POST /v1/internal/hotshield/cmd {save|cancel}、状态 1s 轮询、事件历史落 gpu-hotshield-state.json。 // r20 = 10-08 新增「Strata 监控」标签：克隆 Strata Web UI Monitor 页（http://192.168.1.38:8080/#monitor）——内嵌 /strata-monitor.html（模型状态/八指标卡带 sparkline/上下文仪表/逐请求表/会话缓存/MCP），后端 [strata-remote-monitor] 模块代理远端 /metrics+/health+/mcp（800ms TTL+单飞+AbortController 超时；目标地址 strata-remote.json 热加载，缺省 .38:8080；浏览器直连远端会被 CORS 拦，必须走代理）。 // r19 = 10-07 「最近完成请求」表新增 二级缓存命中 列（在 缓存命中 右侧）：数据是逐请求真值，非估算——vLLM 侧由 rt-patch #12（dsh_extcache_rt）在 Request.take_prefill_stats 摘取官方 PrefillStats 的一瞬记下 num_external_cached_tokens/num_local_cached_tokens 分项，请求完成时落盘 vllm-ext-cache.jsonl，后端按 rid join（含 -8hex 内部后缀）；SGLang 侧直接映射官方 exporter 的 cached_tokens_storage_backend/cached_tokens_local。无该项数据时如实显示 --（绝不用「缓存命中」总数冒充），并在表尾给一句原因说明；组头聚合并列显示 二级缓存命中率＝Σ二级命中/Σprompt。新列生效需引擎带补丁重启（控制台重启不影响）。 // r18 = 10-06 仪表盘曲线提速平滑 + 停刷防御：① PD 动态图轮询 1s→500ms、序列 EMA(α=0.3) 平滑、折线改 Catmull-Rom 贝塞尔、当前值读数用平滑值（曲线跟进更快、无逐秒锯齿）；② 并发卡（500ms 独立轮询）成功渲染即盖 _lastRenderAt——原实现只在主链整轮结束后盖章，后端毛刺期（stats 实测 p95≈1.9s、峰值 4s）主链一轮拖十几秒时看门狗误判正常不自愈，现并发卡心跳成为独立渲染推进信号；③ 后端 stats 加 350ms 结果缓存（同窗口多消费者只算一次）。 //  r17 = 10-06 并发实时测速稀释修复：v3TouchRow 活跃期全程均值分母钉在 min(now, 最后产出/新行)（停增/暂离期不发稀释值，截图 g=8·34s·0.2 形态根治）；v3goneAt 冻结滞留窗 15s→5s；bindRow 复活清 stale goneAt 锚；active_requests.elapsed_s 同源钉锚。 // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r16 = 10-05 修复 vLLM 运行日志空白：祖先链 argv 判据对「重定向在 wrapper shell 内部」的现行启动链失明（引擎属 root 读不到其 fd），新增祖先链 fd1/fd2 指向 .log + 内容校验判据 ancestorFdLogFile，接入选日志两条链（pickLogFromProcs ⓪ / pickScriptModelLogFile ①″）；端点透传 fallback、前端红条明示兜底 vllm.log；页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r15 = EPYC 板两处口径修复：① 封装温度——该机 /sys/class/thermal 为空、k10temp 只挂 hwmon，采样器加 hwmon 回落（Tctl/Package 优先、避开逐 CCD 的 Tccd 分量）；② CPU 缓存——后端从只读 cpu0 改为全核扫共享域聚合并行输出（7F52 的 16 个 16MB L3 域合计 256MB 如实呈现，前端加「N域×slice」标注）；r14 = 10-05 换装适配（AMD EPYC 7F52 16C/32T + H12D-8D + 3×CMP 170HX + 32GB 内存）：主端口自愈三层防御（6s 定时兜底重探 / ticker busy>15s 强制放行 / stats 空数据触发纠偏——换装开机时序竞态会令主端口永久粘滞缺省 8000、仪表盘整页假 {}）；cpu-ctl v3 跨平台化（睿频通道 intel_pstate/no_turbo⇄cpufreq/boost 自适应、温度 coretemp⇄k10temp 回落、platform 串运行时生成）；SCRIPT_MODELS.base 换 32GB 账（pp:3、kvoff:0、PLE INT8+disk）；新 standard 预设 current-pp3-1m-mtp4-int8disk-32g；双卡文案改卡数自适应；r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20261012-r23'; // r23 = 10-12 并发请求卡行位固定（[conc-slot-pin 1012]）：后端 rt.live 行序因 gauge 滞后 retire + 身份 parked 按 rid 复活而整段轮换（实测 4 行每拍对调位置），前端新增 __concSlotOrder 按行身份（taskId||id）首现排位、新行追加末尾、缺席 15s 释放槽位，行位置不再动态排序；live token 流在重排前按后端原始顺序 zip 绑定（r.__lv），预览不串行 // r22 = 10-10 新增「崩溃记录」标签：独立页 /crash.html 展示引擎崩溃时间+根因+证据原文（筛选/搜索/KPI），数据源 = 独立守护进程 crash-watch.mjs（systemd --user fnx-crash-watch.service，不占控制台事件循环、不重启控制台）：model-manager 实例快照两轮缺席+/proc 校验=进程消失、看门狗「确认离线」精确时间戳、server.log 启停事件抑制人工停止/控制台重启连坐、日志尾部签名定根因（EngineDead/CUDA OOM/非法内存/NCCL/断言/段错误/磁盘满…）+ dmesg OOM/Xid 补充，首跑回填历史崩溃（watchdog 日志+vllm 日志+dmesg），产出 static/crash-records.json // r21 = 10-09 硬件监视页新增「GPU 高温自动关机守护」卡（[gpu-hotshield 1009]）：任一张 GPU max(核心,显存)温度 ≥ 阈值且持续 holdSec 秒 → 先优雅停全部 vLLM/SGLang 实例（限时 45s）→ gpu-ctl halt（root：sync + systemctl poweroff）关闭本机；graceSec 倒计时全屏红幅（任意标签可见+跨标签 alert 提醒）可手动取消，降温自动取消，数据盲态（>15s 无 GPU 采样）不判定并撤销倒计时，cooldownMin 防关机-开机振荡；配置 gpu-hotshield.json 热加载、POST /v1/internal/hotshield/cmd {save|cancel}、状态 1s 轮询、事件历史落 gpu-hotshield-state.json。 // r20 = 10-08 新增「Strata 监控」标签：克隆 Strata Web UI Monitor 页（http://192.168.1.38:8080/#monitor）——内嵌 /strata-monitor.html（模型状态/八指标卡带 sparkline/上下文仪表/逐请求表/会话缓存/MCP），后端 [strata-remote-monitor] 模块代理远端 /metrics+/health+/mcp（800ms TTL+单飞+AbortController 超时；目标地址 strata-remote.json 热加载，缺省 .38:8080；浏览器直连远端会被 CORS 拦，必须走代理）。 // r19 = 10-07 「最近完成请求」表新增 二级缓存命中 列（在 缓存命中 右侧）：数据是逐请求真值，非估算——vLLM 侧由 rt-patch #12（dsh_extcache_rt）在 Request.take_prefill_stats 摘取官方 PrefillStats 的一瞬记下 num_external_cached_tokens/num_local_cached_tokens 分项，请求完成时落盘 vllm-ext-cache.jsonl，后端按 rid join（含 -8hex 内部后缀）；SGLang 侧直接映射官方 exporter 的 cached_tokens_storage_backend/cached_tokens_local。无该项数据时如实显示 --（绝不用「缓存命中」总数冒充），并在表尾给一句原因说明；组头聚合并列显示 二级缓存命中率＝Σ二级命中/Σprompt。新列生效需引擎带补丁重启（控制台重启不影响）。 // r18 = 10-06 仪表盘曲线提速平滑 + 停刷防御：① PD 动态图轮询 1s→500ms、序列 EMA(α=0.3) 平滑、折线改 Catmull-Rom 贝塞尔、当前值读数用平滑值（曲线跟进更快、无逐秒锯齿）；② 并发卡（500ms 独立轮询）成功渲染即盖 _lastRenderAt——原实现只在主链整轮结束后盖章，后端毛刺期（stats 实测 p95≈1.9s、峰值 4s）主链一轮拖十几秒时看门狗误判正常不自愈，现并发卡心跳成为独立渲染推进信号；③ 后端 stats 加 350ms 结果缓存（同窗口多消费者只算一次）。 //  r17 = 10-06 并发实时测速稀释修复：v3TouchRow 活跃期全程均值分母钉在 min(now, 最后产出/新行)（停增/暂离期不发稀释值，截图 g=8·34s·0.2 形态根治）；v3goneAt 冻结滞留窗 15s→5s；bindRow 复活清 stale goneAt 锚；active_requests.elapsed_s 同源钉锚。 // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r16 = 10-05 修复 vLLM 运行日志空白：祖先链 argv 判据对「重定向在 wrapper shell 内部」的现行启动链失明（引擎属 root 读不到其 fd），新增祖先链 fd1/fd2 指向 .log + 内容校验判据 ancestorFdLogFile，接入选日志两条链（pickLogFromProcs ⓪ / pickScriptModelLogFile ①″）；端点透传 fallback、前端红条明示兜底 vllm.log；页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r15 = EPYC 板两处口径修复：① 封装温度——该机 /sys/class/thermal 为空、k10temp 只挂 hwmon，采样器加 hwmon 回落（Tctl/Package 优先、避开逐 CCD 的 Tccd 分量）；② CPU 缓存——后端从只读 cpu0 改为全核扫共享域聚合并行输出（7F52 的 16 个 16MB L3 域合计 256MB 如实呈现，前端加「N域×slice」标注）；r14 = 10-05 换装适配（AMD EPYC 7F52 16C/32T + H12D-8D + 3×CMP 170HX + 32GB 内存）：主端口自愈三层防御（6s 定时兜底重探 / ticker busy>15s 强制放行 / stats 空数据触发纠偏——换装开机时序竞态会令主端口永久粘滞缺省 8000、仪表盘整页假 {}）；cpu-ctl v3 跨平台化（睿频通道 intel_pstate/no_turbo⇄cpufreq/boost 自适应、温度 coretemp⇄k10temp 回落、platform 串运行时生成）；SCRIPT_MODELS.base 换 32GB 账（pp:3、kvoff:0、PLE INT8+disk）；新 standard 预设 current-pp3-1m-mtp4-int8disk-32g；双卡文案改卡数自适应；r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -2654,6 +2654,53 @@ async function refreshDashboard() {
         if (myGen === _dashGen) _dashBusy = false;
     }
 }
+// [conc-slot-pin 1012] 并发卡行位固定（用户要求：位置按首次出现钉住，不做动态排序）。
+// 判障实锤：引擎 gauge 与 v3 流错位时，后端 rt.live 行身份每拍轮换（REQ 号 shift 退役 +
+// 队尾新建，实测 4 行显示在 6 个 REQ 号间滚动）——前端照抄后端行序就表现为动态换位置。
+// 行的真身份 = v3 流 rid（行字段 pp_rid，REQ 号轮换时它稳定）；代理流量再优先任务号。
+// 槽位按「复合身份」首现排位：taskId/pp_rid/id 三个别名任一命中即同一条请求（prefill 期
+// 无 rid、decode 后 rid 出现不换位置），新行追加末尾，消失 15s 释放槽位。
+// live token 流与后端行按「同序数组下标」zip，必须在重排前绑定（r.__lv）。
+const __concSlotOrder = (function () {
+    const ports = new Map();   // port -> Map(alias -> entry{seq, seen, aliases:Set})
+    return function (inst, liveList) {
+        const raw = inst.active_requests || [];
+        // 先按后端原始顺序 zip live 流预览（仅主实例有代理捕获），再重排
+        const rows = raw.map((r, i) => Object.assign({}, r, { __lv: inst.primary ? (liveList || [])[i] : undefined }));
+        if (!rows.length) return rows;
+        const pk = inst.port == null ? '__main' : inst.port;
+        let m = ports.get(pk);
+        if (!m) { m = new Map(); ports.set(pk, m); }
+        const now = Date.now();
+        const keysOf = (r) => {
+            const ks = [];
+            if (r.taskId) ks.push('T:' + r.taskId);
+            if (r.pp_rid) ks.push('R:' + r.pp_rid);
+            if (r.id) ks.push('I:' + r.id);
+            return ks;
+        };
+        let maxSeq = 0;
+        for (const e of m.values()) if (e.seq > maxSeq) maxSeq = e.seq;
+        for (const r of rows) {
+            const ks = keysOf(r);
+            let e = null;
+            for (const k of ks) { if (m.has(k)) { e = m.get(k); break; } }
+            if (!e) {
+                e = { seq: ++maxSeq, seen: now, aliases: new Set() };
+                for (const k of ks) m.set(k, e);
+            }
+            e.seen = now;
+            for (const k of ks) if (!e.aliases.has(k)) { e.aliases.add(k); m.set(k, e); }
+            r.__seq = e.seq;
+        }
+        rows.sort((a, b) => a.__seq - b.__seq);
+        // 缺席 15s 释放槽位（清全部别名；同一条请求短暂掉线回来仍占原位）
+        for (const [k, e] of [...m]) {
+            if (now - e.seen > 15000) { for (const a of e.aliases) m.delete(a); m.delete(k); }
+        }
+        return rows;
+    };
+})();
 async function renderConcurrentCard(s) {
     try {
         const insts = (s.instances && s.instances.length > 0)
@@ -2782,12 +2829,12 @@ async function renderConcurrentCard(s) {
         if (totalActive > 0) {
             const _st = document.getElementById('activeRequestsStatus'); if (_st) { _st.style.display = 'block'; _st.textContent = '正在处理 ' + totalActive + ' 个请求 · 数据 500ms 轮询刷新'; _st.title = '速度/进度来自 /v1/internal/stats（500ms 轮询），live 文本流为控制台代理捕获（仅走代理的请求）'; }
             document.getElementById('requestSpeeds').innerHTML = insts.map(inst => {
-                const reqs = inst.active_requests || [];
+                const reqs = __concSlotOrder(inst, liveList); // [conc-slot-pin 1012] 行位=首现顺序钉住，不随后端行序轮换
                 const gpuChip = '<span style="display:inline-block;font-size:10px;line-height:1;padding:2px 6px;border-radius:4px;background:var(--accent-bg);color:var(--accent);border:1px solid var(--border);font-weight:700">GPU ' + instGpuBadgeText(inst) + '</span>';
                 if (!reqs.length) return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0">' + gpuChip + '<span style="font-size:12px;color:var(--text-tertiary)">空闲</span></div>';
                 return '<div style="padding:6px 0;border-bottom:1px solid var(--border)">' + gpuChip + '<div style="display:flex;flex-direction:column;gap:6px;margin-top:6px">' + reqs.map((r, ri) => {
                     const isDecode = r.phase === 'decode';
-                    const lv = inst.primary ? liveList[ri] : undefined; // live 流预览（走控制台代理的请求）
+                    const lv = r.__lv; // live 流预览（走控制台代理的请求）——已在重排前按后端原始顺序 zip 绑定
                     const phaseColor = isDecode ? 'var(--green)' : 'var(--orange)';
                     const tChip = r.taskId ? '<span style="font-size:10px;font-weight:800;color:var(--text-secondary);font-variant-numeric:tabular-nums">' + esc(r.taskId) + '</span>' : '';
                     const idStr = esc(r.id || '');

@@ -4766,6 +4766,7 @@ const LS_SID_KEEP = 3;         // 文件里混跑多实例/多次重启，只留
 const LS_SAMPLE_GAP = 0.35;    // 样本环抽稀间隔（秒）：测速窗 2~6s，0.35s 粒度足够
 const LS_WIN_KEEP = 12;        // 样本环保留窗口（秒）
 const LS_STALE_DONE_S = 30;    // 有 rid 但 >30s 无新行且无完成行 → 视为已终止（abort/抢占丢弃）
+const LS_ACTIVE_FRESH_S = 8;   // [ghost-done-1014] active 集新鲜度：>8s 无新行不算「活跃」（decode 停顿上限≈chunked prefill 单块时长，实测 <6s）
 const LS_PORT_FRESH_MS = 6000; // 端口级新鲜度：该 port 会话 6s 内有行才算 v3 激活
 
 // v3 测速窗参数（滑窗 Δg/Δt，全部该 rid 自身样本）
@@ -4814,7 +4815,17 @@ function lsIngestLine(r) {
   st.lastLineT = ts;
   st.lastWall = Date.now();
   if (r.a && !st.arrival) st.arrival = Number(r.a);
-  if (r.f) { st.done = true; st.doneAt = ts; }
+  if (r.f) {
+    st.done = true; st.doneAt = ts;
+    // [ghost-done-1014] 引擎完成行携带裸 rid（无 -8hex 内部后缀），进度行携带后缀 rid——
+    // 后缀序列永远等不到自己的 f 行，会以「幽灵活跃」滞留 LS_STALE_DONE_S(30s)，
+    // 阶段④为幽灵建行 → 行数/running 虚高（实测 4 并发显示 14 行）。
+    // 裸 rid 完成 = 同会话所有 "裸rid-*" 前缀的兄弟序列一并 done。
+    const pfx = r.rid + '-';
+    for (const [k2, st2] of m.byRid) {
+      if (!st2.done && k2.length > pfx.length && k2.slice(0, pfx.length) === pfx) { st2.done = true; st2.doneAt = ts; }
+    }
+  }
   const g = Number(r.g) || 0;
   // gauge 只增不减；回退 = 引擎重启后 rid 复用（同 sid 内不会），忽略
   if (g > st.g) {
@@ -4919,9 +4930,12 @@ function v3StreamFor(port) {
   if (!m) return { active: [], fresh: false };
   const active = [];
   const doneIds = new Set();
+  const _nowS = Date.now() / 1000;
   for (const st of m.byRid.values()) {
     if (st.done) { if (st.g > 0) doneIds.add(st.rid); continue; }
-    if (st.g > 0) active.push(st);
+    // [ghost-done-1014] 无新行超 LS_ACTIVE_FRESH_S 的未 done 序列（abort/丢完成行）不进活跃集，
+    // 但保留在 byRid 里等 done 或 30s 回收——已绑它的行走 v3goneAt 语义自然退场。
+    if (st.g > 0 && _nowS - st.lastLineT <= LS_ACTIVE_FRESH_S) active.push(st);
   }
   const fresh = (now - m.lastWall) < LS_PORT_FRESH_MS;
   return { active, doneIds, fresh: fresh && active.length > 0, sid: m ? [...S.sids.keys()].find(k => S.sids.get(k) === m) : null, session: m,

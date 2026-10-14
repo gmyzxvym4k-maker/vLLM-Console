@@ -2114,7 +2114,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20261014-r34'; // r34 = 10-14 并发行「保持原位到输出结束」[conc-row-until-end + conc-spark-sticky]：① 缺席保持行不再受「本拍行数≥running 就不补」限制——末次数据 2.5s 内一律原位保持（半透明），后端行集轮换/rid 闪断期曲线与位置都不动，2.5s 无更新才判输出结束退场；live 行恒显、保持行只占 running+1 的额外名额（最近可见优先），既不闪断也不堆积② 曲线键钉到槽位首见身份 __sparkKey（rid 晚到/REQ 轮换不换键不重启），采样点记录移入行渲染循环、保持行不记录旧快照 // r33 = 10-14 并发卡输出曲线细粒度[conc-spark-fine]：① decode 行曲线数据源改引擎真值累计 tokens_generated 的逐拍差分 Δg/Δt（500ms 粒度、每行独立、key=rid 跨行轮换连续；显示值含均值/分摊回落会把曲线拉平，差分保留真实瞬时起伏；dt<250ms 或 g 回落不发放）② 折线改 Catmull-Rom 三次贝塞尔平滑（同 PD 图手法）；再细到 100ms 级（引擎每步）需后端随 stats 下发 v3 逐步样本，待控制台重启窗口 // r32 = 10-14 并发请求行速度区改 Strata 监控 Speed 卡版式[strata-speed-ui]：大号数值+t/s 单位、下方灰字语义标签（当前 Decode·实测/均值/分摊、上次请求 Decode；当前/本请求 Prefill·实测/估、上次请求 Prefill），Decode/Prefill 双值并排（prefill 行 Decode 显 --），走势线保留；计算逻辑不变（Decode=后端本行实时→全程均值→上一值→分摊，与 GPU 排队卡同源；Prefill=未缓存 prompt÷预填充耗时，同 Strata (prompt−reused)/prompt_ms 式）；prefill 行进度对 done/total 挪入 meta 行 // r31 = 10-14 并发卡显示身份钉稳[conc-pin-id]：REQ 号只是后端行槽位流水号（rt.seq，gauge 滞后+绑定抖动致同请求换号，用户所见「REQ-480923 一直变」），首见 REQ 号+vLLM rid 钉在槽位上随行轮换不变，meta 行显示「REQ-xxx · rid8」 // r30 = 10-14 并发卡速度口径与「GPU 排队·处理」卡对齐[conc-gq-rate]（用户确认排队卡数值正确并要求采用）：Decode=后端本行实时 avg_speed_3s → 本行全程均值 avg_speed（buildGpuQueueSegs 同款）→ 上一值(≤60s 不空窗) → 实例吞吐÷行数分摊（最后兜底）；撤除 r29 前端 rid 滑窗测速与 r26 提前的分摊层（两者都会让行值偏离排队卡口径）；sparkline 保留 rid 稳定键 // r29 = 10-14 并发卡每行独立实时测速[conc-rid-rate]：r26 的分摊兜底过前导致「所有并发速度都一样」（截图 6 行同显 11 tok/s·分摊）——tokens_generated 是引擎按 vLLM rid 上报真值，前端按 rid 每拍采样自算滑窗 Δg/Δt（rid 跨行轮换稳定，后端行窗因绑定抖动常不出数）；Decode 优先级改为 后端本行实时→前端本 rid 滑窗实测→本行全程均值→实例分摊(最后兜底)→上一值；sparkline 键改 rid 优先（REQ 轮换曲线不断） // r28 = 10-14 并发卡行数封顶 [conc-one-row-per-rid 1014b]：后端行集整拍轮换（REQ 号滚动+rid 闪断）时旧缺席保持行逐拍堆积，3 个并发显示 9 行（截图实锤）——保持行只补「本拍行数 < running」的缺口且补后总行数 ≤ running，多槽位竞争取最近可见者优先；并发数即行数上限 // r27 = 10-14 并发卡「一个并发一行」[conc-one-row-per-rid]：按 vLLM rid 判身份——同拍多行命中同一身份（绑定抖动期旧行仍挂 rid 别名+新行绑到同一 rid；REQ 号被接管后旧槽位留幽灵行）→ 身份并入同一槽位（排位取更早者）且只保留信息最全的一行（有 rid > 有 live 流预览 > 生成量大者），合并后的空壳槽位不再产生缺席保持幽灵行；根治用户所见「一个并发出现几行数据」 // r26 = 10-14 并发卡速度优先级对齐 Strata「生成中=当前 Decode」[strata-rule-1012b]：v3 每行实时滑窗在并发短请求下常未成熟（请求 2~5s 完成，窗需 ≥1.5s+末样本 ≤2.2s），旧逻辑此时回落本行全程均值（滞后恒定值，看起来"没变化"）——新增第二优先级：实例当前 Decode 吞吐(last_second.tokens)÷并发输出行数（标「实时 tok/s·分摊」，各行同值=Strata 速度卡当前 Decode 的行级等价）；完整链=本行实时实测→当前 Decode 分摊→本行全程均值→上一值(≤60s)，sparkline 同源 // r25 = 10-12 并发请求卡速度规则对齐「Strata 监控」速度卡[strata-rule-1012]：① Decode/Prefill 数值不空窗——回落链 当前实测→本请求全程均值→最近一次有效实测值（≤60s，行级缓存 __concSpdHold），回落时子标签明示「上一值」并半透明，滑窗未成熟期不再闪 --（同 Strata：生成中=当前 Decode，空闲=上次请求 Decode）；② decode 行预填充小字标语义：本请求实测 / 上次请求（后端回落值口径）/ 上一值；③ 空闲态在「等待请求...」下补显 上次请求 Decode/Prefill（主源=最近完成请求 request-traces 实测：decode_tps、prefill=(prompt−cached)/prefill_s 实算口径，与 Strata (prompt−reused)/prompt_ms 同式；无记录退回行级缓存 ≤2min）；④ sparkline 历史同源回落，曲线不再因单拍无值塌 0 // r24 = 10-12 行位固定补第二层防御[conc-hold]：后端某拍轮换掉仍在跑的行时，前端按上一拍数据原位保持显示 ≤2.5s（半透明+tooltip），整列不再因单拍缺行上下移；槽位释放窗口不变 15s // r23 = 10-12 并发请求卡行位固定（[conc-slot-pin 1012]）：后端 rt.live 行序因 gauge 滞后 retire + 身份 parked 按 rid 复活而整段轮换（实测 4 行每拍对调位置），前端新增 __concSlotOrder 按行身份（taskId||id）首现排位、新行追加末尾、缺席 15s 释放槽位，行位置不再动态排序；live token 流在重排前按后端原始顺序 zip 绑定（r.__lv），预览不串行 // r22 = 10-10 新增「崩溃记录」标签：独立页 /crash.html 展示引擎崩溃时间+根因+证据原文（筛选/搜索/KPI），数据源 = 独立守护进程 crash-watch.mjs（systemd --user fnx-crash-watch.service，不占控制台事件循环、不重启控制台）：model-manager 实例快照两轮缺席+/proc 校验=进程消失、看门狗「确认离线」精确时间戳、server.log 启停事件抑制人工停止/控制台重启连坐、日志尾部签名定根因（EngineDead/CUDA OOM/非法内存/NCCL/断言/段错误/磁盘满…）+ dmesg OOM/Xid 补充，首跑回填历史崩溃（watchdog 日志+vllm 日志+dmesg），产出 static/crash-records.json // r21 = 10-09 硬件监视页新增「GPU 高温自动关机守护」卡（[gpu-hotshield 1009]）：任一张 GPU max(核心,显存)温度 ≥ 阈值且持续 holdSec 秒 → 先优雅停全部 vLLM/SGLang 实例（限时 45s）→ gpu-ctl halt（root：sync + systemctl poweroff）关闭本机；graceSec 倒计时全屏红幅（任意标签可见+跨标签 alert 提醒）可手动取消，降温自动取消，数据盲态（>15s 无 GPU 采样）不判定并撤销倒计时，cooldownMin 防关机-开机振荡；配置 gpu-hotshield.json 热加载、POST /v1/internal/hotshield/cmd {save|cancel}、状态 1s 轮询、事件历史落 gpu-hotshield-state.json。 // r20 = 10-08 新增「Strata 监控」标签：克隆 Strata Web UI Monitor 页（http://192.168.1.38:8080/#monitor）——内嵌 /strata-monitor.html（模型状态/八指标卡带 sparkline/上下文仪表/逐请求表/会话缓存/MCP），后端 [strata-remote-monitor] 模块代理远端 /metrics+/health+/mcp（800ms TTL+单飞+AbortController 超时；目标地址 strata-remote.json 热加载，缺省 .38:8080；浏览器直连远端会被 CORS 拦，必须走代理）。 // r19 = 10-07 「最近完成请求」表新增 二级缓存命中 列（在 缓存命中 右侧）：数据是逐请求真值，非估算——vLLM 侧由 rt-patch #12（dsh_extcache_rt）在 Request.take_prefill_stats 摘取官方 PrefillStats 的一瞬记下 num_external_cached_tokens/num_local_cached_tokens 分项，请求完成时落盘 vllm-ext-cache.jsonl，后端按 rid join（含 -8hex 内部后缀）；SGLang 侧直接映射官方 exporter 的 cached_tokens_storage_backend/cached_tokens_local。无该项数据时如实显示 --（绝不用「缓存命中」总数冒充），并在表尾给一句原因说明；组头聚合并列显示 二级缓存命中率＝Σ二级命中/Σprompt。新列生效需引擎带补丁重启（控制台重启不影响）。 // r18 = 10-06 仪表盘曲线提速平滑 + 停刷防御：① PD 动态图轮询 1s→500ms、序列 EMA(α=0.3) 平滑、折线改 Catmull-Rom 贝塞尔、当前值读数用平滑值（曲线跟进更快、无逐秒锯齿）；② 并发卡（500ms 独立轮询）成功渲染即盖 _lastRenderAt——原实现只在主链整轮结束后盖章，后端毛刺期（stats 实测 p95≈1.9s、峰值 4s）主链一轮拖十几秒时看门狗误判正常不自愈，现并发卡心跳成为独立渲染推进信号；③ 后端 stats 加 350ms 结果缓存（同窗口多消费者只算一次）。 //  r17 = 10-06 并发实时测速稀释修复：v3TouchRow 活跃期全程均值分母钉在 min(now, 最后产出/新行)（停增/暂离期不发稀释值，截图 g=8·34s·0.2 形态根治）；v3goneAt 冻结滞留窗 15s→5s；bindRow 复活清 stale goneAt 锚；active_requests.elapsed_s 同源钉锚。 // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r16 = 10-05 修复 vLLM 运行日志空白：祖先链 argv 判据对「重定向在 wrapper shell 内部」的现行启动链失明（引擎属 root 读不到其 fd），新增祖先链 fd1/fd2 指向 .log + 内容校验判据 ancestorFdLogFile，接入选日志两条链（pickLogFromProcs ⓪ / pickScriptModelLogFile ①″）；端点透传 fallback、前端红条明示兜底 vllm.log；页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r15 = EPYC 板两处口径修复：① 封装温度——该机 /sys/class/thermal 为空、k10temp 只挂 hwmon，采样器加 hwmon 回落（Tctl/Package 优先、避开逐 CCD 的 Tccd 分量）；② CPU 缓存——后端从只读 cpu0 改为全核扫共享域聚合并行输出（7F52 的 16 个 16MB L3 域合计 256MB 如实呈现，前端加「N域×slice」标注）；r14 = 10-05 换装适配（AMD EPYC 7F52 16C/32T + H12D-8D + 3×CMP 170HX + 32GB 内存）：主端口自愈三层防御（6s 定时兜底重探 / ticker busy>15s 强制放行 / stats 空数据触发纠偏——换装开机时序竞态会令主端口永久粘滞缺省 8000、仪表盘整页假 {}）；cpu-ctl v3 跨平台化（睿频通道 intel_pstate/no_turbo⇄cpufreq/boost 自适应、温度 coretemp⇄k10temp 回落、platform 串运行时生成）；SCRIPT_MODELS.base 换 32GB 账（pp:3、kvoff:0、PLE INT8+disk）；新 standard 预设 current-pp3-1m-mtp4-int8disk-32g；双卡文案改卡数自适应；r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20261014-r35'; // r35 = 10-14 并发请求卡推倒重写[conc-v2]：清空 r23~r34 十轮叠加的 slot-pin/hold/cap/spdHold/genHist/sparkKey/pinId 补丁层，改为单一「请求注册表」模型——条目=vLLM 请求（主键 rid，prefill 期暂记 REQ 号、rid 晚到同条目改登不换行），行位=首现序永不重排，行保持到输出结束（>1.5s 无数据退场，闪断期原位半透明驻留），曲线=引擎真值 Δg/Δt 逐拍采样（500ms/点窗 15s 贝塞尔，保持行不记录），Decode=本行实时→全程均值→上一显示值→分摊（与 GPU 排队卡同源），Prefill=未缓存÷耗时按 exact 标语义，空闲显上次请求实测；GPU 排队卡不受影响 // r34 = 10-14 并发行「保持原位到输出结束」[conc-row-until-end + conc-spark-sticky]：① 缺席保持行不再受「本拍行数≥running 就不补」限制——末次数据 2.5s 内一律原位保持（半透明），后端行集轮换/rid 闪断期曲线与位置都不动，2.5s 无更新才判输出结束退场；live 行恒显、保持行只占 running+1 的额外名额（最近可见优先），既不闪断也不堆积② 曲线键钉到槽位首见身份 __sparkKey（rid 晚到/REQ 轮换不换键不重启），采样点记录移入行渲染循环、保持行不记录旧快照 // r33 = 10-14 并发卡输出曲线细粒度[conc-spark-fine]：① decode 行曲线数据源改引擎真值累计 tokens_generated 的逐拍差分 Δg/Δt（500ms 粒度、每行独立、key=rid 跨行轮换连续；显示值含均值/分摊回落会把曲线拉平，差分保留真实瞬时起伏；dt<250ms 或 g 回落不发放）② 折线改 Catmull-Rom 三次贝塞尔平滑（同 PD 图手法）；再细到 100ms 级（引擎每步）需后端随 stats 下发 v3 逐步样本，待控制台重启窗口 // r32 = 10-14 并发请求行速度区改 Strata 监控 Speed 卡版式[strata-speed-ui]：大号数值+t/s 单位、下方灰字语义标签（当前 Decode·实测/均值/分摊、上次请求 Decode；当前/本请求 Prefill·实测/估、上次请求 Prefill），Decode/Prefill 双值并排（prefill 行 Decode 显 --），走势线保留；计算逻辑不变（Decode=后端本行实时→全程均值→上一值→分摊，与 GPU 排队卡同源；Prefill=未缓存 prompt÷预填充耗时，同 Strata (prompt−reused)/prompt_ms 式）；prefill 行进度对 done/total 挪入 meta 行 // r31 = 10-14 并发卡显示身份钉稳[conc-pin-id]：REQ 号只是后端行槽位流水号（rt.seq，gauge 滞后+绑定抖动致同请求换号，用户所见「REQ-480923 一直变」），首见 REQ 号+vLLM rid 钉在槽位上随行轮换不变，meta 行显示「REQ-xxx · rid8」 // r30 = 10-14 并发卡速度口径与「GPU 排队·处理」卡对齐[conc-gq-rate]（用户确认排队卡数值正确并要求采用）：Decode=后端本行实时 avg_speed_3s → 本行全程均值 avg_speed（buildGpuQueueSegs 同款）→ 上一值(≤60s 不空窗) → 实例吞吐÷行数分摊（最后兜底）；撤除 r29 前端 rid 滑窗测速与 r26 提前的分摊层（两者都会让行值偏离排队卡口径）；sparkline 保留 rid 稳定键 // r29 = 10-14 并发卡每行独立实时测速[conc-rid-rate]：r26 的分摊兜底过前导致「所有并发速度都一样」（截图 6 行同显 11 tok/s·分摊）——tokens_generated 是引擎按 vLLM rid 上报真值，前端按 rid 每拍采样自算滑窗 Δg/Δt（rid 跨行轮换稳定，后端行窗因绑定抖动常不出数）；Decode 优先级改为 后端本行实时→前端本 rid 滑窗实测→本行全程均值→实例分摊(最后兜底)→上一值；sparkline 键改 rid 优先（REQ 轮换曲线不断） // r28 = 10-14 并发卡行数封顶 [conc-one-row-per-rid 1014b]：后端行集整拍轮换（REQ 号滚动+rid 闪断）时旧缺席保持行逐拍堆积，3 个并发显示 9 行（截图实锤）——保持行只补「本拍行数 < running」的缺口且补后总行数 ≤ running，多槽位竞争取最近可见者优先；并发数即行数上限 // r27 = 10-14 并发卡「一个并发一行」[conc-one-row-per-rid]：按 vLLM rid 判身份——同拍多行命中同一身份（绑定抖动期旧行仍挂 rid 别名+新行绑到同一 rid；REQ 号被接管后旧槽位留幽灵行）→ 身份并入同一槽位（排位取更早者）且只保留信息最全的一行（有 rid > 有 live 流预览 > 生成量大者），合并后的空壳槽位不再产生缺席保持幽灵行；根治用户所见「一个并发出现几行数据」 // r26 = 10-14 并发卡速度优先级对齐 Strata「生成中=当前 Decode」[strata-rule-1012b]：v3 每行实时滑窗在并发短请求下常未成熟（请求 2~5s 完成，窗需 ≥1.5s+末样本 ≤2.2s），旧逻辑此时回落本行全程均值（滞后恒定值，看起来"没变化"）——新增第二优先级：实例当前 Decode 吞吐(last_second.tokens)÷并发输出行数（标「实时 tok/s·分摊」，各行同值=Strata 速度卡当前 Decode 的行级等价）；完整链=本行实时实测→当前 Decode 分摊→本行全程均值→上一值(≤60s)，sparkline 同源 // r25 = 10-12 并发请求卡速度规则对齐「Strata 监控」速度卡[strata-rule-1012]：① Decode/Prefill 数值不空窗——回落链 当前实测→本请求全程均值→最近一次有效实测值（≤60s，行级缓存 __concSpdHold），回落时子标签明示「上一值」并半透明，滑窗未成熟期不再闪 --（同 Strata：生成中=当前 Decode，空闲=上次请求 Decode）；② decode 行预填充小字标语义：本请求实测 / 上次请求（后端回落值口径）/ 上一值；③ 空闲态在「等待请求...」下补显 上次请求 Decode/Prefill（主源=最近完成请求 request-traces 实测：decode_tps、prefill=(prompt−cached)/prefill_s 实算口径，与 Strata (prompt−reused)/prompt_ms 同式；无记录退回行级缓存 ≤2min）；④ sparkline 历史同源回落，曲线不再因单拍无值塌 0 // r24 = 10-12 行位固定补第二层防御[conc-hold]：后端某拍轮换掉仍在跑的行时，前端按上一拍数据原位保持显示 ≤2.5s（半透明+tooltip），整列不再因单拍缺行上下移；槽位释放窗口不变 15s // r23 = 10-12 并发请求卡行位固定（[conc-slot-pin 1012]）：后端 rt.live 行序因 gauge 滞后 retire + 身份 parked 按 rid 复活而整段轮换（实测 4 行每拍对调位置），前端新增 __concSlotOrder 按行身份（taskId||id）首现排位、新行追加末尾、缺席 15s 释放槽位，行位置不再动态排序；live token 流在重排前按后端原始顺序 zip 绑定（r.__lv），预览不串行 // r22 = 10-10 新增「崩溃记录」标签：独立页 /crash.html 展示引擎崩溃时间+根因+证据原文（筛选/搜索/KPI），数据源 = 独立守护进程 crash-watch.mjs（systemd --user fnx-crash-watch.service，不占控制台事件循环、不重启控制台）：model-manager 实例快照两轮缺席+/proc 校验=进程消失、看门狗「确认离线」精确时间戳、server.log 启停事件抑制人工停止/控制台重启连坐、日志尾部签名定根因（EngineDead/CUDA OOM/非法内存/NCCL/断言/段错误/磁盘满…）+ dmesg OOM/Xid 补充，首跑回填历史崩溃（watchdog 日志+vllm 日志+dmesg），产出 static/crash-records.json // r21 = 10-09 硬件监视页新增「GPU 高温自动关机守护」卡（[gpu-hotshield 1009]）：任一张 GPU max(核心,显存)温度 ≥ 阈值且持续 holdSec 秒 → 先优雅停全部 vLLM/SGLang 实例（限时 45s）→ gpu-ctl halt（root：sync + systemctl poweroff）关闭本机；graceSec 倒计时全屏红幅（任意标签可见+跨标签 alert 提醒）可手动取消，降温自动取消，数据盲态（>15s 无 GPU 采样）不判定并撤销倒计时，cooldownMin 防关机-开机振荡；配置 gpu-hotshield.json 热加载、POST /v1/internal/hotshield/cmd {save|cancel}、状态 1s 轮询、事件历史落 gpu-hotshield-state.json。 // r20 = 10-08 新增「Strata 监控」标签：克隆 Strata Web UI Monitor 页（http://192.168.1.38:8080/#monitor）——内嵌 /strata-monitor.html（模型状态/八指标卡带 sparkline/上下文仪表/逐请求表/会话缓存/MCP），后端 [strata-remote-monitor] 模块代理远端 /metrics+/health+/mcp（800ms TTL+单飞+AbortController 超时；目标地址 strata-remote.json 热加载，缺省 .38:8080；浏览器直连远端会被 CORS 拦，必须走代理）。 // r19 = 10-07 「最近完成请求」表新增 二级缓存命中 列（在 缓存命中 右侧）：数据是逐请求真值，非估算——vLLM 侧由 rt-patch #12（dsh_extcache_rt）在 Request.take_prefill_stats 摘取官方 PrefillStats 的一瞬记下 num_external_cached_tokens/num_local_cached_tokens 分项，请求完成时落盘 vllm-ext-cache.jsonl，后端按 rid join（含 -8hex 内部后缀）；SGLang 侧直接映射官方 exporter 的 cached_tokens_storage_backend/cached_tokens_local。无该项数据时如实显示 --（绝不用「缓存命中」总数冒充），并在表尾给一句原因说明；组头聚合并列显示 二级缓存命中率＝Σ二级命中/Σprompt。新列生效需引擎带补丁重启（控制台重启不影响）。 // r18 = 10-06 仪表盘曲线提速平滑 + 停刷防御：① PD 动态图轮询 1s→500ms、序列 EMA(α=0.3) 平滑、折线改 Catmull-Rom 贝塞尔、当前值读数用平滑值（曲线跟进更快、无逐秒锯齿）；② 并发卡（500ms 独立轮询）成功渲染即盖 _lastRenderAt——原实现只在主链整轮结束后盖章，后端毛刺期（stats 实测 p95≈1.9s、峰值 4s）主链一轮拖十几秒时看门狗误判正常不自愈，现并发卡心跳成为独立渲染推进信号；③ 后端 stats 加 350ms 结果缓存（同窗口多消费者只算一次）。 //  r17 = 10-06 并发实时测速稀释修复：v3TouchRow 活跃期全程均值分母钉在 min(now, 最后产出/新行)（停增/暂离期不发稀释值，截图 g=8·34s·0.2 形态根治）；v3goneAt 冻结滞留窗 15s→5s；bindRow 复活清 stale goneAt 锚；active_requests.elapsed_s 同源钉锚。 // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r16 = 10-05 修复 vLLM 运行日志空白：祖先链 argv 判据对「重定向在 wrapper shell 内部」的现行启动链失明（引擎属 root 读不到其 fd），新增祖先链 fd1/fd2 指向 .log + 内容校验判据 ancestorFdLogFile，接入选日志两条链（pickLogFromProcs ⓪ / pickScriptModelLogFile ①″）；端点透传 fallback、前端红条明示兜底 vllm.log；页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r15 = EPYC 板两处口径修复：① 封装温度——该机 /sys/class/thermal 为空、k10temp 只挂 hwmon，采样器加 hwmon 回落（Tctl/Package 优先、避开逐 CCD 的 Tccd 分量）；② CPU 缓存——后端从只读 cpu0 改为全核扫共享域聚合并行输出（7F52 的 16 个 16MB L3 域合计 256MB 如实呈现，前端加「N域×slice」标注）；r14 = 10-05 换装适配（AMD EPYC 7F52 16C/32T + H12D-8D + 3×CMP 170HX + 32GB 内存）：主端口自愈三层防御（6s 定时兜底重探 / ticker busy>15s 强制放行 / stats 空数据触发纠偏——换装开机时序竞态会令主端口永久粘滞缺省 8000、仪表盘整页假 {}）；cpu-ctl v3 跨平台化（睿频通道 intel_pstate/no_turbo⇄cpufreq/boost 自适应、温度 coretemp⇄k10temp 回落、platform 串运行时生成）；SCRIPT_MODELS.base 换 32GB 账（pp:3、kvoff:0、PLE INT8+disk）；新 standard 预设 current-pp3-1m-mtp4-int8disk-32g；双卡文案改卡数自适应；r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -2654,238 +2654,136 @@ async function refreshDashboard() {
         if (myGen === _dashGen) _dashBusy = false;
     }
 }
-// [conc-slot-pin 1012] 并发卡行位固定（用户要求：最旧的钉最顶端、新并发只追加最低端，
-// 绝不动态排序）。判障实锤：引擎 gauge 与 v3 流错位时，后端 rt.live 行身份每拍轮换
-// （REQ 号 shift 退役 + 队尾新建，实测 4 行显示在 6 个 REQ 号间滚动；且某请求会整拍
-// 缺席）——前端照抄后端行序就表现为上下跳行换位置。三层防御：
-// ① 槽位按「复合身份」首现排位钉死：行的真身份 = vLLM 流 rid（字段 pp_rid，REQ 号轮换时
-//    它稳定），taskId/pp_rid/id 三别名任一命中即同一条请求（prefill 期无 rid、decode 后
-//    rid 出现不换位置），新行只追加末尾，消失 15s 释放槽位；
-// ② [conc-one-row-per-rid 1014] 一个并发一行（用户口径：按 vLLM rid 一行）：同拍多行命中
-//    同一身份（绑定抖动期旧行仍挂 rid 别名 + 新行绑到同一 rid；或行接管后旧槽位留幽灵行）
-//    → 身份并入同一槽位 + 只保留信息最全的一行（有 rid > 有 live 流预览 > 生成量大者）；
-// ③ 缺席保持：后端某拍把仍在跑的行轮换掉时，按上一拍数据原位保留显示 ≤2.5s（半透明
-//    +title 标注），回来即恢复——整列内容不因单拍缺行而上下移动。
-// live token 流与后端行按「同序数组下标」zip，必须在重排前绑定（r.__lv）。
-const __concSlotOrder = (function () {
-    const HOLD_MS = 2500;      // 缺席保持窗口（覆盖轮换期连续 4 拍缺席）
-    const ports = new Map();   // port -> Map(alias -> entry{seq, seen, aliases:Set, last})
-    return function (inst, liveList) {
-        const raw = inst.active_requests || [];
-        // 先按后端原始顺序 zip live 流预览（仅主实例有代理捕获），再重排
-        const rows = raw.map((r, i) => Object.assign({}, r, { __lv: inst.primary ? (liveList || [])[i] : undefined }));
-        const pk = inst.port == null ? '__main' : inst.port;
-        let m = ports.get(pk);
-        if (!m) { m = new Map(); ports.set(pk, m); }
-        const now = Date.now();
-        const keysOf = (r) => {
-            const ks = [];
-            if (r.taskId) ks.push('T:' + r.taskId);
-            if (r.pp_rid) ks.push('R:' + r.pp_rid);
-            if (r.id) ks.push('I:' + r.id);
-            return ks;
-        };
-        let maxSeq = 0;
-        for (const e of m.values()) if (e.seq > maxSeq) maxSeq = e.seq;
-        const liveE = new Set();
-        const rowE = new Array(rows.length).fill(null); // [conc-one-row-per-rid] 行→身份槽位
-        for (let ri = 0; ri < rows.length; ri++) {
-            const r = rows[ri];
-            const ks = keysOf(r);
-            const hits = [];
-            for (const k of ks) { const e0 = m.get(k); if (e0 && e0.aliases.size && hits.indexOf(e0) === -1) hits.push(e0); }
-            let e = hits[0] || null;
-            if (!e) { e = { seq: ++maxSeq, seen: now, aliases: new Set(), last: r, firstId: null, firstRid: null, sparkKey: null }; }
-            // 次级命中槽位（同一行同时命中多个旧槽位 = 绑定抖动/行接管）→ 并入主槽位：
-            // 别名迁移、排位取更早者，旧槽位不再产生幽灵保持行。
-            for (let hi = 1; hi < hits.length; hi++) {
-                const e2 = hits[hi];
-                if (e2 === e) continue;
-                for (const a of e2.aliases) { m.set(a, e); e.aliases.add(a); }
-                if (!e.firstId && e2.firstId) e.firstId = e2.firstId;
-                if (!e.firstRid && e2.firstRid) e.firstRid = e2.firstRid;
-                if (!e.sparkKey && e2.sparkKey) e.sparkKey = e2.sparkKey;
-                e2.aliases.clear();
-                liveE.delete(e2);
-                if (e2.seq < e.seq) e.seq = e2.seq;
-                for (let j = 0; j < ri; j++) if (rowE[j] === e2) rowE[j] = e; // 本拍已处理行同步归并
+// ============================================================================
+// [conc-v2 1014] 并发请求卡——注册表重写（清空旧 slot-pin/hold/cap/spdHold/
+// genHist/sparkKey/pinId 全部补丁层，单一数据模型，规则如下）：
+//  ① 一个并发一行：注册表条目=请求，主键=vLLM rid（引擎真身份）；prefill 期无 rid
+//     的行以 REQ 号暂记，rid 出现时同条目改登（位置/曲线不重启）；行位=首现顺序，永不重排。
+//  ② 行保持到输出结束：本拍后端没发该 rid → 原位保持（半透明）；条目 >3s 无任何数据
+//     → 判定输出结束，退场释放（后端真完成会即时删行，1.5s 只兜底闪断误判）。
+//  ③ 曲线：引擎真值 tokens_generated 逐拍差分 Δg/Δt（500ms/点，窗 15s，贝塞尔平滑）；
+//     保持行不记录（旧快照不进曲线）。
+//  ④ Decode 数值 = 后端本行实时 avg_speed_3s → 全程均值 avg_speed（与「GPU 排队·处理」
+//     卡同源，用户确认口径）→ 上一显示值（不空窗，标「上次 Decode」）→ 实例吞吐÷live
+//     decode 行数分摊（最后兜底，标「分摊」）。Prefill = prefill_tps（未缓存 prompt ÷
+//     预填充耗时，同 Strata (prompt−reused)/prompt_ms 式），按 prefill_exact 标语义。
+//  ⑤ 空闲态：显示上次请求 Decode/Prefill（最近完成请求实测，Strata 空闲口径）。
+// ============================================================================
+const __concReg = (function () {
+    const END_MS = 1500;    // >1.5s(3拍) 无数据 = 输出结束退场（实测后端行集闪断间隙 ≤1s，1.5s 足够覆盖又限制幽灵堆积）
+    const WIN_MS = 15000;   // 曲线窗口
+    const ports = new Map();
+    return {
+        reset() { ports.clear(); },
+        tick(inst, zipped) {
+            const pk = inst.port == null ? '__main' : String(inst.port);
+            let st = ports.get(pk);
+            if (!st) { st = { seq: 0, list: [], byKey: new Map() }; ports.set(pk, st); }
+            const now = Date.now();
+            const seenE = new Set();
+            for (const r of zipped) {
+                const rid = r.pp_rid || null;
+                let e = null;
+                if (rid) {
+                    e = st.byKey.get('R:' + rid) || null;
+                    if (!e && r.id) { const c = st.byKey.get('I:' + r.id); if (c && !c.rid) e = c; } // prefill 条目认领 rid
+                } else {
+                    e = (r.taskId && st.byKey.get('T:' + r.taskId)) || (r.id && st.byKey.get('I:' + r.id)) || null;
+                }
+                if (!e) {
+                    e = { seq: ++st.seq, rid: null, taskId: null, id: null, firstId: r.id || null, born: now, row: null, seen: now, held: false, spark: [], lastT: 0, lastG: 0, lastShown: 0, lastShownP: 0 };
+                    st.list.push(e);
+                }
+                if (rid && e.rid !== rid) { if (e.rid) st.byKey.delete('R:' + e.rid); e.rid = rid; st.byKey.set('R:' + rid, e); }
+                if (r.taskId && e.taskId !== r.taskId) { if (e.taskId) st.byKey.delete('T:' + e.taskId); e.taskId = r.taskId; st.byKey.set('T:' + r.taskId, e); }
+                if (r.id && e.id !== r.id) { if (e.id) st.byKey.delete('I:' + e.id); e.id = r.id; st.byKey.set('I:' + r.id, e); }
+                e.row = r; e.seen = now; e.held = false;
+                seenE.add(e);
             }
-            e.seen = now; e.last = r;
-            // [conc-pin-id 1014] 显示身份钉首见值：REQ 号只是后端行槽位流水号（rt.seq），
-            // gauge 滞后+绑定抖动会让同一 vLLM 请求被重绑到新行换号（用户所见「REQ-480923
-            // 一直变」根因）；首见 REQ 号 + vLLM rid 钉在槽位上，行轮换显示不变。
-            if (!e.firstId && r.id) e.firstId = r.id;
-            if (!e.firstRid && r.pp_rid) e.firstRid = r.pp_rid;
-            r.__pinId = e.firstId || r.id;
-            r.__pinRid = e.firstRid || r.pp_rid || null;
-            // [conc-spark-sticky 1014] 曲线键=槽位首见身份（rid 晚到/REQ 轮换不换键，曲线不重启）
-            if (!e.sparkKey) e.sparkKey = r.pp_rid ? 'R:' + r.pp_rid : (r.taskId ? 'T:' + r.taskId : (r.id ? 'I:' + r.id : ''));
-            r.__sparkKey = e.sparkKey;
-            for (const k of ks) if (!e.aliases.has(k)) { e.aliases.add(k); m.set(k, e); }
-            liveE.add(e);
-            r.__seq = e.seq;
-            rowE[ri] = e;
-        }
-        // [conc-one-row-per-rid 1014] 一个并发一行：同拍多行命中同一身份 → 只留信息最全的一行
-        const byE = new Map();
-        const dedup = [];
-        for (let ri = 0; ri < rows.length; ri++) {
-            const r = rows[ri];
-            const e = rowE[ri];
-            const prev = byE.get(e);
-            if (!prev) { byE.set(e, r); r.__seq = e.seq; dedup.push(r); continue; }
-            const score = (x) => (x.pp_rid ? 1e9 : 0) + (x.__lv ? 1e6 : 0) + (parseInt(x.tokens_generated) || 0);
-            if (score(r) >= score(prev)) { r.__seq = prev.__seq; byE.set(e, r); dedup[dedup.indexOf(prev)] = r; }
-        }
-        // ③ [conc-row-until-end 1014] 行保持原位到输出结束：缺席 <HOLD_MS(2.5s) 的行按上一拍
-        // 数据原位保持（半透明）——后端行集轮换/rid 闪断期不再被挤出，曲线与位置都不动；
-        // 末次数据 2.5s 无更新视为输出结束，退场释放槽位。总行数封顶 running：超员按首见
-        // 排位从尾部裁（老行保位到输出结束，新行排队等槽位释放）。（m.values() 重复给出
-        // 同一 entry 须先去重；已合并空壳槽位不复活）
-        // live 行恒显（后端本拍真值）；保持行只占 +1 额外名额（最近可见优先、平手原位序）——
-        // 闪断行存活不消失，又不会像旧堆积形态那样「3 个并发 9 行」。
-        const capN = (parseInt(inst.running) || 0) + 1;
-        const heldCands = [];
-        for (const e of new Set(m.values())) {
-            if (!e.aliases.size) continue;
-            if (liveE.has(e) || !e.last || now - e.seen > HOLD_MS) continue;
-            heldCands.push(e);
-        }
-        heldCands.sort((a, b) => b.seen - a.seen || a.seq - b.seq);
-        for (const e of heldCands) {
-            if (dedup.length >= capN) break;
-            const held = Object.assign({}, e.last, { __held: true });
-            held.__seq = e.seq;
-            held.__pinId = e.firstId || held.id;
-            held.__pinRid = e.firstRid || held.pp_rid || null;
-            held.__sparkKey = e.sparkKey;
-            dedup.push(held);
-        }
-        dedup.sort((a, b) => a.__seq - b.__seq);
-        // 缺席 15s 释放槽位（清全部别名；同一条请求短暂掉线回来仍占原位）
-        for (const [k, e] of [...m]) {
-            if (!e.aliases.size) { m.delete(k); continue; } // 合并后的空壳槽位直接清
-            if (now - e.seen > 15000) { for (const a of e.aliases) m.delete(a); m.delete(k); }
-        }
-        return dedup;
+            // 曲线采样：只记 live 行；decode=Δg/Δt 真值差分（dt<250ms 或 g 回落不发，回落显示值），prefill=prefill_tps
+            for (const e of seenE) {
+                const r = e.row;
+                let v = 0;
+                if (r.phase === 'decode') {
+                    const g = parseInt(r.tokens_generated) || 0;
+                    if (e.lastT && g > e.lastG && now - e.lastT >= 250) v = (g - e.lastG) / ((now - e.lastT) / 1000);
+                    if (g > 0) { e.lastG = g; e.lastT = now; }
+                    if (!(v > 0)) v = r.avg_speed_3s != null ? parseFloat(r.avg_speed_3s) : (parseFloat(r.avg_speed) || 0);
+                } else {
+                    v = parseFloat(r.prefill_tps) || 0;
+                }
+                const last = e.spark[e.spark.length - 1];
+                if (v > 0 && (!last || now - last.t > 400)) e.spark.push({ t: now, v });
+                while (e.spark.length > 2 && now - e.spark[0].t > WIN_MS) e.spark.shift();
+                if (e.spark.length > 40) e.spark.splice(0, e.spark.length - 40);
+            }
+            // 退场：>END_MS 无数据 = 输出结束
+            st.list = st.list.filter(e => {
+                if (now - e.seen <= END_MS) return true;
+                for (const [k, v] of [...st.byKey]) if (v === e) st.byKey.delete(k);
+                return false;
+            });
+            if (st.list.length > 64) { // 防泄漏保险：极端异常下裁最老
+                st.list.sort((a, b) => a.seq - b.seq).splice(0, st.list.length - 64)
+                    .forEach(e => { for (const [k, v] of [...st.byKey]) if (v === e) st.byKey.delete(k); });
+            }
+            for (const e of st.list) e.held = !seenE.has(e);
+            return st.list.slice().sort((a, b) => a.seq - b.seq);
+        },
     };
 })();
-
+function concSpark(e, color, H) {
+    const h = e.spark || [];
+    if (h.length < 2) return '';
+    if (!H) H = e.row && e.row.phase === 'decode' ? 44 : 40;
+    const P = 3, N = 30;
+    const max = Math.max(...h.map(p => p.v), 1);
+    const pts = h.map((p, i) => {
+        const idx = N - h.length + i;
+        const x = P + (idx / (N - 1)) * (100 - 2 * P);
+        const y = H - P - (p.v / max) * (H - 2 * P);
+        return [x.toFixed(1), y.toFixed(1)];
+    });
+    if (e.row && e.row.phase !== 'decode' && h.length < N) { // 预填充曲线从 0 起步
+        const idx0 = N - h.length - 1;
+        pts.unshift([(P + (idx0 / (N - 1)) * (100 - 2 * P)).toFixed(1), (H - P).toFixed(1)]);
+    }
+    const smooth = (ps) => {
+        if (ps.length < 3) return 'M' + ps.map(p => p.join(',')).join('L');
+        let d = 'M' + ps[0][0] + ',' + ps[0][1];
+        for (let i = 0; i < ps.length - 1; i++) {
+            const p0 = ps[i - 1] || ps[i], p1 = ps[i], p2 = ps[i + 1], p3 = ps[i + 2] || p2;
+            d += 'C' + (+p1[0] + (+p2[0] - +p0[0]) / 6).toFixed(2) + ',' + (+p1[1] + (+p2[1] - +p0[1]) / 6).toFixed(2)
+                + ' ' + (+p2[0] - (+p3[0] - +p1[0]) / 6).toFixed(2) + ',' + (+p2[1] - (+p3[1] - +p1[1]) / 6).toFixed(2)
+                + ' ' + p2[0] + ',' + p2[1];
+        }
+        return d;
+    };
+    const lineD = smooth(pts);
+    const baseY = (H - P).toFixed(1);
+    const areaD = lineD + 'L' + pts[pts.length - 1][0] + ',' + baseY + 'L' + pts[0][0] + ',' + baseY + 'Z';
+    const lastPt = pts[pts.length - 1];
+    return '<svg style="width:100%;height:' + H + 'px;display:block" viewBox="0 0 100 ' + H + '" preserveAspectRatio="none" title="近 ' + Math.max(1, Math.round((h[h.length - 1].t - h[0].t) / 1000)) + 's tok/s 走势（500ms 引擎真值差分，窗口 15s）">' +
+        '<path d="' + areaD + '" fill="' + color + '" opacity="0.12"/>' +
+        '<path d="' + lineD + '" fill="none" stroke="' + color + '" stroke-width="1.5" opacity="0.9" vector-effect="non-scaling-stroke"/>' +
+        '<circle cx="' + lastPt[0] + '" cy="' + lastPt[1] + '" r="1.5" fill="' + color + '"/></svg>';
+}
 async function renderConcurrentCard(s) {
     try {
         const insts = (s.instances && s.instances.length > 0)
             ? s.instances
             : [{ port: null, gpu: null, model: '', running: s.running || 0, queued: s.queued || 0,
                  active_requests: s.active_requests || [], last_second: s.last_second || null, primary: true }];
-        const totalActive = insts.reduce((n, i) => n + ((i.active_requests || []).length), 0);
-        const totalRunning = insts.reduce((n, i) => n + (i.running || 0), 0);
-        // Live token streams: requests routed through this console proxy are
-        // tee'd server-side (see server.js teeSseStream). Zip to rows by
-        // start order; rows without a capture show a hint instead.
-        // 只与主实例行 zip（代理只捕获走主端口的流量）
         const liveList = (s.live_streams || []).filter(l => !l.done);
-        // 每请求 tok/s 历史（sparkline）：key=taskId||id:phase，预填充和输出分开记录
-        // 保留最近 30 个采样点（500ms/点 ≈ 15s）；phase 切换时重置历史
-        if (!window.__tpsHist) window.__tpsHist = new Map();
-        if (!window.__concGenHist) window.__concGenHist = new Map(); // [conc-spark-fine] key -> {t,g} 引擎真值上一拍
-        // [strata-rule-1012] 速度/Decode/Prefill 数值规则对齐「Strata 监控」速度卡（strata-monitor.html
-        // renderMetrics）：数值不空窗，回落链 = 当前实测 → 本请求全程均值 → 最近一次有效实测值，
-        // 且回落时子标签明示语义（Strata 空闲显示「上次请求 Decode/Prefill」的行级等价实现）。
-        // 只缓存实测有效值（>0）；滑窗未成熟/暂停产出期用最近真值顶位，绝不用 0 冒充、不再闪 --。
-        if (!window.__concSpdHold) window.__concSpdHold = new Map(); // key -> {v,t}
-        const SPD_HOLD_MS = 60000;
-        const spdHold = (key, raw) => {
-            const nowMs = Date.now();
-            if (raw > 0 && isFinite(raw)) {
-                const e = { v: raw, t: nowMs };
-                window.__concSpdHold.set(key, e);
-                window.__concSpdHold.set(String(key).charAt(0) + ':__last', e); // 空闲态「上次请求」回落料
-                return { v: raw, held: false };
-            }
-            const e = window.__concSpdHold.get(key);
-            if (e && nowMs - e.t <= SPD_HOLD_MS) return { v: e.v, held: true };
-            return { v: 0, held: false };
-        };
-        if (window.__concSpdHold.size > 300) { // 防泄漏：超限时清过期项
-            const _nw = Date.now();
-            for (const [_k, _e] of window.__concSpdHold) if (_nw - _e.t > SPD_HOLD_MS) window.__concSpdHold.delete(_k);
-        }
-        const rowKey = (r) => r.pp_rid || r.taskId || r.id || '';
-        // [conc-spark-sticky 1014] 曲线采样已移入行渲染循环（键=槽位钉稳 __sparkKey）；这里只做周期清扫
-        if (!window.__tpsSweepAt || Date.now() - window.__tpsSweepAt > 10000) {
-            window.__tpsSweepAt = Date.now();
-            const _nw3 = Date.now();
-            for (const [k, h] of [...window.__tpsHist]) { if (!h.length || _nw3 - h[h.length - 1].t > 30000) window.__tpsHist.delete(k); }
-            for (const [k, g] of [...window.__concGenHist]) { if (_nw3 - g.t > 30000) window.__concGenHist.delete(k); }
-        }
-        const tpsSpark = (k, color, phase, H) => {
-            const key = k ? k + ':' + (phase === 'decode' ? 'd' : 'p') : null;
-            const h = (key && window.__tpsHist.get(key)) || [];
-            if (h.length < 2) return '';
-            if (!H) H = 44;
-            const P = 3;
-            // 固定时间窗口 30 点（15s），最新点在右端，历史向左延伸；
-            // 数据不足时左侧留空，随时间推移逐渐填满
-            const N = 30;
-            const max = Math.max(...h.map(p => p.v), 1);
-            const min = 0;
-            const pts = h.map((p, i) => {
-                const idx = N - h.length + i;
-                const x = P + (idx / (N - 1)) * (100 - 2 * P);
-                const y = H - P - ((p.v - min) / (max - min || 1)) * (H - 2 * P);
-                return [x.toFixed(1), y.toFixed(1)];
-            });
-            // 预填充曲线从初始值 0 起步：窗口未满时，在最早数据点左侧紧邻位置补一个 0 值点，
-            // 让曲线从 0 爬升到实际 tok/s（输出曲线不受影响）
-            if (phase === 'prefill' && h.length < N) {
-                const idx0 = N - h.length - 1;
-                const x0 = P + (idx0 / (N - 1)) * (100 - 2 * P);
-                pts.unshift([x0.toFixed(1), (H - P).toFixed(1)]);
-            }
-            // [conc-spark-fine 1014] Catmull-Rom 转三次贝塞尔平滑（同 PD 动态图手法），
-            // 500ms 真值差分点经平滑后瞬时起伏可读且不显锯齿
-            const smooth = (ps) => {
-                if (ps.length < 3) return 'M' + ps.map(p => p.join(',')).join('L');
-                let d = 'M' + ps[0][0] + ',' + ps[0][1];
-                for (let i = 0; i < ps.length - 1; i++) {
-                    const p0 = ps[i - 1] || ps[i], p1 = ps[i], p2 = ps[i + 1], p3 = ps[i + 2] || p2;
-                    d += 'C' + (+p1[0] + (+p2[0] - +p0[0]) / 6).toFixed(2) + ',' + (+p1[1] + (+p2[1] - +p0[1]) / 6).toFixed(2)
-                        + ' ' + (+p2[0] - (+p3[0] - +p1[0]) / 6).toFixed(2) + ',' + (+p2[1] - (+p3[1] - +p1[1]) / 6).toFixed(2)
-                        + ' ' + p2[0] + ',' + p2[1];
-                }
-                return d;
-            };
-            const lineD = smooth(pts);
-            const baseY = (H - P).toFixed(1);
-            const areaD = lineD + 'L' + pts[pts.length - 1][0] + ',' + baseY + 'L' + pts[0][0] + ',' + baseY + 'Z';
-            const last = h[h.length - 1];
-            const lastIdx = N - 1;
-            const lx = P + (lastIdx / (N - 1)) * (100 - 2 * P);
-            const ly = H - P - ((last.v - min) / (max - min || 1)) * (H - 2 * P);
-            return '<svg style="width:100%;height:' + H + 'px;display:block" viewBox="0 0 100 ' + H + '" preserveAspectRatio="none" title="近 ' + Math.max(1, Math.round((h[h.length - 1].t - h[0].t) / 1000)) + 's tok/s 走势（500ms 引擎真值差分，窗口 15s；100ms 级需后端下发逐步样本）">' +
-                '<path d="' + areaD + '" fill="' + color + '" opacity="0.12"/>' +
-                '<path d="' + lineD + '" fill="none" stroke="' + color + '" stroke-width="1.5" opacity="0.9" vector-effect="non-scaling-stroke"/>' +
-                '<circle cx="' + lx.toFixed(1) + '" cy="' + ly.toFixed(1) + '" r="1.5" fill="' + color + '"/></svg>';
-        };
-        // 每行 GPU 徽标（哪张卡）
-        const gpuChip = (req) => {
-            const gs = reqGpuList(req);
-            if (!gs.length) return '';
-            const multi = gs.length > 1;
-            const bg = multi ? 'var(--green-bg)' : 'var(--blue-bg)';
-            const fg = multi ? 'var(--green)' : 'var(--blue)';
-            return '<span style="display:inline-block;font-size:10px;line-height:1;padding:2px 5px;border-radius:4px;background:' + bg + ';color:' + fg + ';font-weight:700;margin-right:6px;vertical-align:1px">GPU ' + gs.join('+') + '</span>';
-        };
-        // 实例分组头：GPU 号 + 端口 + 模型 + 并发数（旧后端无实例信息时不显示）
-        const instHeadHtml = (inst, reqCount) => {
-            if (inst.gpu == null && !inst.port) return '';
-            const gpuLabel = instGpuLabel(inst);
-            return '<div style="display:flex;align-items:center;gap:8px;margin:10px 0 6px">' +
-                '<span style="font-size:12px;font-weight:700;padding:2px 8px;border-radius:5px;background:var(--accent-bg);color:var(--accent);border:1px solid var(--border)">' + gpuLabel + '</span>' +
-                '<span style="font-size:11px;color:var(--text-tertiary)">:' + (inst.port || '--') + (inst.model ? ' · ' + esc(inst.model) : '') + '</span>' +
-                ''
-                '</div>';
-        };
+        // 注册表一拍：live 流预览按后端原始顺序 zip 到行（重排前绑定），再逐实例登记
+        const views = insts.map(inst => {
+            const zipped = (inst.active_requests || []).map((r, i) => Object.assign({}, r, { __lv: inst.primary ? (liveList || [])[i] : undefined }));
+            return { inst, entries: __concReg.tick(inst, zipped) };
+        });
+        const totalRows = views.reduce((n, v) => n + v.entries.length, 0);
+        const totalLive = views.reduce((n, v) => n + v.entries.filter(e => !e.held).length, 0);
+        const totalRunning = insts.reduce((n, i) => n + (i.running || 0), 0);
+        const gpuChipOf = (inst) => '<span style="display:inline-block;font-size:10px;line-height:1;padding:2px 6px;border-radius:4px;background:var(--accent-bg);color:var(--accent);border:1px solid var(--border);font-weight:700">GPU ' + instGpuBadgeText(inst) + '</span>';
         const liveMidHtml = (lv, phase) => {
                 const t = lv ? (lv.text || '') : '';
                 const head = lv
@@ -2901,91 +2799,59 @@ async function renderConcurrentCard(s) {
                     </div>
                 </div>`;
             };
-
-        if (totalActive === 0 && totalRunning > 0) {
-            // 兜底：Running 有值但明细未捕获（请求刚进 decode 的窗口期）
+        if (totalRows === 0 && totalRunning > 0) {
             const _stf = document.getElementById('activeRequestsStatus'); if (_stf) { _stf.style.display = 'block'; _stf.textContent = '正在处理 ' + totalRunning + ' 个请求（明细捕获中，下一拍出现）'; }
             document.getElementById('requestSpeeds').innerHTML = '<div style="text-align:center;padding:14px;font-size:12px;color:var(--text-tertiary)">请求进行中 · 预填充进度/输出速度下一拍（500ms）出现</div>';
             renderGpuQueueCard(insts);
             return;
         }
-        if (totalActive > 0) {
-            const _st = document.getElementById('activeRequestsStatus'); if (_st) { _st.style.display = 'block'; _st.textContent = '正在处理 ' + totalActive + ' 个请求 · 数据 500ms 轮询刷新'; _st.title = '速度/进度来自 /v1/internal/stats（500ms 轮询），live 文本流为控制台代理捕获（仅走代理的请求）'; }
-            document.getElementById('requestSpeeds').innerHTML = insts.map(inst => {
-                const reqs = __concSlotOrder(inst, liveList); // [conc-slot-pin 1012] 行位=首现顺序钉住，不随后端行序轮换
-                // [strata-rule-1012b] 行级「当前 Decode」分摊值：实例实时生成吞吐(last_second.tokens) ÷ 输出行数
-                const _ndR = reqs.filter(x => x.phase === 'decode' && !x.__held).length; // 分摊分母只数 live 行（保持行不占吞吐份额）
-                const _ig1R = (inst.last_second && parseFloat(inst.last_second.tokens)) || 0;
-                const _shareTps = _ndR > 0 && _ig1R > 0 ? _ig1R / _ndR : 0;
-                const gpuChip = '<span style="display:inline-block;font-size:10px;line-height:1;padding:2px 6px;border-radius:4px;background:var(--accent-bg);color:var(--accent);border:1px solid var(--border);font-weight:700">GPU ' + instGpuBadgeText(inst) + '</span>';
-                if (!reqs.length) return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0">' + gpuChip + '<span style="font-size:12px;color:var(--text-tertiary)">空闲</span></div>';
-                return '<div style="padding:6px 0;border-bottom:1px solid var(--border)">' + gpuChip + '<div style="display:flex;flex-direction:column;gap:6px;margin-top:6px">' + reqs.map((r, ri) => {
+        if (totalRows > 0) {
+            const _st = document.getElementById('activeRequestsStatus'); if (_st) { _st.style.display = 'block'; _st.textContent = '正在处理 ' + totalLive + ' 个请求 · 数据 500ms 轮询刷新'; _st.title = '一行=一个 vLLM 请求（rid 为身份）；行保持到输出结束（末次数据 >3s 退场）；半透明行=本拍后端未随行'; }
+            document.getElementById('requestSpeeds').innerHTML = views.map(v => {
+                const inst = v.inst;
+                if (!v.entries.length) return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0">' + gpuChipOf(inst) + '<span style="font-size:12px;color:var(--text-tertiary)">空闲</span></div>';
+                // 分摊兜底料：实例实时生成吞吐 ÷ live decode 条目数
+                const _nd = v.entries.filter(e => !e.held && e.row.phase === 'decode').length;
+                const _ig = (inst.last_second && parseFloat(inst.last_second.tokens)) || 0;
+                const shareTps = _nd > 0 && _ig > 0 ? _ig / _nd : 0;
+                return '<div style="padding:6px 0;border-bottom:1px solid var(--border)">' + gpuChipOf(inst) + '<div style="display:flex;flex-direction:column;gap:6px;margin-top:6px">' + v.entries.map(e => {
+                    const r = e.row;
                     const isDecode = r.phase === 'decode';
-                    const lv = r.__lv; // live 流预览（走控制台代理的请求）——已在重排前按后端原始顺序 zip 绑定
+                    const lv = r.__lv;
                     const phaseColor = isDecode ? 'var(--green)' : 'var(--orange)';
                     const tChip = r.taskId ? '<span style="font-size:10px;font-weight:800;color:var(--text-secondary);font-variant-numeric:tabular-nums">' + esc(r.taskId) + '</span>' : '';
-                    // [conc-pin-id 1014] REQ 号取槽位钉稳值；vLLM rid 是跨行轮换的稳定真身份，一并显示
-                    const idStr = esc(r.__pinId || r.id || '') + (r.__pinRid ? ' · ' + esc(r.__pinRid) : '');
+                    const idStr = esc(e.firstId || r.id || '');
+                    const ridStr = e.rid ? 'rid ' + esc(e.rid) : ''; // 独立 meta 段（并入 idStr 会被 join(' · ') 的 filter 吃掉）
                     const ipStr = esc(r.ip || '');
                     const elapsed = r.elapsed_s !== undefined ? r.elapsed_s + 's' : '';
                     const outTok = (parseInt(r.tokens_generated) || 0).toLocaleString();
                     const lastSec = parseInt(r.tok_last_sec) || 0;
-                    const has3s = r.avg_speed_3s !== undefined && r.avg_speed_3s !== null;
-                    const _own3 = has3s ? parseFloat(r.avg_speed_3s) : 0;
-                    const _avgAll = parseFloat(r.avg_speed) || 0;
-                    // [conc-gq-rate 1014] Decode 数值口径与「GPU 排队·处理」卡完全一致（用户确认该口径正确）：
-                    //   ① 后端本行实时 avg_speed_3s → ② 本行全程均值 avg_speed（buildGpuQueueSegs 同款）
-                    //   → ③ 上一值（≤60s，不空窗）→ ④ 实例吞吐÷行数分摊（最后兜底，全行同值才出现）。
-                    const _dH = r.__held ? { v: 0, held: false } : spdHold('d:' + rowKey(r), _own3 > 0 ? _own3 : _avgAll); // 缓存只存 live 行实测值（保持行是旧快照，不得回写）
-                    let decodeTps, dLabel, dTip, dRound0;
-                    if (_own3 > 0) { decodeTps = _own3; dLabel = spdMeta(r).label; dTip = spdMeta(r).tip; dRound0 = spdMeta(r).share; }
-                    else if (_avgAll > 0) { decodeTps = _avgAll; dLabel = spdMeta(r).label; dTip = spdMeta(r).tip; dRound0 = spdMeta(r).share; }
-                    else if (_dH.held) { decodeTps = _dH.v; dLabel = '上一值 tok/s'; dTip = '实时滑窗未成熟/暂停产出，显示本请求最近一次实测值（同 Strata 速度卡规则：数值不空窗、回落明示语义）'; dRound0 = false; }
-                    else if (_shareTps > 0) { decodeTps = _shareTps; dLabel = '实时 tok/s·分摊'; dTip = '本行无任何每请求实测数据，按 Strata 速度卡口径显示当前 Decode：实例实时生成吞吐 ÷ 并发输出行数（各行同值，非个体实测）'; dRound0 = true; }
-                    else { decodeTps = 0; dLabel = spdMeta(r).label; dTip = spdMeta(r).tip; dRound0 = false; }
-                    const _dHeld = !(_own3 > 0) && !(_avgAll > 0) && _dH.held;
-                    const _pRaw = parseFloat(r.prefill_tps) || 0;
-                    const _pH = r.__held ? { v: _pRaw, held: false } : spdHold('p:' + rowKey(r), _pRaw); // 同上：保持行不回写
-                    const prefillTps = _pH.v;
-                    // [conc-spark-sticky 1014] 曲线采样点：键=槽位 __sparkKey（跨 rid 晚到/REQ 轮换连续）；
-                    // decode 优先引擎真值 Δg/Δt（dt<250ms 或 g 回落不发，回落显示链），保持行不记录（数据是旧快照）。
-                    if (!r.__held) {
-                        const _sk = r.__sparkKey || rowKey(r);
-                        const _nowS = Date.now();
-                        let _recV = 0;
-                        if (isDecode) {
-                            let _dgS = 0;
-                            const _gS = parseInt(r.tokens_generated) || 0;
-                            const _pvS = _sk && window.__concGenHist.get(_sk);
-                            if (_gS > 0) {
-                                if (_pvS && _gS > _pvS.g && _nowS - _pvS.t >= 250) _dgS = (_gS - _pvS.g) / ((_nowS - _pvS.t) / 1000);
-                                if (_sk) window.__concGenHist.set(_sk, { t: _nowS, g: _gS });
-                            }
-                            _recV = _dgS > 0 ? _dgS : (_own3 > 0 ? _own3 : (_avgAll > 0 ? _avgAll : (decodeTps > 0 ? decodeTps : 0)));
-                        } else {
-                            _recV = prefillTps > 0 ? prefillTps : 0;
-                        }
-                        if (_sk) {
-                            const _kS = _sk + ':' + (isDecode ? 'd' : 'p');
-                            let _hS = window.__tpsHist.get(_kS);
-                            if (!_hS) { _hS = []; window.__tpsHist.set(_kS, _hS); }
-                            const _lS = _hS[_hS.length - 1];
-                            if (!_lS || _nowS - _lS.t > 400) _hS.push({ t: _nowS, v: _recV });
-                            while (_hS.length > 2 && _nowS - _hS[0].t > 15000) _hS.shift();
-                            if (_hS.length > 40) _hS.splice(0, _hS.length - 40);
-                        }
-                    }
+                    // Decode 数值链（规则④）：本行实时 → 全程均值 → 上一显示值 → 分摊
+                    const own3 = r.avg_speed_3s != null ? parseFloat(r.avg_speed_3s) : 0;
+                    const avgAll = parseFloat(r.avg_speed) || 0;
+                    if (!e.held) { const m = own3 > 0 ? own3 : avgAll; if (m > 0) e.lastShown = m; }
+                    let decodeTps, dLab, dDim = false;
+                    if (own3 > 0) { decodeTps = own3; dLab = '当前 Decode·实测'; }
+                    else if (avgAll > 0) { decodeTps = avgAll; dLab = '当前 Decode·均值'; }
+                    else if (e.lastShown > 0) { decodeTps = e.lastShown; dLab = '上次 Decode'; dDim = true; }
+                    else if (isDecode && shareTps > 0) { decodeTps = shareTps; dLab = '当前 Decode·分摊'; }
+                    else { decodeTps = 0; dLab = 'Decode'; }
+                    // Prefill 数值链：prefill_tps（未缓存÷耗时）→ 上一显示值
+                    const pRaw = parseFloat(r.prefill_tps) || 0;
+                    if (!e.held && pRaw > 0) e.lastShownP = pRaw;
+                    const prefillTps = pRaw > 0 ? pRaw : (e.lastShownP || 0);
+                    const ppExact = !!r.prefill_exact;
                     const ppTotal = parseInt(r.prefill_total_uncached) || 0;
                     const ppDone = parseInt(r.prefill_done_uncached) || 0;
                     const ppPct = ppTotal > 0 ? Math.min(100, Math.max(0, Math.round(ppDone / ppTotal * 100))) : 0;
-                    const ppExact = !!r.prefill_exact;
                     const ppDur = (parseFloat(r.prefill_s) || 0) > 0 ? parseFloat(r.prefill_s).toFixed(1) + 's' : '';
-                    // 元信息行
-                    let meta = [idStr, ipStr, elapsed, (ppTotal > 0 ? ppDone.toLocaleString() + ' / ' + ppTotal.toLocaleString() + ' tok 待算' : null)].filter(Boolean).join(' · ');
-                    if (isDecode) {
-                        meta = [idStr, ipStr, elapsed, outTok + ' tok 已输出', lastSec > 0 ? '上一秒 ' + lastSec + (spdMeta(r).exact ? '' : ' (摊)') : null, ppDur ? '预填充 ' + ppDur : null].filter(Boolean).join(' · ');
-                    }
-                    // 主体
+                    // 全局「上次请求」回落料（空闲态用）
+                    if (!e.held && isDecode && (own3 > 0 || avgAll > 0)) window.__concLastShownG = { d: decodeTps, p: prefillTps, t: Date.now() };
+                    let meta = [idStr, ridStr, ipStr, elapsed, (ppTotal > 0 ? ppDone.toLocaleString() + ' / ' + ppTotal.toLocaleString() + ' tok 待算' : null)].filter(Boolean).join(' · ');
+                    if (isDecode) meta = [idStr, ridStr, ipStr, elapsed, outTok + ' tok 已输出', lastSec > 0 ? '上一秒 ' + lastSec : null, ppDur ? '预填充 ' + ppDur : null].filter(Boolean).join(' · ');
+                    const col = (val, unit, lab, tip, dim, color) => '<div style="text-align:right;min-width:64px"><div><span style="font-size:20px;font-weight:800;font-variant-numeric:tabular-nums;color:' + (color || 'var(--text-primary)') + (dim ? ';opacity:.6' : '') + '">' + val + '</span><span style="font-size:10px;color:var(--text-tertiary);margin-left:3px">' + unit + '</span></div><div style="font-size:10px;color:var(--text-tertiary);margin-top:1px;white-space:nowrap" title="' + tip + '">' + lab + '</div></div>';
+                    const dTip = own3 > 0 ? '后端每行实时滑窗（v3 实测）' : avgAll > 0 ? '本请求全程实测均值（与 GPU 排队卡同源）' : dDim ? '本拍无新实测，显示最近一次值（不空窗）' : '实例实时吞吐÷输出行数分摊（无每请求数据时的兜底，各行同值）';
+                    const pLabD = prefillTps > 0 ? (ppExact ? '本请求 Prefill·实测' : (pRaw > 0 ? '上次请求 Prefill' : '上次 Prefill')) : 'Prefill';
                     let body;
                     if (isDecode) {
                         body = '<div style="display:flex;align-items:center;gap:12px">' +
@@ -2994,35 +2860,19 @@ async function renderConcurrentCard(s) {
                             '<div style="font-size:10.5px;color:var(--text-tertiary);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + meta + '</div>' +
                             (lv ? liveMidHtml(lv, 'decode') : '') +
                             '</div>' +
-                            '<div style="flex:1;min-width:0">' + tpsSpark(r.__sparkKey || rowKey(r), 'var(--green)', 'decode') + '</div>' +
-                            '<div style="text-align:right;flex-shrink:0">' +
-                            (function () { // [strata-speed-ui 1014] Strata 监控 Speed 卡版式：大号数值+t/s，下方灰字语义标签，Decode/Prefill 双值并排
-                                const dLab = _dHeld ? '上次请求 Decode' : (_own3 > 0 ? '当前 Decode·实测' : (_avgAll > 0 ? '当前 Decode·均值' : '当前 Decode·分摊'));
-                                const pLab = prefillTps > 0 ? (_pH.held && !(_pRaw > 0) ? '上次 Prefill' : (ppExact ? '本请求 Prefill·实测' : '上次请求 Prefill')) : 'Prefill';
-                                const pTip = ppExact ? '本请求预填充实测：未缓存 prompt ÷ 预填充耗时（同 Strata (prompt−reused)/prompt_ms 口径）' : '本请求无每请求预填充实测，显示最近一次完成 prefill 的实测（Strata 空闲回落口径）';
-                                const col = (v, unit, lab, tip, dim, color) => '<div style="text-align:right;min-width:64px"><div><span style="font-size:20px;font-weight:800;font-variant-numeric:tabular-nums;color:' + (color || 'var(--text-primary)') + (dim ? ';opacity:.6' : '') + '">' + v + '</span><span style="font-size:10px;color:var(--text-tertiary);margin-left:3px">' + unit + '</span></div><div style="font-size:10px;color:var(--text-tertiary);margin-top:1px;white-space:nowrap" title="' + tip + '">' + lab + '</div></div>';
-                                return '<div style="display:flex;gap:14px;flex-shrink:0">' +
-                                    col(decodeTps > 0 ? decodeTps.toFixed(dRound0 ? 0 : 1) : '--', 't/s', dLab, dTip, _dHeld) +
-                                    col(prefillTps > 0 ? Math.round(prefillTps).toLocaleString() : '--', 't/s', pLab, pTip, false, 'var(--orange)') +
-                                    '</div>';
-                            })() +
+                            '<div style="flex:1;min-width:0">' + concSpark(e, 'var(--green)', 44) + '</div>' +
+                            '<div style="display:flex;gap:14px;flex-shrink:0">' +
+                            col(decodeTps > 0 ? decodeTps.toFixed(dLab === '当前 Decode·分摊' ? 0 : 1) : '--', 't/s', dLab, dTip, dDim) +
+                            col(prefillTps > 0 ? Math.round(prefillTps).toLocaleString() : '--', 't/s', pLabD, ppExact ? '本请求预填充：未缓存 prompt ÷ 预填充耗时（同 Strata 口径）' : '本请求无每请求预填充实测，显示最近一次完成 prefill 的实测', false, 'var(--orange)') +
                             '</div></div>';
                     } else {
-                        // 09-06 布局：两行 grid（auto 1fr auto）
-                        //   行1 = 「预填充中 实测」(col1) + 进度条(col2)
-                        //   行2 = 元信息(以「XXX tok 待算」结尾, col1) + 曲线(col2) + 数字(col3)
-                        // 进度条与曲线同处 col2(1fr) → 宽度一致且左右端对齐；
-                        // col1 宽度 = 元信息右端 → 进度条/曲线左端不越过「XXX tok 待算」
                         const titleHtml = '<span style="font-size:12px;font-weight:700;color:var(--orange);white-space:nowrap">预填充中</span>' + tChip + (ppExact ? ' <span style="font-size:9px;color:var(--green);font-weight:600">实测</span>' : ' <span style="font-size:9px;color:var(--text-tertiary);font-weight:600" title="进度/速度为实测聚合按并发预填充行数分摊的估算">估</span>');
                         const metaInline = '<span style="font-size:10.5px;color:var(--text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;max-width:300px" title="' + esc(meta) + '">' + meta + '</span>';
                         const barHtml = '<div style="grid-column:2;grid-row:1;height:4px;background:var(--bg-primary);border-radius:2px;overflow:hidden;border:1px solid var(--border)"><div style="height:100%;width:' + ppPct + '%;background:var(--orange);border-radius:2px;transition:width .5s"></div></div>';
-                        const curveHtml = '<div style="grid-column:2;grid-row:2;height:40px">' + tpsSpark(r.__sparkKey || rowKey(r), 'var(--orange)', 'prefill', 40) + '</div>';
-                        // [strata-speed-ui 1014] 与 decode 行同款 Strata Speed 卡双值：Decode（未开始 --）+ 当前 Prefill
-                        const pLabP = prefillTps > 0 ? (_pH.held && !(_pRaw > 0) ? '上次 Prefill' : (ppExact ? '当前 Prefill·实测' : '当前 Prefill·估')) : 'Prefill';
-                        const colS = (v, unit, lab, tip, dim, color) => '<div style="text-align:right;min-width:64px"><div><span style="font-size:20px;font-weight:800;font-variant-numeric:tabular-nums;color:' + (color || 'var(--text-primary)') + (dim ? ';opacity:.6' : '') + '">' + v + '</span><span style="font-size:10px;color:var(--text-tertiary);margin-left:3px">' + unit + '</span></div><div style="font-size:10px;color:var(--text-tertiary);margin-top:1px;white-space:nowrap" title="' + tip + '">' + lab + '</div></div>';
+                        const curveHtml = '<div style="grid-column:2;grid-row:2;height:40px">' + concSpark(e, 'var(--orange)', 40) + '</div>';
                         const numsHtml = '<div style="grid-column:3;grid-row:2;white-space:nowrap;display:flex;gap:14px;align-items:flex-start">' +
-                            colS('--', 't/s', 'Decode', '请求尚在预填充，未开始输出', true) +
-                            colS(prefillTps > 0 ? Math.round(prefillTps).toLocaleString() : '--', 't/s', pLabP, ppExact ? '本请求预填充实测：未缓存 prompt ÷ 已算时长（同 Strata 口径）' : '无每请求实测，按并发预填充行数分摊实测聚合', _pH.held && !(_pRaw > 0), 'var(--orange)') +
+                            col('--', 't/s', 'Decode', '请求尚在预填充，未开始输出', true) +
+                            col(prefillTps > 0 ? Math.round(prefillTps).toLocaleString() : '--', 't/s', prefillTps > 0 ? (ppExact ? '当前 Prefill·实测' : '当前 Prefill·估') : 'Prefill', ppExact ? '本请求预填充实测：未缓存 prompt ÷ 已算时长' : '无每请求实测，按并发预填充行数分摊实测聚合', false, 'var(--orange)') +
                             '</div>';
                         body = '<div style="min-width:0">' +
                             (ppPct > 0
@@ -3036,7 +2886,7 @@ async function renderConcurrentCard(s) {
                             (lv ? liveMidHtml(lv, 'prefill') : '') +
                             '</div>';
                     }
-                    return '<div style="border:1px solid var(--border);border-top:3px solid ' + phaseColor + ';border-radius:8px;background:var(--bg-primary);padding:8px 10px' + (r.__held ? ';opacity:.55' : '') + '"' + (r.__held ? ' title="该请求仍在运行，本拍后端未随行（引擎行轮换窗口），按上一拍数据原位保持 ≤2.5s，回来即恢复"' : '') + '>' + body + '</div>';
+                    return '<div style="border:1px solid var(--border);border-top:3px solid ' + phaseColor + ';border-radius:8px;background:var(--bg-primary);padding:8px 10px' + (e.held ? ';opacity:.55' : '') + '"' + (e.held ? ' title="该请求仍在运行，本拍后端未随行（行集轮换窗口），原位保持显示；末次数据 >3s 无更新才退场"' : '') + '>' + body + '</div>';
                 }).join('') + '</div></div>';
             }).join('');
         } else if (totalRunning > 0 || s.total_speed > 0) {
@@ -3044,8 +2894,7 @@ async function renderConcurrentCard(s) {
             const speed = s.total_speed > 0 ? s.total_speed : (s.avg_speed_per_request || 0);
             const pp = s.avg_prefill_time_seconds > 0 ? (s.avg_prefill_tokens_per_request / s.avg_prefill_time_seconds) : 0;
             document.getElementById('requestSpeeds').innerHTML = insts.filter(inst => (inst.running || 0) > 0).map(inst => {
-                const gpuChip = '<span style="display:inline-block;font-size:10px;line-height:1;padding:2px 6px;border-radius:4px;background:var(--accent-bg);color:var(--accent);border:1px solid var(--border);font-weight:700">GPU ' + instGpuBadgeText(inst) + '</span>';
-                return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0">' + gpuChip +
+                return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0">' + gpuChipOf(inst) +
                     '<span style="font-size:11px;font-weight:600;color:var(--green)">输出中</span>' +
                     '<span style="font-size:11px;color:var(--text-secondary);font-variant-numeric:tabular-nums">' + (parseFloat(speed).toFixed(1)) + ' tok/s</span>' +
                     (inst.primary ? '<span style="font-size:11px;color:var(--text-tertiary)">· 预填充 ' + (parseFloat(pp).toFixed(0)) + ' tok/s</span>' : '') +
@@ -3056,36 +2905,27 @@ async function renderConcurrentCard(s) {
             const clients = (s.connected_clients && s.connected_clients.length > 0)
                 ? '<div style="font-size:11px;color:var(--text-tertiary);margin-top:4px">当前连接: ' + s.connected_clients.map(esc).join(', ') + '</div>'
                 : '';
-            // [strata-rule-1012] 空闲回落（同 Strata 速度卡空闲口径：显示「上次请求 Decode/Prefill」不空窗）。
-            // 主源=最近完成请求实测（request-traces：decode_tps 真值；prefill 用实算口径
-            // (prompt−cached)/prefill_s，与 Strata (prompt−reused)/prompt_ms 同式）；
-            // 无完成记录时退回行级缓存的最近有效实测值（≤2min）。
+            // 空闲回落（Strata 空闲口径）：上次请求 Decode/Prefill = 最近完成请求实测
             let _lastReqHtml = '';
             try {
                 const lr = (typeof __recentReqs !== 'undefined' && __recentReqs && __recentReqs[0]) || null;
                 let _ld = lr ? (parseFloat(lr.decode_tps) || 0) : 0;
                 let _lp = (lr && (parseFloat(lr.prefill_s) || 0) > 0)
                     ? Math.max(0, (parseInt(lr.prompt_tokens) || 0) - (parseInt(lr.cached_tokens) || 0)) / parseFloat(lr.prefill_s) : 0;
-                const _nowH = Date.now();
-                const _hold = (k) => { const e = window.__concSpdHold.get(k); return (e && _nowH - e.t <= 120000) ? e.v : 0; };
-                if (!(_ld > 0)) _ld = _hold('d:__last');
-                if (!(_lp > 0)) _lp = _hold('p:__last');
+                const g = window.__concLastShownG;
+                if (!(_ld > 0) && g && Date.now() - g.t <= 120000) _ld = g.d || 0;
+                if (!(_lp > 0) && g && Date.now() - g.t <= 120000) _lp = g.p || 0;
                 const _pr = [];
                 if (_ld > 0) _pr.push('上次请求 Decode <b style="color:var(--green);font-variant-numeric:tabular-nums">' + _ld.toFixed(1) + '</b> t/s');
                 if (_lp > 0) _pr.push('上次请求 Prefill <b style="color:var(--orange);font-variant-numeric:tabular-nums">' + Math.round(_lp).toLocaleString() + '</b> t/s');
-                if (_pr.length) _lastReqHtml = '<div style="text-align:center;font-size:11px;color:var(--text-tertiary);margin-top:4px" title="同 Strata 监控速度卡规则：空闲时显示上次请求实测（数据源=最近完成请求 vLLM/SGLang 逐请求记录）">' + _pr.join(' · ') + '</div>';
+                if (_pr.length) _lastReqHtml = '<div style="text-align:center;font-size:11px;color:var(--text-tertiary);margin-top:4px" title="同 Strata 监控速度卡规则：空闲时显示上次请求实测（数据源=最近完成请求逐请求记录）">' + _pr.join(' · ') + '</div>';
             } catch (e) {}
             document.getElementById('requestSpeeds').innerHTML = '<div style="text-align:center;padding:12px;font-size:13px;color:var(--text-tertiary)">等待请求...' + clients + _lastReqHtml + '</div>';
         }
-        // GPU 排队·处理 时间线（右进左出：已处理任务保留）
+        // GPU 排队·处理 时间线（独立卡，数据源=后端原始行，不经并发卡注册表）
         renderGpuQueueCard(insts);
-        // [r18 停刷防御] 并发卡（500ms 独立轮询）成功渲染同样算"画面在推进"，即刻盖章
-        // _lastRenderAt。原实现只在主链 refreshDashboard 整轮结束后盖章——主链一轮要串行
-        // await /v1/models→stats→…，后端毛刺期一轮拖到十几秒时看门狗误判正常（kick 冷静期
-        // 也在顶），不自愈、数字看似定格。并发卡心跳成为独立的渲染推进信号后，看门狗能被
-        // 它救活，不必干等 12s 启动兜底。
+        // [r18 停刷防御] 并发卡成功渲染即盖 _lastRenderAt（独立渲染推进信号）
         window._lastRenderAt = Date.now();
-
     } catch (e) { console.warn('Concurrent render error:', e); }
 }
 

@@ -25,7 +25,7 @@
 
 | 模块 | 说明 |
 |---|---|
-| **仪表盘** | 每秒刷新：运行中请求数、decode/prefill 实时 tok/s、KV 缓存占用与命中率、预填充进度（TTFT/排队）、投机解码接受率、PD（prefill-decode 分离）走势曲线、逐秒吞吐折线。多实例（多端口）并列展示 |
+| **仪表盘** | 每秒刷新：运行中请求数、decode/prefill 实时 tok/s、KV 缓存占用与命中率、预填充进度（TTFT/排队）、投机解码接受率、PD（prefill-decode 分离）走势曲线、逐秒吞吐折线。多实例（多端口）并列展示。**并发请求卡为固定槽位板**：行数恒等于引擎 max-num-seqs（每实例），每个 vLLM 请求按 rid 装配进槽位（先占先得、存续期槽号不变、结束释放），输出速度（Decode/Prefill 双值，Strata 风格）与实时曲线（引擎真值 Δg/Δt，500ms/点）直接嵌入槽行；空闲槽显占位行，行数从结构上不随数据抖动超发。后端配套：v3 实时流按 rid 一行一请求（裸 rid 完成行联动标记带后缀兄弟序列，杜绝幽灵 rid） |
 | **实例管理** | 网页弹窗一键启动/停止 vLLM、SGLang 实例：TP/PP 并行、MTP/DFlash/DSpark/EAGLE 投机解码、YaRN 长上下文（512K/1M）、KV offload 到 CPU、PD 分离；「快速启动预设」把整套启动参数存成 JSON 按钮（`quickstart-presets.json` 热加载） |
 | **OpenAI 兼容代理** | 客户端统一指向 `http://<host>:8889/v1`，控制台按 `--served-model-name` 路由到对应实例端口；流式透传（不压缩不缓冲） |
 | **最近完成请求** | 逐请求真实 tok/s 表格。数据源双轨：vLLM 侧由 `dsh-logger-pkg` 插件写 `request-traces.jsonl`；SGLang 侧直接解析其日志与 metrics |

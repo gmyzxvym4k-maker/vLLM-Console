@@ -8,6 +8,16 @@
 
 ---
 
+## Unreleased — 2026-10-14 并发请求显示机制重构（固定槽位板 + rid 身份链）
+
+- **并发请求卡改为固定槽位板**（用户方案）：行数恒等于引擎 `max-num-seqs`（每实例独立，`model-params` 真值 30s 缓存），每个 vLLM 请求按 rid 装配进槽位——先占先得、存续期槽号不变、结束（>1.5s 无数据）释放；空槽显示「槽位 N · 空闲」占位行。行数从结构上不可能再随后端行集抖动超发（此前实测 4 并发显示 14 行）。
+- **输出速度直接嵌入槽行**（Strata 监控 Speed 卡版式）：每行双列大数字——Decode（本行实时 → 全程均值 → 上一显示值 → 分摊兜底，标签标明口径，与「GPU 排队·处理」卡同源）+ Prefill（未缓存 prompt ÷ 预填充耗时，同 Strata `(prompt−reused)/prompt_ms` 式）；行内实时曲线改用引擎真值 `tokens_generated` 逐拍 Δg/Δt 采样（500ms/点、窗 15s、贝塞尔平滑），rid 键跨行轮换连续不断线。
+- **前端推倒重写为单一「请求注册表」模型**（conc-v2）：清空十轮叠加的行位固定/缺席保持/封顶/缓存补丁层；空闲态显示「上次请求 Decode/Prefill」实测（Strata 空闲口径）。
+- **后端两处总根源修复**（需控制台重启，已做且引擎进程无恙）：① v3 激活时行↔rid 绑定稳定化（活跃 rid 行永不退绑、最近邻重绑仅限从未绑定行、容差 30s→10s、行数权威=注册行）——真实配对采样实锤此前绑定每拍错位；② 幽灵 rid 封死（引擎完成行携裸 rid、进度行携 -8hex 后缀 rid，后缀序列永等不到完成标记、滞留活跃集 30s 被放大成虚高行数；现完成行联动标记兄弟序列 + 活跃集 8s 新鲜度过滤）。
+- 验证：conc-v2 仿真 V1~V12、真实 stats 逐帧回灌 0 重复行、8 路突发负载压测行数贴合物理上限、unit 39/39、pages 全场景回归 0 失败。线上回滚备份 `server.js.bak-ridstable-1014` / `server.js.bak-ghostdone-1014` / `index.html.bak-pre-concv2-1014`。
+
+---
+
 ## Unreleased — 2026-10-11 二级缓存 160G 崩溃根因修复（rt-patch #14，引擎已带补丁运行）
 
 「修复崩溃 bug」深挖闭环：六崩根因**不是** CPU 池越界（#13 握手 clamp 在位，4194→3355 生效），而是官方 vLLM 0.31 `SimpleCPUOffloadConnector` 的 **load 路径缺 compute-done 跨流屏障**——请求结束释放的 GPU 块立即复用给异步 CPU→GPU load 时，compute stream 上先前排队的 kernel（MTP 投机步）仍在读该块，DMA 写与计算读并发 → 索引/元数据行读出一半垃圾 → 后续 kernel 越界（Xid 13 illegal memory access，恒由最后一个 PP stage 报出）。上游同案实锤：issue #59768（Qwen3.8-Flash-Next 同栈同签名）、#47282，修复 PR #47324/#60078 **均未合并**——升级 release 无效，必须运行时补丁。

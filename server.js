@@ -739,20 +739,20 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   altLogs: ['/home/ll/deploy/vllm-flash-next-0310.log', '/home/ll/deploy/vllm-flash-next-0300.log'],
   note: '官方 vLLM 0.31.0 运行时补丁栈 TP1×PP2（现行生产=W4A16-AutoRound-1M，PLE=INT8 磁盘 mmap，内存二级缓存 96GiB），加载约 5~8 分钟；回滚：touch /home/ll/deploy/vllm-0310/DISABLED → 退回 chroot 旧栈',  // [stack-0310-1006]
   base: {
-    maxModelLen: 262144, gpuMemUtil: 0.95, maxNumSeqs: 4, maxBatchedTokens: 8192,  // [seqs4-1006] 用户 10-06 指定 4 并发（FULL 图捕获 [1,2,4]）
+    maxModelLen: 262144, gpuMemUtil: 0.90, maxNumSeqs: 4, maxBatchedTokens: 8192,  // [seqs4-1006] 用户 10-06 指定 4 并发（FULL 图捕获 [1,2,4]）
     // [gen-loopfix 0929] 采样基准回到 09-21 反循环定档 t0.6 / p0.95 / k20 / minp0 / pp0.1 / rp1.0（用户 09-29 拍板：09-27 的 1/0/1 裸档导致思考模型 uct/duct token 级硬循环）。
     // base 同时是「弹窗默认值」与「是否下发 FN_GENCFG 的比较基准」，因此两套栈的 inner
     // GENCFG_DEFAULT 必须与此逐字段一致（flash-next-w4a16-inner.sh / vllm-0300/bin/flash-next-0300-inner.sh），
     // 否则会出现「弹窗显示 ≠ 引擎 cmdline 真值」。
-    blockSize: 1616, temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-    presencePenalty: 0.2, repetitionPenalty: 1.15, pp: 2, mtpTokens: 4,  // [w4a16-restore-1006] 本机在位 2×CMP 170HX（lspci 仅 03:00/04:00），PP 基准 3→2；三卡机勿套此值
+    blockSize: 1616, temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,  // [gen-1010 用户定档] 官方默认档
+    presencePenalty: 0.0, repetitionPenalty: 1.0, pp: 2, mtpTokens: 4,  // [w4a16-restore-1006] 本机在位 2×CMP 170HX（lspci 仅 03:00/04:00），PP 基准 3→2；三卡机勿套此值
     // [hw-move 1005] 换装 HUANANZHI H12D-8D + EPYC 7F52 + 3×CMP 170HX + 仅 32GB 内存：
     // ① PP 基准 2→3（三卡满配，与 10-04 实跑实例 FN_PP=3 一致）；
     // ② 二级缓存关（classic 96GiB / SimpleCPU 100GiB 在 64GB 机即实锤 OOM，32GB 更快炸）；
     // ③ PLE 唯一可行档 = INT8+disk（mmap 47.7GiB 可回收页缓存，10-04 实跑验证；
     //    INT8 heap 匿名堆 48.3GiB 与 BF16 95.4GiB 均不可回收、必 OOM）。
     // （存档：0929/0927 定版的 kvoff=simple 96GiB 与 pleLoc=heap 均以大内存机为前提，已随换装作废。）
-    kvoff: 'simple', kvoffGiB: 96, pleInt8: '1', pleLoc: 'disk',  // [stack-0310-1006] 二级缓存=SimpleCPUOffloadConnector 96GiB（每 rank ≈48GiB 锁页）；PLE=INT8 产物磁盘 mmap（/media/ll/data/ple，47.7+0.6 GiB 可回收页缓存）。0.31 只有两档：mmap-INT8 / pinned-BF16——弹窗「精度=BF16」或「位置=heap」都会走官方锁页 BF16 95.4GiB
+    kvoff: 'simple', kvoffGiB: 160, pleInt8: '1', pleLoc: 'heap',  // [kvoff160 10-10] 251GB 机账：48.3 PLE匿名 + 160 pinned + ~12 引擎 ≈220/251，权重页缓存被挤（重启多付加载时长）；内存告警第一刀降 96。PLE 放内存=INT8 匿名堆不可回收。「放硬盘」档=mmap 可回收页缓存〔原生产档，随时可切回〕。 // [stack-0310-1006] 二级缓存=SimpleCPUOffloadConnector 96GiB（每 rank ≈48GiB 锁页）；PLE=INT8 产物磁盘 mmap（/media/ll/data/ple，47.7+0.6 GiB 可回收页缓存）。0.31 只有两档：mmap-INT8 / pinned-BF16——弹窗「精度=BF16」或「位置=heap」都会走官方锁页 BF16 95.4GiB
   },
   bannedArgs: ['--mamba-ssm-cache-dtype', '--mamba-cache-mode', '--language-model-only',
                '--enable-prompt-tokens-details', '--safetensors-load-strategy',
@@ -790,7 +790,7 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
       longCtxModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-Channel-INT8-w8a8-1M',
       pleInt8Dir: '/media/ll/data/ple-w8a8',  // w8a8 专属 INT8 表产物（ple_ngram_meta 完整校验通过 10-08）
       pp: 3, minGpus: 3,        // 权重 ~132GB：PP2 每段 66GB > 单卡 64GB 显存，必须 PP3（本机 3 卡在位）
-      kvoff: 'simple', kvoffGiB: 96, kvoffCap: 96,  // [10-08 用户要求开启] PLE=INT8 mmap(48.3 mlock) 时 96GiB 成立：156 pinned/lock + 权重页缓存 132(可回收) 压进 251GB；若内存告警第一刀降 48
+      kvoff: 'simple', kvoffGiB: 160, kvoffCap: 160,  // [kvoff160 10-10 用户要求 96→160] 251GB 机账：48.3 PLE + 160 pinned + 引擎 ≈220，权重页缓存(可回收)压余量；内存告警第一刀降 96
     },
   },  // __modelvariant_1008__
   maxModelLenLong: 1048576,
@@ -1340,7 +1340,7 @@ function scriptModelLaunchPlan(smIn, d) {
   if (kvMode === 'simple') {
     env.FN_KVOFF = '0';
     // [model-variant-1008] 变体可钳制 CPU 二级缓存上限（Channel: 权重页缓存+PLE mlock 已 ~192GB）
-    let _sg = Math.max(8, Math.min(200, int(d.kvoffGiB, 96)));
+    let _sg = Math.max(8, Math.min(200, int(d.kvoffGiB, 160)));
     if (sm.variantKvoffCap !== undefined && _sg > sm.variantKvoffCap) {
       warnings.push(sm.variantName + '：权重页缓存(~132 GiB) + PLE 表 mlock(~48.3 GiB) + 引擎常驻后，二级缓存 ' + _sg + ' GiB 会顶穿物理内存（历史 96GiB 档秒崩同族）——已自动降到 ' + sm.variantKvoffCap + ' GiB；如内存吃紧可选「关」');
       _sg = Math.max(8, sm.variantKvoffCap);
@@ -1348,7 +1348,7 @@ function scriptModelLaunchPlan(smIn, d) {
     env.FN_SIMPLE_OFFLOAD = String(_sg);
   } else if (kvMode === '1') {
     env.FN_KVOFF = '1';
-    const koG = int(d.kvoffGiB, 96);
+    const koG = int(d.kvoffGiB, 160);
     if (koG > 0) env.FN_KVOFF_BYTES = String(koG * 1073741824);
   } else {
     env.FN_KVOFF = '0';
@@ -5106,7 +5106,7 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
     }
   }
   if (!foundSource) sourceLabelPrefix = modelLabel;
-  const running = Math.round(m[keyPrefix + 'num_requests_running' + modelLabel] || 0);
+  let running = Math.round(m[keyPrefix + 'num_requests_running' + modelLabel] || 0); // [rid-stable-1014] v3 激活时行数权威切给注册行，需重赋值
   const queued = Math.round(m[keyPrefix + 'num_requests_waiting' + modelLabel] || 0);
   const reqGenCount = m[keyPrefix + 'request_generation_tokens_count' + modelLabel] || 0;
   const reqGenSum = m[keyPrefix + 'request_generation_tokens_sum' + modelLabel] || 0;
@@ -5245,7 +5245,13 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
         }
         continue;
       }
-      const r = rt.live.shift();
+      // [rid-stable-1014] 全绑仍超发（gauge 滞后瞬态）：只退「rid 已不在本轮活跃集」的绑定行，
+      // 活跃 rid 的行一律保留——行数权威在 v3 流，不跟滞后 gauge 抖动（退绑→重绑正是
+      // 实测「同一请求 rid 每拍换、完成 rid 被绑回」错位的根源）。
+      const activeRids = new Set(v3s.active.map(st => st.rid));
+      const sidx = rt.live.findIndex(r2 => r2 && r2.v3rid && !activeRids.has(r2.v3rid));
+      if (sidx === -1) break;
+      const r = rt.live.splice(sidx, 1)[0];
       if (r && r.v3rid) {
         rt.parked = rt.parked || new Map();
         if (rt.parked.size < 500) rt.parked.set(r.v3rid, { id: r.id, taskId: r.taskId, crid: r.crid, ip: r.ip, startedAt: r.startedAt, at: nowTs });
@@ -5453,10 +5459,14 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
       for (let i = 0; i < rt.live.length; i++) {
         const lv = rt.live[i];
         if (!lv || lv.v3rid) continue;
+        // [rid-stable-1014] 只允许「从未绑过 rid」的新行（代理/排队行）走最近邻；
+        // 曾绑定（v3born）或丢过 rid（v3goneAt）的行不得抢别的 rid——回归 rid
+        // 由 ④+parked 复活原身份。容差 30s→10s（同机 arrival vs 行创建偏差 <1s）。
+        if (lv.v3born || lv.v3goneAt) continue;
         for (const fr of freeRids) {
           if (claimed.has(fr.rid)) continue;
           const d = Math.abs(fr.arrive - lv.startedAt);
-          if (d < 30000) pairs.push({ i, rid: fr.rid, d });
+          if (d < 10000) pairs.push({ i, rid: fr.rid, d });
         }
       }
       pairs.sort((a, b) => a.d - b.d);
@@ -5485,6 +5495,9 @@ function computeConcurrencyDetails(m, genTokensTotal, lastGenTokensTotal, elapse
     rt.v3Count = 0;
     for (const lv of rt.live) { if (lv) { lv.v3rid = null; lv.v3Exact = false; } }
   }
+  // [rid-stable-1014] v3 激活时行数权威=注册行：一个活跃 rid 一行，gauge 滞后窗内
+  // 行数=真并发（行循环/响应 running 统一取 live 长度；queued 独立不受影响）。
+  if (v3Active && rt.live.length > running) running = rt.live.length;
 
   // ====== Determine per-request phases & speeds ======
   let activeRequests = [];
@@ -11304,6 +11317,18 @@ const server = http.createServer(async (req, res) => {
     // 最权威（含自校验回落后的真实形态），其次分配行，最后 inner echo（启动意图，
     // 覆盖"正在加载、引擎行还没写出来"的窗口）。
     function matchPleLine(line) {
+      // —— [anon-ple 1010] 0.31 栈引擎实建权威行（本次启动真身，最先判）——
+      if (line.indexOf('PLE anon-heap storage attached') >= 0) {
+        return { dtype: 'int8', loc: 'heap', gib: pleGib(line), resident: true };
+      }
+      if (line.indexOf('PLE mmap storage attached') >= 0) {
+        return { dtype: 'int8', loc: 'disk', gib: pleGib(line), mmap: true };
+      }
+      // inner echo（匿名堆档；覆盖"正在加载、引擎行还没写出来"的窗口）：
+      if (line.indexOf('[FN-PLE] INT8 \u5185\u5b58\u9a7b\u7559') >= 0) {
+        const gz = /^[^\uff08(]*[\uff08(](\d+(?:\.\d+)?)\+/.exec(line);
+        return { dtype: 'int8', loc: 'heap', gib: gz ? parseFloat(gz[1]) : pleGib(line), resident: true };
+      }
       // —— 新栈（官方 vLLM 0.30.0 + rt-patch）——
       // ① 引擎权威行：Initialized PLE embedding ... weight_dtype=torch.bfloat16,
       //    weight_device=cpu, pinned=True   （ngram_embedding.py）
@@ -11325,7 +11350,7 @@ const server = http.createServer(async (req, res) => {
       // [ple-loc-0310-1006] 新栈（0.31.0）inner echo：带体积，可作为 gib 来源
       if (line.indexOf('[FN-PLE] INT8 \u78c1\u76d8 mmap') >= 0) {
         // echo 文案是「（47.7+0.6 GiB …）」：表体积是加号前那个数，pleGib 会取到 0.6，需专用提取
-        const g0 = /^.*?\((\d+(?:\.\d+)?)\+/.exec(line);
+        const g0 = /^[^\uff08(]*[\uff08(](\d+(?:\.\d+)?)\+/.exec(line);  // [anon-ple 1010] 半/全角括号均可
         return { dtype: 'int8', loc: 'disk', gib: g0 ? parseFloat(g0[1]) : pleGib(line) };
       }
       if (line.indexOf('[FN-PLE] \u5b98\u65b9 pinned-host') >= 0) return { dtype: 'bf16', loc: 'pinned', gib: pleGib(line) };
@@ -11373,7 +11398,7 @@ const server = http.createServer(async (req, res) => {
           carry = parts.shift() || '';                // 块首残句，并入下一（更早）块
           for (let i = parts.length - 1; i >= 0; i--) {
             const ln = parts[i];
-            if (!mmapSeen && (ln.indexOf('PLE mmap mode:') >= 0 || ln.indexOf('PLE mmap class installed') >= 0)) mmapSeen = true;
+            if (!mmapSeen && (ln.indexOf('PLE mmap mode:') >= 0 || ln.indexOf('PLE mmap storage attached') >= 0)) mmapSeen = true; // [anon-ple 1010] class installed 两模式都装，不作文件档判据
             const m = matchPleLine(ln);
             if (!m) {
               // 越过本次启动的分段边界（更早的启动不再参与 mmapSeen 判定）
@@ -11387,14 +11412,14 @@ const server = http.createServer(async (req, res) => {
             }
             // 主判据只缺大小（新栈①行不带 GiB）：往回第一条补上即可，
             // 再往回就是上一次启动，不再跨启动合并。
-            if (ple.gib == null && m.gib != null) ple.gib = m.gib;
+            if (ple.gib == null && m.gib != null) { ple.gib = m.gib; if (m.resident) ple.resident = true; }
             break scan;
           }
           pos = start2;
         }
       } catch (e) {}
       for (const fd of fdArr) { try { fs.closeSync(fd); } catch (e) {} }
-      if (ple && ple.loc === 'heap' && mmapSeen) {    // [ple-loc-0310-1006] 0.31 mmap 档改判
+      if (ple && ple.loc === 'heap' && mmapSeen && !ple.resident) {    // [ple-loc-0310-1006] 0.31 mmap 档改判（[anon-ple 1010] 匿名堆档不翻转）
         ple = Object.assign({}, ple, { loc: 'disk', mmap: true });
         if (ple.gib == null) {
           const g = /\((\d+(?:\.\d+)\+)\+?[\d.]*\s*GiB/.exec('') || null;
@@ -11413,7 +11438,7 @@ const server = http.createServer(async (req, res) => {
           const ls = b2.toString('utf8').split('\n');
           for (let i = ls.length - 1; i >= 0; i--) {
             if (ls[i].indexOf('[FN-PLE]') < 0) continue;
-            const mm0 = /^.*?\((\d+(?:\.\d+)?)\+/.exec(ls[i]);   // 表体积=括号里加号前那个数
+            const mm0 = /^[^\uff08(]*[\uff08(](\d+(?:\.\d+)?)\+/.exec(ls[i]);   // [anon-ple 1010] 表体积=括号里加号前那个数（半/全角均可）
             const g = mm0 ? parseFloat(mm0[1]) : pleGib(ls[i]);
             if (g != null && g > 1) { ple.gib = g; break; }
           }

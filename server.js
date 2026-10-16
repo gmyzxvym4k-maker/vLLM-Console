@@ -783,17 +783,21 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
     'Qwen3.8-Flash-Next-W4A16-AutoRound': {
       modelPath: '/media/ll/data/models/Qwen3.8-Flash-Next-W4A16-AutoRound',
       longCtxModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M',
+      longCtx512ModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-512K',  // [512k-reg-1016] YaRN×2 副本（09-25 已建）
       pleInt8Dir: '/media/ll/data/ple',
     },
     'Qwen3.8-Flash-Next-Channel-INT8-w8a8': {
       modelPath: '/media/ll/data/models/Qwen3.8-Flash-Next-Channel-INT8-w8a8',
       longCtxModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-Channel-INT8-w8a8-1M',
+      longCtx512ModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-Channel-INT8-w8a8-512K',  // [512k-reg-1016] YaRN×2 副本（10-16 建：cp -as 软链 144 + config 实体）
       pleInt8Dir: '/media/ll/data/ple-w8a8',  // w8a8 专属 INT8 表产物（ple_ngram_meta 完整校验通过 10-08）
       pp: 3, minGpus: 3,        // 权重 ~132GB：PP2 每段 66GB > 单卡 64GB 显存，必须 PP3（本机 3 卡在位）
       kvoff: 'simple', kvoffGiB: 160, kvoffCap: 160,  // [kvoff160 10-10 用户要求 96→160] 251GB 机账：48.3 PLE + 160 pinned + 引擎 ≈220，权重页缓存(可回收)压余量；内存告警第一刀降 96
     },
   },  // __modelvariant_1008__
   maxModelLenLong: 1048576,
+  maxModelLen512: 524288,  // [512k-reg-1016] 512K 档 = YaRN×2；mrope 缓存恒 262144×4=1048576，512K 在缓存内安全
+  longCtx512ModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-512K',  // [512k-reg-1016] 顶层缺省与 longCtxModelPath 同形态（variant 命中时被覆盖）
 };
 MODEL_ALIASES['qwen3.8-flash-next-w4a16'] = 'qwen3.8-flash-next';
 MODEL_ALIASES['Qwen3.8-Flash-Next-W4A16-AutoRound'] = 'qwen3.8-flash-next';
@@ -1225,6 +1229,7 @@ function scriptModelVariantResolve(sm, d) {
   out.variantName = hit;
   if (v.modelPath) out.modelPath = v.modelPath;
   if (v.longCtxModelPath) { out.longCtxModelPath = v.longCtxModelPath; out.altModelPaths = [v.longCtxModelPath]; }
+  if (v.longCtx512ModelPath) out.longCtx512ModelPath = v.longCtx512ModelPath;  // [512k-reg-1016] 512K 副本按 variant 下发（否则 tierPath 为空 → inner 拒启）
   if (v.pleInt8Dir !== undefined) out.pleInt8Dir = v.pleInt8Dir;
   if (v.pp) { out.variantPp = v.pp; out.variantMinGpus = v.minGpus || v.pp; }
   if (v.kvoff) out.variantKvoff = String(v.kvoff);

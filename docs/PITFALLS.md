@@ -164,6 +164,15 @@
 - **缺值兼容**：`gpuNum()` 对 `[N/A]` 返 null、`gpu_info` 链对不支持时返 0，前端一律降级成 `--` / 不显示该项，不要显示 0 °C。
 - **落点**：`server.js` 两处字段 + `index.html` 的 `renderStorageGpuCard`（KPI 副值与明细表列，`kpiCard` 加第 5 参 `subColor`）、`updateHdrFromGpu`（tooltip）、`_doRefreshDashboard`（逐卡徽章与 `tempSub`）+ `mobile.html` 同步；`PAGE_VERSION=20261006-r6`；线上备份 `*.bak-gputempmem-0929`。
 
+### 14g. SimpleCPU 池不进 /dev/shm：「驻留 0.7 GiB」恒定是杂项噪音（10-17，前端已上线）
+
+- **症状**：vLLM 页「CPU KV 二级缓存」卡显示 `驻留 0.7 GiB（/dev/shm 实测）· 容量占用 0.5%`，跑多久都不动。
+- **根因链（三层缺一不可）**：① 14d 给「二级缓存·CPU」卡定的驻留主值 = `statfs('/dev/shm')` 已用——**前提是连接器把 CPU 档放 tmpfs**（旧栈经典 OffloadingConnector 的 c8 共享区确实如此）；② 现引擎是 **SimpleCPUOffloadConnector**，池 = `torch.zeros(整池, device="cpu")` + `cudaHostRegister` 锁页的**匿名主机内存**（生产 venv `vllm/v1/simple_kv_offload/worker.py` 实证），**根本不写 /dev/shm**；③ 后端 `resident_gb` 对非 fill 口径一律回落 tmpfs → 显示的是 `psm_*`（NCCL/PyTorch 分布式共享段，240MB×3 稀疏文件）等杂项 ≈0.74 GiB，近恒定。整机内存 228/252 GiB 与「160G 池启动即物理满配」吻合。
+- **判障口径**：`df -h /dev/shm` + `du -sh /dev/shm/*` 看那 0.7 GiB 装的是谁的名字——`psm_*`/`nccl*` = 通讯段，`vllm_simple_offload_rows.*.json` = SimpleCPU 的行元数据（每块仅 69B，数据不在里面）。
+- **修法**：前端（vllm.html，零重启已上线）simple 主值改「锁页池 · 启动即满配」、撤假的「容量占用 0.5%」、无真值的列一律 `--`（宁缺毋假）。后端（server.js，**入库待重启窗口**）接官方 0.31 的 `vllm:simple_kv_offload_*` 族：`info{capacity_blocks}` / `used_blocks`（在飞+命中钉住，官方 HELP 明示**不含可驱逐缓存块** → 不是已存量）/ `pending_store_blocks` / `load_blocks_total`（实测 3355 块/1 钉住/6819 累计回载 ≈325 GiB）。
+- **解析坑**：`parseMetrics` 键格式是 `name|JSON`（标签已转 JSON），取 `capacity_blocks` 必须 `JSON.parse(k.substring(k.indexOf('|')+1))`，拿 Prometheus 原文正则 `capacity_blocks="3355"` 匹配不到；`_created` 伴生序列靠 `startsWith(name + '|')` 的 `|` 边界天然排除。
+- **上游无「已存缓存量」gauge**——想显示真实驻留占比只能再加 rt-patch（同 14d 遗留），当前以命中率+回载 token 观察缓存效果。
+
 ### 15. chroot 搭建的琐碎坑
 
 - bind mount 设备节点要用 **by-id 路径**（`/dev/disk/by-id/...`），裸 `/dev/nvmeXnY` 重启后可能换位（`start-flash-next-w4a16.sh.bak-byid-0919` 即修复前）。

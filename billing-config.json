@@ -119,18 +119,18 @@
       "name": "Qwen3.8 Flash-Next W4A16 (512K)",
       "enabled": true,
       "pricing": {
-        "cached_input_price_per_1m": 0.1,
-        "uncached_input_price_per_1m": 3,
-        "output_price_per_1m": 9
+        "cached_input_price_per_1m": 0.04,
+        "uncached_input_price_per_1m": 2,
+        "output_price_per_1m": 8
       }
     },
     "Qwen3.8-Flash-Next-W4A16-AutoRound-1M": {
       "name": "Qwen3.8 Flash-Next W4A16 (1M)",
       "enabled": true,
       "pricing": {
-        "cached_input_price_per_1m": 0.1,
-        "uncached_input_price_per_1m": 3,
-        "output_price_per_1m": 9
+        "cached_input_price_per_1m": 0.04,
+        "uncached_input_price_per_1m": 2,
+        "output_price_per_1m": 8
       }
     },
     "Qwen3.8-Flash-Next-NVFP4": {
@@ -152,6 +152,14 @@
     },
     "qwen3.8-27b-twin-709": {
       "name": "qwen3.8-27b-twin-709",
+      "pricing": {
+        "cached_input_price_per_1m": 0.04,
+        "uncached_input_price_per_1m": 2,
+        "output_price_per_1m": 8
+      }
+    },
+    "Qwen3.8-Flash-Next-Channel-INT8-w8a8": {
+      "name": "Qwen3.8-Flash-Next-Channel-INT8-w8a8",
       "pricing": {
         "cached_input_price_per_1m": 0.04,
         "uncached_input_price_per_1m": 2,

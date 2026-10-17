@@ -46,9 +46,19 @@ export VLLM_PLE_CPU_OFFLOAD=1
 #   INT8=1 视作 disk。回滚手动命令 FN_PLE_INT8=0 语义不变。
 FN_PLE_INT8="${FN_PLE_INT8:-1}"
 # [FN-PLE-DIR] INT8 产物目录可被 FN_PLE_INT8_DIR 覆盖（不同 checkpoint 的 n-gram 表内容不同，禁止跨模型复用）
-PLE_INT8_DIR="${FN_PLE_INT8_DIR:-/media/ll/data/ple}"
+PLE_INT8_DIR="${FN_PLE_INT8_DIR:-/media/ll/data/ple-w8a8}"  # [1006] JZ盘复测健康(直读5.4GB/s直写4.6GB/s,SMART 5%磨损0错)，现成w8a8表迁回2T数据盘；根盘静默+腾回48G
 if [ -z "${FN_PLE_LOC:-}" ]; then
   if [ "$FN_PLE_INT8" = "0" ]; then FN_PLE_LOC=heap; else FN_PLE_LOC=disk; fi
+fi
+# [pleclamp-1005] 低内存机防线（与 server.js plan 同判据的第二道兜底）：
+# heap 匿名堆 48.3GiB(INT8)/95.4GiB(BF16) 不可回收，MemTotal <100GiB 必触发 oom-killer
+# （10-05 该机四连 OOM→PLE worker exited→EngineDead→看门狗循环）。强制降级 disk。
+if [ "$FN_PLE_LOC" = "heap" ]; then
+  MEM_KIB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+  if [ "${MEM_KIB:-0}" -lt $((100 * 1024 * 1024)) ]; then
+    echo "[FN-PLE-CLAMP] MemTotal=$((MEM_KIB / 1048576))GiB <100GiB：heap 会被 OOM 杀 -> 强制降级 disk（可回收页缓存）" >&2
+    FN_PLE_LOC=disk
+  fi
 fi
 # 精度定精度、位置定内存/硬盘，两者正交（四种组合都成立）：
 #   INT8+内存 = VLLM_PLE_INT8_MEMORY 匿名堆 48.3GiB（[FN-PLE-INT8MEM] 引擎侧新增）
@@ -160,7 +170,7 @@ if [ "${FN_LONGCTX:-0}" = "1" ]; then
 fi
 # 采样参数缺省（可被 FN_GENCFG 覆盖；与 server.js SCRIPT_MODELS.base、快启预设 p2p-mtp4 一致）
 # [gendefault 0927] 采样缺省定档 t1.0/p0.95/k20/minp0/pp0/rp1.0（与 server.js SCRIPT_MODELS.base 逐字段一致）
-GENCFG_DEFAULT='{"temperature":0.6,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.2,"repetition_penalty":1.15}'
+GENCFG_DEFAULT='{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"repetition_penalty":1.0}'
 CHATKW_DEFAULT='{"enable_thinking":true,"preserve_thinking":true}'
 
 ARGS=(
@@ -172,6 +182,7 @@ ARGS=(
   --distributed-executor-backend mp
   --tensor-parallel-size "${FN_TP:-1}"
   --pipeline-parallel-size "${FN_PP:-2}"
+  --disable-custom-all-reduce  # [nocustomar-1005] BAR1 强制 P2P 补丁会静默污染 CUDA-IPC 数据通路；任何 TP>1 不得走 custom all-reduce（10-01 定版成对项，126 机 10-05 补齐）
   --dtype "${FN_DTYPE:-bfloat16}"
   --max-model-len "$FN_MAXLEN_EFF"
   # gavinxym 手册：两级 CSA + linear 层 block size 不一致 → 1616 必传
@@ -179,7 +190,7 @@ ARGS=(
   # gavinxym 手册：sharded mamba cache dtype 不一致 → float32 必传
   --mamba-ssm-cache-dtype "${FN_SSMDTYPE:-float32}"
   --max-num-seqs "${FN_SEQS:-4}"
-  --gpu-memory-utilization "${FN_GPUMEM:-0.93}"
+  --gpu-memory-utilization "${FN_GPUMEM:-0.95}"
   --enable-prefix-caching
   --enable-prompt-tokens-details
   --max-num-batched-tokens "${FN_MBTOKENS:-8192}"

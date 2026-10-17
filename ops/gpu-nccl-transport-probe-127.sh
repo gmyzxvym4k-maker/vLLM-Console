@@ -16,13 +16,6 @@
 #   via P2P/IPC     → NCCL 在用 GPU 直通（P2P 生效）
 #   via SHM/direct  → NCCL 在经主机内存中转（P2P 名义可用但没被使用）
 
-# 提权口令来源（仓库内不留明文）：CONSOLE_SUDO_PASS 环境变量或 ~/.console-sudo
-# helper 查找顺序：DEPLOY_DIR → 脚本所在目录 → 上级目录，兼容仓库开发与单文件 scp 上线两种摆放。
-CDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
-for _csudo_lib in "${DEPLOY_DIR:-/home/ll/deploy}/lib/sudo-pass.sh" ${CDIR:+$CDIR/lib/sudo-pass.sh} ${CDIR:+$CDIR/../lib/sudo-pass.sh}; do
-  [ -n "$_csudo_lib" ] && [ -f "$_csudo_lib" ] && { . "$_csudo_lib"; break; }
-done
-CSUDO_PW=""; require_sudo_pass || exit 1
 set -u
 CHROOT=${CHROOT:-/media/ll/data/vllm-image/rootfs}
 PY=${PY:-/usr/bin/python3.12}
@@ -83,17 +76,20 @@ time.sleep(2)
 dist.destroy_process_group()
 PYEOF
 
-sudo_run true                      # 预热 sudo 时间戳
+echo 3124 | sudo -S -p '' true                      # 预热 sudo 时间戳
 # 注意：本机宿主 /tmp 与 $CHROOT/tmp 是同一 bind 挂载，cp 会报"同一文件"返回 1。
 # 别拿 cp 的返回码当判据（比路径字符串也不可靠，bind 挂载下两者路径本就不同）；
 # 唯一可信的判据是"chroot 内看得见这个文件"。
 INPATH="/tmp/.nccl-transport-probe.py"
-sudo_run cp -f "$INPATH" "$CHROOT$INPATH" 2>/dev/null || true
-sudo_run test -f "$CHROOT$INPATH" || { echo "  chroot 内看不到 $INPATH，放弃"; exit 1; }
+echo 3124 | sudo -S -p '' cp -f "$INPATH" "$CHROOT$INPATH" 2>/dev/null || true
+echo 3124 | sudo -S -p '' test -f "$CHROOT$INPATH" || { echo "  chroot 内看不到 $INPATH，放弃"; exit 1; }
 
 # NCCL_DEBUG_SUBSYS 只开 TRANSPORT+INIT，避免全量 INFO 刷屏
-# 提权穿 timeout：同上，口令经 printf %q 烤成字面量，不依赖函数导出/变量继承。
-timeout -k 5 240 sh -c "$(sudo_run_quoted "chroot $CHROOT env $ENVV NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=TRANSPORT,INIT MASTER_ADDR=127.0.0.1 MASTER_PORT=$MASTER_PORT $PY -m torch.distributed.run --nproc_per_node=2 --master_port=$MASTER_PORT $INPATH")" 2>&1 | tee /tmp/.nccl-transport-raw.txt >/dev/null
+timeout -k 5 240 sh -c "echo 3124 | sudo -S -p '' chroot $CHROOT env $ENVV \
+    NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=TRANSPORT,INIT \
+    MASTER_ADDR=127.0.0.1 MASTER_PORT=$MASTER_PORT \
+    $PY -m torch.distributed.run --nproc_per_node=2 --master_port=$MASTER_PORT $INPATH" 2>&1 \
+  | sed 's/^/  /' | tee /tmp/.nccl-transport-raw.txt >/dev/null
 
 echo "-- 判决行（去色后）--"
 sed 's/\x1b\[[0-9;]*m//g' /tmp/.nccl-transport-raw.txt \

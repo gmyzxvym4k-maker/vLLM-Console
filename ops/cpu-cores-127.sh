@@ -4,7 +4,7 @@
 # 背景：该机 22 个逻辑 CPU 就是 22 个同构物理核（无大小核、无超线程配对），
 #       编号 n 与 Core ID n 一一对应，"关奇数编号"= 精确关掉 11 个物理核。
 #
-# 用法（在 127 本机执行，或 ssh ll@192.168.1.126 'bash /home/ll/deploy/ops/cpu-cores-127.sh <cmd>'）：
+# 用法（在 127 本机执行，或 ssh ll@192.168.1.127 'bash /home/ll/deploy/ops/cpu-cores-127.sh <cmd>'）：
 #   cpu-cores-127.sh status          查看当前在线/离线核心与服务健康
 #   cpu-cores-127.sh off <目标>       下线核心：<目标> 可为 odd / even / 显式列表
 #                                    列表支持逗号与区间，如 off 2,6,10,14,18 或 off 4-9
@@ -25,9 +25,8 @@
 #     下线时内核自动把该核上的任务迁到在线核，vLLM 与控制台不会被打断；
 #   - 中断由内核自动从下线核迁走，无需手动调 irq affinity。
 #
-# 提权：ll 无免密 sudo，口令走 lib/sudo-pass.sh 的统一约定（仓库内不留明文）：
-#       CONSOLE_SUDO_PASS 环境变量 → ~/.console-sudo（chmod 600）→ 交互输入。
-#       兼容旧写法 CPW=<口令> 覆盖。
+# 提权：ll 无免密 sudo，沿用本机既定模式 echo <pw> | sudo -S -p ""（同 start/stop-flash-next 系列）。
+#       可用环境变量 CPW 覆盖口令，缺省取脚本内 DEFAULT_PW。
 #
 # 已知代价（下线一半核后）：
 #   - vLLM CPU 侧只剩 11 核：OffloadingConnector 的 CPU KV 拷贝、tokenizer/detokenize、
@@ -38,20 +37,13 @@
 set -u
 HOST_SELF=1
 DEF_ONLINE_ALL="0-21"
-# 提权口令（见文件头说明）：CPW 仅作向后兼容的覆盖入口
-CONSOLE_SUDO_PASS="${CPW:-${CONSOLE_SUDO_PASS:-}}"
-# helper 查找顺序：DEPLOY_DIR → 脚本所在目录 → 上级目录，兼容仓库开发与单文件 scp 上线两种摆放。
-CDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
-for _csudo_lib in "${DEPLOY_DIR:-/home/ll/deploy}/lib/sudo-pass.sh" ${CDIR:+$CDIR/lib/sudo-pass.sh} ${CDIR:+$CDIR/../lib/sudo-pass.sh}; do
-  [ -n "$_csudo_lib" ] && [ -f "$_csudo_lib" ] && { . "$_csudo_lib"; break; }
-done
-if [ -z "${CSUDO_PW+isset}" ]; then CSUDO_PW=""; require_sudo_pass || exit 1; fi
+DEFAULT_PW="${CPW:-3124}"
 SYS=/sys/devices/system/cpu
 
 say() { printf '%s\n' "$*"; }
 
 run_root() {  # 以 root 执行一段 shell
-  sudo_run sh -c "$1"
+  printf '%s\n' "$DEFAULT_PW" | sudo -S -p "" sh -c "$1"
 }
 
 do_status() {

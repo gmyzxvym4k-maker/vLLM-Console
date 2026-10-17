@@ -459,7 +459,8 @@ function renderInstance(inst, mt, params, kvDet) {
 
 
   // ---- 运行时参数 ----
-  html += '<div class="card"><h2>运行时参数（来自启动命令 / vLLM 0.30.0）</h2>';
+  var vver = (params && params.vllm_version) || (inst && inst.vllm_version) || null; // [vllm-version-1006]
+  html += '<div class="card"><h2>运行时参数（来自启动命令 / vLLM' + (vver ? ' ' + esc(vver) : ' 0.30.0') + '）</h2>';
   if (params) {
     var specTxt = (params.speculative_config && params.speculative_config.method)
       ? esc(String(params.speculative_config.method)) + '×' + (params.speculative_config.num_speculative_tokens || '?') : '关闭';
@@ -468,8 +469,9 @@ function renderInstance(inst, mt, params, kvDet) {
       || '单卡';
     var pleTxt = params.ple_table ? (String(params.ple_table.dtype || '').toUpperCase() + ' · ' + esc(params.ple_table.loc || '') + ' · ' + fmt(params.ple_table.gib, 2) + ' GiB') : '--';
     html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:4px 26px">'
-      + '<table><tr><th>上下文</th><th>并发</th><th>显存比例</th><th>投机</th><th>并行</th></tr>'
-      + '<tr><td>' + fmtInt(params.max_model_len) + '</td>'
+      + '<table><tr><th>vLLM 版本</th><th>上下文</th><th>并发</th><th>显存比例</th><th>投机</th><th>并行</th></tr>'
+      + '<tr><td class="mono">' + (vver ? esc(vver) : '--') + '</td>'
+      + '<td>' + fmtInt(params.max_model_len) + '</td>'
       + '<td>' + (params.max_num_seqs != null ? params.max_num_seqs : '--') + '</td>'
       + '<td>' + (params.gpu_memory_utilization != null ? fmt(params.gpu_memory_utilization, 2) : '--') + '</td>'
       + '<td>' + specTxt + '</td>'
@@ -501,7 +503,8 @@ function render(mmInsts, metricMap, paramMap, kvMap, mmErr, stale) {
     bar.innerHTML = vlInsts.length
       ? vlInsts.map(function (i) {
         var gtxt = (i.gpus && i.gpus.length > 1) ? (' · GPU' + i.gpus.join('+')) : (i.gpu != null && i.gpu !== '' ? ' · GPU' + esc(i.gpu) : '');
-        return '<span class="inst-badge">vllm :' + i.port + ' · ' + esc(i.model || '?') + gtxt + '</span>';
+        var vt = (paramMap && paramMap[i.port] && paramMap[i.port].vllm_version) || i.vllm_version || null; // [vllm-version-1006]
+        return '<span class="inst-badge">vllm :' + i.port + ' · ' + esc(i.model || '?') + gtxt + (vt ? ' · v' + esc(vt) : '') + '</span>';
       }).join('')
       + mmInsts.filter(function (i) { return i.runtime !== 'vllm'; })
         .map(function (i) { return '<span class="inst-badge off">' + esc(i.runtime || '?') + ' :' + i.port + '</span>'; }).join('')

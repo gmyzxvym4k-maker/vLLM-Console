@@ -18,13 +18,6 @@
 # 注意：本脚本测的是"P2P 通路能不能用"。NCCL 在 PP 通信里选没选它，
 #       是另一回事，要靠 NCCL_DEBUG=INFO 的 transport 判决行（见文末）。
 
-# 提权口令来源（仓库内不留明文）：CONSOLE_SUDO_PASS 环境变量或 ~/.console-sudo
-# helper 查找顺序：DEPLOY_DIR → 脚本所在目录 → 上级目录，兼容仓库开发与单文件 scp 上线两种摆放。
-CDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
-for _csudo_lib in "${DEPLOY_DIR:-/home/ll/deploy}/lib/sudo-pass.sh" ${CDIR:+$CDIR/lib/sudo-pass.sh} ${CDIR:+$CDIR/../lib/sudo-pass.sh}; do
-  [ -n "$_csudo_lib" ] && [ -f "$_csudo_lib" ] && { . "$_csudo_lib"; break; }
-done
-CSUDO_PW=""; require_sudo_pass || exit 1
 set -u
 NVS="timeout -k 3 20 nvidia-smi"
 CHROOT=${CHROOT:-/media/ll/data/vllm-image/rootfs}
@@ -112,13 +105,11 @@ del a, b, cpu_src
 torch.cuda.empty_cache()
 PYEOF
   # 用 cp 送进 chroot（勿用 printf 内嵌代码：Python 里的引号会被二次解析）
-  sudo_run true                       # 预热 sudo 时间戳
-  sudo_run cp /tmp/.gpu-p2p-probe.py "$CHROOT/tmp/.gpu-p2p-probe.py" 2>/dev/null \
+  echo 3124 | sudo -S -p '' true                       # 预热 sudo 时间戳
+  echo 3124 | sudo -S -p '' cp /tmp/.gpu-p2p-probe.py "$CHROOT/tmp/.gpu-p2p-probe.py" 2>/dev/null \
     || cp /tmp/.gpu-p2p-probe.py "$CHROOT/tmp/.gpu-p2p-probe.py" 2>/dev/null
   # 硬超时 180s：CUDA context 建立慢，但绝不无限等
-  # 提权穿 timeout：GNU timeout 以 env -i 起子进程，父 shell 的函数与普通变量都过不去
-  # （bash <4.3 还不支持导出函数），所以把口令用 printf %%q 烤成字面量再交给 sh 解析。
-  timeout -k 5 180 sh -c "$(sudo_run_quoted "chroot $CHROOT $PY /tmp/.gpu-p2p-probe.py")" 2>&1 | sed 's/^/  /'
+  timeout -k 5 180 sh -c "echo 3124 | sudo -S -p '' chroot $CHROOT $PY /tmp/.gpu-p2p-probe.py" 2>&1 | sed 's/^/  /'
   rc=${PIPESTATUS[0]:-?}
   [ "$rc" != "0" ] && echo "  （探针退出码 $rc；124=超时，多为驱动异常，按 09-20 铁律处理）"
   rm -f /tmp/.gpu-p2p-probe.py

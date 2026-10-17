@@ -1,4 +1,14 @@
 #!/bin/bash
+# ---- sudo 凭据（脱敏版）----
+# 生产机上 chroot 内进程属 root，宿主脚本需要 sudo。两种给法二选一：
+#   A) 推荐：/etc/sudoers.d/ 配 NOPASSWD（见 docs/01-host-prep.md），无需本变量
+#   B) 环境变量 SUDO_PASS 传入密码（不落盘、不写进脚本）
+if [ -n "${SUDO_PASS:-}" ]; then
+  SUDO() { printf '%s\n' "$SUDO_PASS" | sudo -S -p '' "$@"; }
+else
+  SUDO() { sudo -n "$@"; }
+fi
+
 # 给 chroot 环境挂载必要文件系统 + 校验 NVIDIA 用户态库（幂等，可反复执行）
 # 重建于 2026-09-19（系统重装后 /etc 与 /usr/local 丢失，chroot 副本库仍在数据盘）
 set -u

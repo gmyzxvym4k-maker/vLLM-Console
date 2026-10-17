@@ -22,7 +22,7 @@ PORT=${FN_PORT:-18420}
 LOG=${FN_LOG:-/home/ll/deploy/vllm-flash-next-w4a16.log}
 PROF=/home/ll/deploy/flash-next-w4a16-loadprofile.log
 ENVFILE=${FN_ENVFILE:-/home/ll/deploy/flash-next-w4a16-launch.env}
-RA_LOAD=${RA_LOAD:-128}
+RA_LOAD=${RA_LOAD:-128}  # [w4a16-restore-1006] 本机 251GiB 内存：PLE 表(95.4GiB)+权重(79GiB) 可全驻留页缓存，服务期盘读≈0，RA 无读放大代价；09-23 实测 128KB 即到拐点（0→297 / 128→3011 MB/s），RA=16 会把加载拖慢数倍（16 是 10-05 那台 32GiB 三卡机的降预读档，不适用于本机）
 
 # 1) 弹窗参数落盘：透传全部 FN_*（只排除 FN_ENVFILE 自身）
 # 【2026-09-26 修复·采样参数静默失效】这里原先是一份手写白名单，漏了 FN_GENCFG：
@@ -52,7 +52,7 @@ if [ "$FOUND" = "0" ]; then
   echo "[wrapper] $(date -Is) 未收到 FN_* 参数，inner 使用内置缺省（gavinxym 手册定稿 + PLE mmap）" >> "$LOG"
 fi
 
-# 2) read_ahead_kb：全程 128 KB（实测拐点，2026-09-23 定版）
+# 2) read_ahead_kb：全程 16 KB（2026-10-05 用户指令；备份 .bak-ra0-1005）
 #    实测（2T 盘 2.70GB 分片、每轮 fadvise DONTNEED）：0->297 / 128->3011 / 256->3113 /
 #    512->3080 / 1024->3301 / 2048->3094 / 8192->3303 MB/s。128KB 已饱和；2048 无吞吐收益
 #    且缺页读放大 16x；设 0 会让权重加载慢 10.9x（475s vs 43.7s），绝不可取。

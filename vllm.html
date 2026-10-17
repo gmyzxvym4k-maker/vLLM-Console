@@ -319,13 +319,21 @@ function renderInstance(inst, mt, params, kvDet) {
     var _bw = function (bps) { return bps == null || isNaN(bps) ? '--' : (bps >= 1073741824 ? (bps / 1073741824).toFixed(2) + ' GiB/s' : bps >= 1048576 ? (bps / 1048576).toFixed(1) + ' MiB/s' : (bps / 1024).toFixed(0) + ' KiB/s'); };
     if (kd && kd.enabled) {
       var _capGb = kd.capacity_gb;
-      var _resGb = kd.resident_gb;
+      // [kvoff-simple-honest 1017] SimpleCPU 池 = torch.zeros 整池 + cudaHostRegister 锁页的
+      // **匿名主机内存**，根本不进 /dev/shm——后端非 fill 口径的 resident_gb 回落 tmpfs 实测值，
+      // 那 0.7 GiB 是 NCCL psm_* 共享段等杂项（近恒定），与缓存池无关；拿它显示"驻留"并除容量
+      // 得"容量占用"都是错的。simple 口径主值改按源码判据显示"锁页池·启动即满配"（整机内存
+      // 228/252 GiB 与满配吻合），缓存已存数据量上游无 gauge → 如实不显示。
+      var _isSimple = kd.metric_kind === 'simple';
+      var _resGb = _isSimple ? null : kd.resident_gb;
       var _resPct = (_capGb > 0 && _resGb != null) ? (_resGb / _capGb * 100) : null;
       var _hitPct = (kd.hit_rate != null) ? kd.hit_rate : (extRate != null ? extRate * 100 : null);
       // 概览条
       html += '<div style="display:flex;gap:18px;flex-wrap:wrap;font-size:12px;margin-bottom:8px">'
         + '<span>容量 <b class="mono">' + (_capGb != null ? _capGb.toFixed(0) + ' GiB' : '--') + '</b></span>'
-        + '<span>驻留 <b class="mono">' + _fmtGb(_resGb) + (kd.resident_src === 'tmpfs' ? '（/dev/shm 实测）' : (kd.resident_src === 'metric' ? '（指标）' : '')) + '</b></span>'
+        + (_isSimple
+            ? '<span title="SimpleCPUOffloadConnector 池按源码（worker.py：torch.zeros 整池分配 + cudaHostRegister 锁页）启动即物理占满容量，且不走 /dev/shm；上游无「已存缓存数据量」gauge，缓存效果看命中率">驻留 <b class="mono">锁页池 · 启动即满配</b></span>'
+            : '<span>驻留 <b class="mono">' + _fmtGb(_resGb) + (kd.resident_src === 'tmpfs' ? '（/dev/shm 实测）' : (kd.resident_src === 'metric' ? '（指标）' : '')) + '</b></span>')
         + (_capGb > 0 && _resPct != null ? '<span>容量占用 <b class="mono">' + _resPct.toFixed(1) + '%</b></span>' : '')
         + '<span>档内命中率 <b class="mono" style="color:' + (_hitPct > 0 ? 'var(--green)' : 'var(--orange)') + '">' + (_hitPct != null ? _hitPct.toFixed(1) + '%' : '--') + '</b></span>'
         + '</div>'
@@ -339,7 +347,7 @@ function renderInstance(inst, mt, params, kvDet) {
         + '<td>' + (kd.gpu_pool && kd.gpu_pool.block_size ? fmtInt(kd.gpu_pool.block_size) : '--') + '</td></tr></table>';
       // ② 驻留与内存
       var _sm = kd.system_mem;
-      html += '<table><tr><th>tmpfs 驻留</th><th>tmpfs 上限</th><th>整机内存</th><th>可用</th></tr>'
+      html += '<table><tr><th>' + (_isSimple ? 'tmpfs 用量（NCCL 等杂项，非本池）' : 'tmpfs 驻留') + '</th><th>tmpfs 上限</th><th>整机内存</th><th>可用</th></tr>'
         + '<tr><td>' + _fmtGb(kd.shm_used_gb, 2) + (kd.shm_used_pct != null ? '（' + kd.shm_used_pct.toFixed(1) + '%）' : '') + '</td>'
         + '<td>' + _fmtGb(kd.shm_total_gb) + '</td>'
         + '<td>' + (_sm ? _sm.used_gb.toFixed(1) + ' / ' + _sm.total_gb.toFixed(0) + ' GiB（' + _sm.used_pct.toFixed(0) + '%）' : '--') + '</td>'
@@ -351,11 +359,19 @@ function renderInstance(inst, mt, params, kvDet) {
         + '<td>' + (_hitPct != null ? _hitPct.toFixed(2) + '%' : '--') + '</td>'
         + '<td>' + fmtInt(cur.cacheHit) + '</td></tr></table>';
       html += '<table><tr><th>累计存入</th><th>累计回载</th><th>回载命中 token</th><th>在飞钉住</th></tr>'
-        + '<tr><td>' + _fmtGb(kd.stored_gb, 2) + (kd.store_count ? ' / ' + fmtInt(kd.store_count) + ' 次' : '') + '</td>'
-        + '<td>' + _fmtGb(kd.loaded_gb, 2) + (kd.load_count ? ' / ' + fmtInt(kd.load_count) + ' 次' : '') + '</td>'
+        + '<tr><td>' + (_isSimple ? '--' : _fmtGb(kd.stored_gb, 2) + (kd.store_count ? ' / ' + fmtInt(kd.store_count) + ' 次' : '')) + '</td>'
+        // [kvoff-simple-metric 1017] simple 口径回载真值 = load_blocks_total（块数，×每块容量折算 GiB）
+        + '<td>' + (kd.simple_loaded_blocks != null && kd.simple_cap_blocks > 0
+            ? fmtInt(Math.round(kd.simple_loaded_blocks)) + ' 块（≈' + (kd.simple_loaded_blocks * (kd.capacity_gb || 0) / kd.simple_cap_blocks).toFixed(0) + ' GiB）'
+            : _isSimple ? '--' : _fmtGb(kd.loaded_gb, 2) + (kd.load_count ? ' / ' + fmtInt(kd.load_count) + ' 次' : '')) + '</td>'
         + '<td>' + fmtInt(kd.ext_tokens) + '</td>'
-        + '<td>' + (kd.fill_pct != null ? kd.fill_pct.toFixed(1) + '%' : '--')
-        + (kd.write_pct != null || kd.read_pct != null ? '（写 ' + (kd.write_pct != null ? kd.write_pct.toFixed(1) : '--') + '% / 读 ' + (kd.read_pct != null ? kd.read_pct.toFixed(1) : '--') + '%）' : '')
+        // [kvoff-simple-metric 1017] simple 口径的在飞钉住真值 = simple_kv_offload_used_blocks
+        // （被在飞传输/命中钉住的块，官方口径不含 evictable 缓存块）；后端未重启时无此字段照旧 --。
+        + '<td>' + (kd.simple_pinned_gb != null
+            ? kd.simple_pinned_gb.toFixed(2) + ' GiB（' + fmtInt(Math.round(kd.simple_used_blocks)) + ' 块 · 在飞+命中钉住' + (kd.simple_pending_blocks ? '，存中 ' + fmtInt(Math.round(kd.simple_pending_blocks)) + ' 块' : '') + '）'
+            : _isSimple ? '--' /* simple 的 fill_pct 是硬编码 0 的假值，宁缺毋假 */
+            : (kd.fill_pct != null ? kd.fill_pct.toFixed(1) + '%' : '--')
+            + (kd.write_pct != null || kd.read_pct != null ? '（写 ' + (kd.write_pct != null ? kd.write_pct.toFixed(1) : '--') + '% / 读 ' + (kd.read_pct != null ? kd.read_pct.toFixed(1) : '--') + '%）' : ''))
         + '</td></tr></table>';
       // ④ 速率（滑窗差值）
       if (kd.rates) {
@@ -371,10 +387,14 @@ function renderInstance(inst, mt, params, kvDet) {
       // 口径脚注
       html += '<div class="sub" style="font-size:11px;color:var(--text-tertiary);margin-top:6px">'
         + '查询/命中 = vllm:external_prefix_cache_{queries,hits}_total（自引擎启动累计）；'
-        + '驻留 = /dev/shm（tmpfs）实测已用，本机 tmpfs 仅此档使用（单实例口径）；'
-        + '在飞钉住 = cpu_cache_usage_perc（被在飞传输占住的比例，非驻留量）；'
+        + (_isSimple
+            ? 'SimpleCPU 池 = 锁页匿名主机内存（torch.zeros 整池 + cudaHostRegister），启动即物理满配、不进 /dev/shm——tmpfs 那 ~0.7 GiB 是 NCCL 共享段等杂项；'
+                + (kd.simple_pinned_gb != null
+                    ? '在飞钉住 = simple_kv_offload_used_blocks（被在飞传输/命中钉住的块，官方口径不含可驱逐缓存块，≠已存数据量——上游无「已存量」gauge，缓存效果看命中率与回载 token）；'
+                    : '上游无「已存缓存量」gauge（在飞钉住族 simple_kv_offload_used_blocks 待控制台下次重启接入），缓存效果看命中率与回载 token；')
+            : '驻留 = /dev/shm（tmpfs）实测已用，本机 tmpfs 仅此档使用（单实例口径）；在飞钉住 = cpu_cache_usage_perc（被在飞传输占住的比例，非驻留量）；')
         + '速率 = ' + (kd.rates ? kd.rates.window_s.toFixed(1) : '6.0') + 's 滑窗差值。'
-        + (kd.metric_kind === 'simple' ? 'SimpleCPU 档的存/取字节不经指标暴露，累计列恒 0 属正常。' : '')
+        + (_isSimple ? 'SimpleCPU 档的写入字节不经指标暴露，累计存入列如实显示 --。' : '')
         + '</div>';
     } else if (kd && !kd.enabled) {
       html += '<div style="font-size:12px;line-height:1.7;color:var(--text-secondary)">'

@@ -1888,6 +1888,9 @@ function kvOffloadPortsInfo() {
         queries: kv ? Math.round(kv.queries || 0) : 0,
         hits: kv ? Math.round(kv.hits || 0) : 0,
         hit_rate: (kv && kv.queries > 0) ? +(kv.hits / kv.queries * 100).toFixed(1) : null,
+        // [kvoff-simple-metric 1017] SimpleCPU 在飞/命中钉住真值（非已存缓存量，官方口径）
+        simple_pinned_gb: (kv && kv.metricKind === 'simple' && kv.simpleUsedBlocks != null && kv.simpleCapBlocks > 0 && capBytes)
+          ? +(kv.simpleUsedBlocks * capBytes / kv.simpleCapBlocks / gib).toFixed(3) : null,
       });
     }
   } catch (e) {}
@@ -1978,9 +1981,22 @@ function kvDetailInfo(portFilter) {
         connector,
         metric_kind: kv ? (kv.metricKind || 'fill') : null,
         capacity_gb: capBytes ? +(capBytes / gib).toFixed(2) : null,
-        // 驻留：fill 口径有真实驻留 GiB；其余用 tmpfs 实测（单实例）
-        resident_gb: (kv && kv.metricKind === 'fill' && capBytes) ? +(kv.fillPerc * capBytes / gib).toFixed(2) : (shm ? +shm.used_gb.toFixed(2) : null),
-        resident_src: (kv && kv.metricKind === 'fill') ? 'metric' : (shm ? 'tmpfs' : null),
+        // 驻留：fill 口径有真实驻留 GiB；usage 口径（经典连接器走 tmpfs）用实测（单实例）；
+        // [kvoff-simple-metric 1017] simple 口径（SimpleCPU）池=锁页匿名内存不进 /dev/shm，
+        // tmpfs 值与它无关（10-17 实锤：恒 0.7GiB 的 NCCL psm_* 杂项）→ 绝不回落 tmpfs；
+        // 真实可得的只有「在飞/命中钉住块数」（官方 used_blocks，evictable 缓存块不计入）
+        // → 换算 GiB 单列 simple_pinned_gb，resident_gb 如实 null。
+        resident_gb: (kv && kv.metricKind === 'fill' && capBytes) ? +(kv.fillPerc * capBytes / gib).toFixed(2)
+          : (kv && kv.metricKind === 'simple') ? null
+          : (shm ? +shm.used_gb.toFixed(2) : null),
+        resident_src: (kv && kv.metricKind === 'fill') ? 'metric'
+          : (kv && kv.metricKind === 'simple') ? 'none' : (shm ? 'tmpfs' : null),
+        simple_pinned_gb: (kv && kv.metricKind === 'simple' && kv.simpleUsedBlocks != null && kv.simpleCapBlocks > 0 && capBytes)
+          ? +(kv.simpleUsedBlocks * capBytes / kv.simpleCapBlocks / gib).toFixed(3) : null,
+        simple_used_blocks: (kv && kv.metricKind === 'simple') ? kv.simpleUsedBlocks : null,
+        simple_cap_blocks: (kv && kv.metricKind === 'simple') ? kv.simpleCapBlocks : null,
+        simple_pending_blocks: (kv && kv.metricKind === 'simple') ? kv.simplePendingBlocks : null,
+        simple_loaded_blocks: (kv && kv.metricKind === 'simple') ? kv.simpleLoadedBlocks : null,
         shm_used_gb: shm ? shm.used_gb : null,
         shm_total_gb: shm ? shm.total_gb : null,
         shm_used_pct: shm ? shm.used_pct : null,
@@ -2107,14 +2123,35 @@ function samplePortMetrics(port) {
               // [kvoff-simple 0927] SimpleCPUOffloadConnector 不暴露 kv_offload_* 族，
               // 只有 external_prefix_cache_*（查询/命中 token）→ 以 simple 口径出条目，
               // 存/在飞等字段如实为 null/0，前端按 metric_kind=simple 隐藏误导性小字。
+              // [kvoff-simple-metric 1017] 官方 0.31 SimpleCPU 自带指标族（0.30 无）：
+              //   info{capacity_blocks}=池容量块数；used_blocks=被在飞传输/命中钉住的块数
+              //   （官方 HELP 明示 Evictable cached blocks are not counted → 不是已存缓存量）；
+              //   pending_store_blocks=在飞存块数；load_blocks_total=累计回载块数。
+              // 注意：本连接器池 = torch.zeros 整池 + cudaHostRegister 锁页的匿名主机内存，
+              // **不进 /dev/shm**（10-17 实锤：tmpfs 那 ~0.7GiB 是 NCCL psm_* 杂项段）——
+              // simple 口径一律不得回落 tmpfs 当驻留。_created 伴生序列须排除（前缀同名）。
+              const plainS = (name) => { for (const k of Object.keys(m)) { if (k === name || k.startsWith(name + '|')) return m[k] || 0; } return null; };
+              let simpleCapBlocks = null;
+              for (const k of Object.keys(m)) {
+                // parseMetrics 键格式 = name|JSON（值已去引号），_created 伴生序列因 '|' 边界天然排除
+                if (k.startsWith('vllm:simple_kv_offload_info|')) {
+                  try { simpleCapBlocks = parseInt(JSON.parse(k.substring(k.indexOf('|') + 1)).capacity_blocks, 10) || null; } catch (e) {}
+                  if (simpleCapBlocks != null) break;
+                }
+              }
+              const simpleUsed = plainS('vllm:simple_kv_offload_used_blocks');
+              const simplePending = plainS('vllm:simple_kv_offload_pending_store_blocks');
+              const simpleLoaded = plainS('vllm:simple_kv_offload_load_blocks_total');
               const q0 = counterTotal(m, 'vllm:external_prefix_cache_queries_total');
               const h0 = counterTotal(m, 'vllm:external_prefix_cache_hits_total');
-              if (q0 || h0) {
+              if (q0 || h0 || simpleCapBlocks != null || simpleUsed != null) {
                 tk.kvOffload = {
                   metricKind: 'simple', fillPerc: 0, writePerc: null, readPerc: null,
                   queries: q0, hits: h0, storedBytes: 0, loadedBytes: 0,
                   extTokens: counterBySource(m, 'vllm:prompt_tokens_by_source_total', 'external_kv_transfer'),
                   loadCount: 0, storeCount: 0,
+                  simpleCapBlocks, simpleUsedBlocks: simpleUsed,
+                  simplePendingBlocks: simplePending, simpleLoadedBlocks: simpleLoaded,
                 };
               }
             }

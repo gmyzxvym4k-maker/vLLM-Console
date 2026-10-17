@@ -1064,6 +1064,8 @@
                     <div id="recentRequests">
                         <div style="font-size:12px;color:var(--text-tertiary);padding:8px 0">暂无记录（请求完成后出现）</div>
                     </div>
+                    <!-- [vllm-agg-1017] vLLM 实测聚合表：对上表当前显示的 vLLM 行做汇总统计（输出真实数据） -->
+                    <div id="recentAggVllm" style="margin-top:10px"></div>
                 </div>
             </div>
 
@@ -2131,7 +2133,7 @@
 })();
 
 let isConnected = false;
-const PAGE_VERSION = '20261017-r46'; // r46 = 二级缓存卡 simple 口径纠偏[kvoff-simple-honest]：SimpleCPU 池=锁页匿名内存不进 /dev/shm，主值不再显示 tmpfs 杂项值（NCCL psm_* ~0.7GiB 恒定噪音）改「锁页池·启动即满配」；后端接入官方 simple_kv_offload_* 族（used/pending/capacity blocks，在飞钉住真值，需重启生效——未重启前端照旧显示不报错）；仪表盘卡 tooltip 同步 // r45 = 新增「⚙ 设置」标签显示设置[tab-prefs]：导航最右齿轮弹窗勾选要显示的标签（13 项），存 localStorage consoleHiddenTabs 仅本浏览器生效、零后端改动零重启；隐藏=导航项 display:none（tab-content/已加载 iframe 不动，切回即恢复），当前激活标签被隐藏自动切到首个可见，至少保留一个防自锁；switchTab 高亮从 DOM 序号 map 改 data-tab 查找（免维护）；顺带清除 09-23 开源发布混入的调试残留（每次刷新 700ms 后自动跳硬件监视）——默认标签恢复仪表盘 // r44 = 10-16 新增「卡算力」标签[card-compute]：逐卡理论峰值 FP32（芯片表档/观测加速档双口径）/ 实时估算算力（峰值×频率达成率×利用率）/ Tensor 参考（GA100 倍率）/ 频率达成率 / 显存频率 / 功耗墙与限频原因位 / 5 分钟算力曲线；独立页 /static/compute.html 走通用静态路由（零重启），数据复用只读接口 /v1/internal/gpu + /v1/internal/gpu-ctl，不改 server.js；页脚固化口径警示（1695=芯片能力表 vs 实测 boost 顶 1470；利用率≠数据通路占用） // r43 = 10-14 GPU 排队卡块内文本全部单行化[gq-nowrap]（用户实锤撑高形态：预填充块长数字「169,610 / 170,000 tok (估)」在 130px 块宽折行+进度条行 → 块变高撑开时间线）：预填充数值行/输出「N tok 已输出」行/headRow 标签一律 nowrap+省略号+title 全文；block 容器 overflow:hidden 防横向溢出；配合 r42 容器定高 76px，队列任何状态卡片高度恒定 // r42 = 10-14 GPU 排队·处理时间线固定高度 76px[gq-fixed-h]（用户要求队列任务块高度固定）：各块行数/字号不一（有/无任务号、＋N 排队、空态），stretch 容器高度原随最高块浮动——现容器定高 76px、块 height:100% 垂直居中填充、空态同高，队列增删换型一律不改卡片高度 // r41 = 10-14 修复「槽被撑开」真因在 GPU 排队卡[gq-row-h]（用户定位）：预填充块原 4 行（标题/done÷total/进度条/tok/s）比其它块多一行，预填充段出现时整条时间线变高、连带下方并发卡位移——进度条与速度合并为一行压成 3 行等高（悬停 title 看精确值）；「刚进入」占位块提示文案改单行防折行撑高 // r40 = 10-14 输出行回原始高度 60px、预填充行改与输出行同构同高[conc-row-h-60]：预填充两行 grid 布局改三段式弹性（左标题+meta/中进度条+曲线 40→24px/右 Decode+Prefill 双值列），空位行同 60px；live token 预览与 meta 行互换（60px 预算不叠加），预览体压到 12px // r39 = 10-14 槽位高度=刚好装下预填充/输出行[conc-row-h]：数据行 84→80px（预填充行自然高 ~76px+余量，两态内容均不裁切）；空位占位行同高 80px（请求装配/释放整板零布局位移，消除尺寸适配跳动）；live token 预览体 38→18px 收进行内预算（column-reverse 恒显最新行） // r38 = 10-14 并发卡「输出中/预填充中」槽行统一固定高度 84px[conc-row-h]（预填充行原 ~77px、输出行原 ~60px、带 live 预览 ~120px，两态切换行高跳动）；live 预览体 48→38px，超高裁切顶部（column-reverse 保最新 token 行可见）；空位占位行保持细行 // r37 = 10-14 并发卡改固定槽位板[conc-slot-board]（用户方案）：行数恒等于 max-num-seqs（每实例，model-params 真值 30s 缓存，兜底 4），vLLM rid 条目装配进槽位（先占先得、条目存续槽号不变、退场释放），空槽显「槽位 N · 空闲」占位行——行数从结构上不可能超发；live 优先占位、保持行填余、溢出让位不显示；删除「明细捕获中/明细未捕获」特判分支（板子天然覆盖）；空闲时板下附「上次请求 Decode/Prefill」行 // r36 = 10-14 conc-v2 语义修正：保持行（旧快照）标签一律「上次 Decode/Prefill」并半透明（原显「当前·实测/均值」误导）；配合后端 [rid-stable-1014]（v3 激活时行数权威=注册行、活跃 rid 永不退绑、最近邻只给从未绑定行、容差 30s→10s）——真实配对采样实锤后端行↔rid 每拍错位才是历次「几行/跳号/曲线断」总根源 // r35 = 10-14 并发请求卡推倒重写[conc-v2]：清空 r23~r34 十轮叠加的 slot-pin/hold/cap/spdHold/genHist/sparkKey/pinId 补丁层，改为单一「请求注册表」模型——条目=vLLM 请求（主键 rid，prefill 期暂记 REQ 号、rid 晚到同条目改登不换行），行位=首现序永不重排，行保持到输出结束（>1.5s 无数据退场，闪断期原位半透明驻留），曲线=引擎真值 Δg/Δt 逐拍采样（500ms/点窗 15s 贝塞尔，保持行不记录），Decode=本行实时→全程均值→上一显示值→分摊（与 GPU 排队卡同源），Prefill=未缓存÷耗时按 exact 标语义，空闲显上次请求实测；GPU 排队卡不受影响 // r34 = 10-14 并发行「保持原位到输出结束」[conc-row-until-end + conc-spark-sticky]：① 缺席保持行不再受「本拍行数≥running 就不补」限制——末次数据 2.5s 内一律原位保持（半透明），后端行集轮换/rid 闪断期曲线与位置都不动，2.5s 无更新才判输出结束退场；live 行恒显、保持行只占 running+1 的额外名额（最近可见优先），既不闪断也不堆积② 曲线键钉到槽位首见身份 __sparkKey（rid 晚到/REQ 轮换不换键不重启），采样点记录移入行渲染循环、保持行不记录旧快照 // r33 = 10-14 并发卡输出曲线细粒度[conc-spark-fine]：① decode 行曲线数据源改引擎真值累计 tokens_generated 的逐拍差分 Δg/Δt（500ms 粒度、每行独立、key=rid 跨行轮换连续；显示值含均值/分摊回落会把曲线拉平，差分保留真实瞬时起伏；dt<250ms 或 g 回落不发放）② 折线改 Catmull-Rom 三次贝塞尔平滑（同 PD 图手法）；再细到 100ms 级（引擎每步）需后端随 stats 下发 v3 逐步样本，待控制台重启窗口 // r32 = 10-14 并发请求行速度区改 Strata 监控 Speed 卡版式[strata-speed-ui]：大号数值+t/s 单位、下方灰字语义标签（当前 Decode·实测/均值/分摊、上次请求 Decode；当前/本请求 Prefill·实测/估、上次请求 Prefill），Decode/Prefill 双值并排（prefill 行 Decode 显 --），走势线保留；计算逻辑不变（Decode=后端本行实时→全程均值→上一值→分摊，与 GPU 排队卡同源；Prefill=未缓存 prompt÷预填充耗时，同 Strata (prompt−reused)/prompt_ms 式）；prefill 行进度对 done/total 挪入 meta 行 // r31 = 10-14 并发卡显示身份钉稳[conc-pin-id]：REQ 号只是后端行槽位流水号（rt.seq，gauge 滞后+绑定抖动致同请求换号，用户所见「REQ-480923 一直变」），首见 REQ 号+vLLM rid 钉在槽位上随行轮换不变，meta 行显示「REQ-xxx · rid8」 // r30 = 10-14 并发卡速度口径与「GPU 排队·处理」卡对齐[conc-gq-rate]（用户确认排队卡数值正确并要求采用）：Decode=后端本行实时 avg_speed_3s → 本行全程均值 avg_speed（buildGpuQueueSegs 同款）→ 上一值(≤60s 不空窗) → 实例吞吐÷行数分摊（最后兜底）；撤除 r29 前端 rid 滑窗测速与 r26 提前的分摊层（两者都会让行值偏离排队卡口径）；sparkline 保留 rid 稳定键 // r29 = 10-14 并发卡每行独立实时测速[conc-rid-rate]：r26 的分摊兜底过前导致「所有并发速度都一样」（截图 6 行同显 11 tok/s·分摊）——tokens_generated 是引擎按 vLLM rid 上报真值，前端按 rid 每拍采样自算滑窗 Δg/Δt（rid 跨行轮换稳定，后端行窗因绑定抖动常不出数）；Decode 优先级改为 后端本行实时→前端本 rid 滑窗实测→本行全程均值→实例分摊(最后兜底)→上一值；sparkline 键改 rid 优先（REQ 轮换曲线不断） // r28 = 10-14 并发卡行数封顶 [conc-one-row-per-rid 1014b]：后端行集整拍轮换（REQ 号滚动+rid 闪断）时旧缺席保持行逐拍堆积，3 个并发显示 9 行（截图实锤）——保持行只补「本拍行数 < running」的缺口且补后总行数 ≤ running，多槽位竞争取最近可见者优先；并发数即行数上限 // r27 = 10-14 并发卡「一个并发一行」[conc-one-row-per-rid]：按 vLLM rid 判身份——同拍多行命中同一身份（绑定抖动期旧行仍挂 rid 别名+新行绑到同一 rid；REQ 号被接管后旧槽位留幽灵行）→ 身份并入同一槽位（排位取更早者）且只保留信息最全的一行（有 rid > 有 live 流预览 > 生成量大者），合并后的空壳槽位不再产生缺席保持幽灵行；根治用户所见「一个并发出现几行数据」 // r26 = 10-14 并发卡速度优先级对齐 Strata「生成中=当前 Decode」[strata-rule-1012b]：v3 每行实时滑窗在并发短请求下常未成熟（请求 2~5s 完成，窗需 ≥1.5s+末样本 ≤2.2s），旧逻辑此时回落本行全程均值（滞后恒定值，看起来"没变化"）——新增第二优先级：实例当前 Decode 吞吐(last_second.tokens)÷并发输出行数（标「实时 tok/s·分摊」，各行同值=Strata 速度卡当前 Decode 的行级等价）；完整链=本行实时实测→当前 Decode 分摊→本行全程均值→上一值(≤60s)，sparkline 同源 // r25 = 10-12 并发请求卡速度规则对齐「Strata 监控」速度卡[strata-rule-1012]：① Decode/Prefill 数值不空窗——回落链 当前实测→本请求全程均值→最近一次有效实测值（≤60s，行级缓存 __concSpdHold），回落时子标签明示「上一值」并半透明，滑窗未成熟期不再闪 --（同 Strata：生成中=当前 Decode，空闲=上次请求 Decode）；② decode 行预填充小字标语义：本请求实测 / 上次请求（后端回落值口径）/ 上一值；③ 空闲态在「等待请求...」下补显 上次请求 Decode/Prefill（主源=最近完成请求 request-traces 实测：decode_tps、prefill=(prompt−cached)/prefill_s 实算口径，与 Strata (prompt−reused)/prompt_ms 同式；无记录退回行级缓存 ≤2min）；④ sparkline 历史同源回落，曲线不再因单拍无值塌 0 // r24 = 10-12 行位固定补第二层防御[conc-hold]：后端某拍轮换掉仍在跑的行时，前端按上一拍数据原位保持显示 ≤2.5s（半透明+tooltip），整列不再因单拍缺行上下移；槽位释放窗口不变 15s // r23 = 10-12 并发请求卡行位固定（[conc-slot-pin 1012]）：后端 rt.live 行序因 gauge 滞后 retire + 身份 parked 按 rid 复活而整段轮换（实测 4 行每拍对调位置），前端新增 __concSlotOrder 按行身份（taskId||id）首现排位、新行追加末尾、缺席 15s 释放槽位，行位置不再动态排序；live token 流在重排前按后端原始顺序 zip 绑定（r.__lv），预览不串行 // r22 = 10-10 新增「崩溃记录」标签：独立页 /crash.html 展示引擎崩溃时间+根因+证据原文（筛选/搜索/KPI），数据源 = 独立守护进程 crash-watch.mjs（systemd --user fnx-crash-watch.service，不占控制台事件循环、不重启控制台）：model-manager 实例快照两轮缺席+/proc 校验=进程消失、看门狗「确认离线」精确时间戳、server.log 启停事件抑制人工停止/控制台重启连坐、日志尾部签名定根因（EngineDead/CUDA OOM/非法内存/NCCL/断言/段错误/磁盘满…）+ dmesg OOM/Xid 补充，首跑回填历史崩溃（watchdog 日志+vllm 日志+dmesg），产出 static/crash-records.json // r21 = 10-09 硬件监视页新增「GPU 高温自动关机守护」卡（[gpu-hotshield 1009]）：任一张 GPU max(核心,显存)温度 ≥ 阈值且持续 holdSec 秒 → 先优雅停全部 vLLM/SGLang 实例（限时 45s）→ gpu-ctl halt（root：sync + systemctl poweroff）关闭本机；graceSec 倒计时全屏红幅（任意标签可见+跨标签 alert 提醒）可手动取消，降温自动取消，数据盲态（>15s 无 GPU 采样）不判定并撤销倒计时，cooldownMin 防关机-开机振荡；配置 gpu-hotshield.json 热加载、POST /v1/internal/hotshield/cmd {save|cancel}、状态 1s 轮询、事件历史落 gpu-hotshield-state.json。 // r20 = 10-08 新增「Strata 监控」标签：克隆 Strata Web UI Monitor 页（http://192.168.1.38:8080/#monitor）——内嵌 /strata-monitor.html（模型状态/八指标卡带 sparkline/上下文仪表/逐请求表/会话缓存/MCP），后端 [strata-remote-monitor] 模块代理远端 /metrics+/health+/mcp（800ms TTL+单飞+AbortController 超时；目标地址 strata-remote.json 热加载，缺省 .38:8080；浏览器直连远端会被 CORS 拦，必须走代理）。 // r19 = 10-07 「最近完成请求」表新增 二级缓存命中 列（在 缓存命中 右侧）：数据是逐请求真值，非估算——vLLM 侧由 rt-patch #12（dsh_extcache_rt）在 Request.take_prefill_stats 摘取官方 PrefillStats 的一瞬记下 num_external_cached_tokens/num_local_cached_tokens 分项，请求完成时落盘 vllm-ext-cache.jsonl，后端按 rid join（含 -8hex 内部后缀）；SGLang 侧直接映射官方 exporter 的 cached_tokens_storage_backend/cached_tokens_local。无该项数据时如实显示 --（绝不用「缓存命中」总数冒充），并在表尾给一句原因说明；组头聚合并列显示 二级缓存命中率＝Σ二级命中/Σprompt。新列生效需引擎带补丁重启（控制台重启不影响）。 // r18 = 10-06 仪表盘曲线提速平滑 + 停刷防御：① PD 动态图轮询 1s→500ms、序列 EMA(α=0.3) 平滑、折线改 Catmull-Rom 贝塞尔、当前值读数用平滑值（曲线跟进更快、无逐秒锯齿）；② 并发卡（500ms 独立轮询）成功渲染即盖 _lastRenderAt——原实现只在主链整轮结束后盖章，后端毛刺期（stats 实测 p95≈1.9s、峰值 4s）主链一轮拖十几秒时看门狗误判正常不自愈，现并发卡心跳成为独立渲染推进信号；③ 后端 stats 加 350ms 结果缓存（同窗口多消费者只算一次）。 //  r17 = 10-06 并发实时测速稀释修复：v3TouchRow 活跃期全程均值分母钉在 min(now, 最后产出/新行)（停增/暂离期不发稀释值，截图 g=8·34s·0.2 形态根治）；v3goneAt 冻结滞留窗 15s→5s；bindRow 复活清 stale goneAt 锚；active_requests.elapsed_s 同源钉锚。 // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r16 = 10-05 修复 vLLM 运行日志空白：祖先链 argv 判据对「重定向在 wrapper shell 内部」的现行启动链失明（引擎属 root 读不到其 fd），新增祖先链 fd1/fd2 指向 .log + 内容校验判据 ancestorFdLogFile，接入选日志两条链（pickLogFromProcs ⓪ / pickScriptModelLogFile ①″）；端点透传 fallback、前端红条明示兜底 vllm.log；页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r15 = EPYC 板两处口径修复：① 封装温度——该机 /sys/class/thermal 为空、k10temp 只挂 hwmon，采样器加 hwmon 回落（Tctl/Package 优先、避开逐 CCD 的 Tccd 分量）；② CPU 缓存——后端从只读 cpu0 改为全核扫共享域聚合并行输出（7F52 的 16 个 16MB L3 域合计 256MB 如实呈现，前端加「N域×slice」标注）；r14 = 10-05 换装适配（AMD EPYC 7F52 16C/32T + H12D-8D + 3×CMP 170HX + 32GB 内存）：主端口自愈三层防御（6s 定时兜底重探 / ticker busy>15s 强制放行 / stats 空数据触发纠偏——换装开机时序竞态会令主端口永久粘滞缺省 8000、仪表盘整页假 {}）；cpu-ctl v3 跨平台化（睿频通道 intel_pstate/no_turbo⇄cpufreq/boost 自适应、温度 coretemp⇄k10temp 回落、platform 串运行时生成）；SCRIPT_MODELS.base 换 32GB 账（pp:3、kvoff:0、PLE INT8+disk）；新 standard 预设 current-pp3-1m-mtp4-int8disk-32g；双卡文案改卡数自适应；r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
+const PAGE_VERSION = '20261017-r47'; // r47 = 仪表盘「最近完成请求」下方新增「vLLM 实测聚合（输出真实数据）」表[vllm-agg-1017]：对上表当前显示的 vLLM 行按实例端口分组汇总（多实例逐行 + 合计行；SGLang 行不进），列=条数/ΣPrompt/Σ缓存命中(含命中率)/Σ二级缓存命中/Σ预填充/Σ生成/聚合pp TPS/首token均值/Σdecode耗时/聚合tg TPS/逐行速度中位数/速度区间/MTP接受率；聚合速度一律 Σtoken/Σ时间（加权真值，与组头 tg TPS 同口径），不用逐行算术平均防短请求带偏；明细表被 sglang_export_off 隐藏或无记录时聚合表同步清空；零后端改动，index.html 每请求读盘刷新即生效 // r46 = 二级缓存卡 simple 口径纠偏[kvoff-simple-honest]：SimpleCPU 池=锁页匿名内存不进 /dev/shm，主值不再显示 tmpfs 杂项值（NCCL psm_* ~0.7GiB 恒定噪音）改「锁页池·启动即满配」；后端接入官方 simple_kv_offload_* 族（used/pending/capacity blocks，在飞钉住真值，需重启生效——未重启前端照旧显示不报错）；仪表盘卡 tooltip 同步 // r45 = 新增「⚙ 设置」标签显示设置[tab-prefs]：导航最右齿轮弹窗勾选要显示的标签（13 项），存 localStorage consoleHiddenTabs 仅本浏览器生效、零后端改动零重启；隐藏=导航项 display:none（tab-content/已加载 iframe 不动，切回即恢复），当前激活标签被隐藏自动切到首个可见，至少保留一个防自锁；switchTab 高亮从 DOM 序号 map 改 data-tab 查找（免维护）；顺带清除 09-23 开源发布混入的调试残留（每次刷新 700ms 后自动跳硬件监视）——默认标签恢复仪表盘 // r44 = 10-16 新增「卡算力」标签[card-compute]：逐卡理论峰值 FP32（芯片表档/观测加速档双口径）/ 实时估算算力（峰值×频率达成率×利用率）/ Tensor 参考（GA100 倍率）/ 频率达成率 / 显存频率 / 功耗墙与限频原因位 / 5 分钟算力曲线；独立页 /static/compute.html 走通用静态路由（零重启），数据复用只读接口 /v1/internal/gpu + /v1/internal/gpu-ctl，不改 server.js；页脚固化口径警示（1695=芯片能力表 vs 实测 boost 顶 1470；利用率≠数据通路占用） // r43 = 10-14 GPU 排队卡块内文本全部单行化[gq-nowrap]（用户实锤撑高形态：预填充块长数字「169,610 / 170,000 tok (估)」在 130px 块宽折行+进度条行 → 块变高撑开时间线）：预填充数值行/输出「N tok 已输出」行/headRow 标签一律 nowrap+省略号+title 全文；block 容器 overflow:hidden 防横向溢出；配合 r42 容器定高 76px，队列任何状态卡片高度恒定 // r42 = 10-14 GPU 排队·处理时间线固定高度 76px[gq-fixed-h]（用户要求队列任务块高度固定）：各块行数/字号不一（有/无任务号、＋N 排队、空态），stretch 容器高度原随最高块浮动——现容器定高 76px、块 height:100% 垂直居中填充、空态同高，队列增删换型一律不改卡片高度 // r41 = 10-14 修复「槽被撑开」真因在 GPU 排队卡[gq-row-h]（用户定位）：预填充块原 4 行（标题/done÷total/进度条/tok/s）比其它块多一行，预填充段出现时整条时间线变高、连带下方并发卡位移——进度条与速度合并为一行压成 3 行等高（悬停 title 看精确值）；「刚进入」占位块提示文案改单行防折行撑高 // r40 = 10-14 输出行回原始高度 60px、预填充行改与输出行同构同高[conc-row-h-60]：预填充两行 grid 布局改三段式弹性（左标题+meta/中进度条+曲线 40→24px/右 Decode+Prefill 双值列），空位行同 60px；live token 预览与 meta 行互换（60px 预算不叠加），预览体压到 12px // r39 = 10-14 槽位高度=刚好装下预填充/输出行[conc-row-h]：数据行 84→80px（预填充行自然高 ~76px+余量，两态内容均不裁切）；空位占位行同高 80px（请求装配/释放整板零布局位移，消除尺寸适配跳动）；live token 预览体 38→18px 收进行内预算（column-reverse 恒显最新行） // r38 = 10-14 并发卡「输出中/预填充中」槽行统一固定高度 84px[conc-row-h]（预填充行原 ~77px、输出行原 ~60px、带 live 预览 ~120px，两态切换行高跳动）；live 预览体 48→38px，超高裁切顶部（column-reverse 保最新 token 行可见）；空位占位行保持细行 // r37 = 10-14 并发卡改固定槽位板[conc-slot-board]（用户方案）：行数恒等于 max-num-seqs（每实例，model-params 真值 30s 缓存，兜底 4），vLLM rid 条目装配进槽位（先占先得、条目存续槽号不变、退场释放），空槽显「槽位 N · 空闲」占位行——行数从结构上不可能超发；live 优先占位、保持行填余、溢出让位不显示；删除「明细捕获中/明细未捕获」特判分支（板子天然覆盖）；空闲时板下附「上次请求 Decode/Prefill」行 // r36 = 10-14 conc-v2 语义修正：保持行（旧快照）标签一律「上次 Decode/Prefill」并半透明（原显「当前·实测/均值」误导）；配合后端 [rid-stable-1014]（v3 激活时行数权威=注册行、活跃 rid 永不退绑、最近邻只给从未绑定行、容差 30s→10s）——真实配对采样实锤后端行↔rid 每拍错位才是历次「几行/跳号/曲线断」总根源 // r35 = 10-14 并发请求卡推倒重写[conc-v2]：清空 r23~r34 十轮叠加的 slot-pin/hold/cap/spdHold/genHist/sparkKey/pinId 补丁层，改为单一「请求注册表」模型——条目=vLLM 请求（主键 rid，prefill 期暂记 REQ 号、rid 晚到同条目改登不换行），行位=首现序永不重排，行保持到输出结束（>1.5s 无数据退场，闪断期原位半透明驻留），曲线=引擎真值 Δg/Δt 逐拍采样（500ms/点窗 15s 贝塞尔，保持行不记录），Decode=本行实时→全程均值→上一显示值→分摊（与 GPU 排队卡同源），Prefill=未缓存÷耗时按 exact 标语义，空闲显上次请求实测；GPU 排队卡不受影响 // r34 = 10-14 并发行「保持原位到输出结束」[conc-row-until-end + conc-spark-sticky]：① 缺席保持行不再受「本拍行数≥running 就不补」限制——末次数据 2.5s 内一律原位保持（半透明），后端行集轮换/rid 闪断期曲线与位置都不动，2.5s 无更新才判输出结束退场；live 行恒显、保持行只占 running+1 的额外名额（最近可见优先），既不闪断也不堆积② 曲线键钉到槽位首见身份 __sparkKey（rid 晚到/REQ 轮换不换键不重启），采样点记录移入行渲染循环、保持行不记录旧快照 // r33 = 10-14 并发卡输出曲线细粒度[conc-spark-fine]：① decode 行曲线数据源改引擎真值累计 tokens_generated 的逐拍差分 Δg/Δt（500ms 粒度、每行独立、key=rid 跨行轮换连续；显示值含均值/分摊回落会把曲线拉平，差分保留真实瞬时起伏；dt<250ms 或 g 回落不发放）② 折线改 Catmull-Rom 三次贝塞尔平滑（同 PD 图手法）；再细到 100ms 级（引擎每步）需后端随 stats 下发 v3 逐步样本，待控制台重启窗口 // r32 = 10-14 并发请求行速度区改 Strata 监控 Speed 卡版式[strata-speed-ui]：大号数值+t/s 单位、下方灰字语义标签（当前 Decode·实测/均值/分摊、上次请求 Decode；当前/本请求 Prefill·实测/估、上次请求 Prefill），Decode/Prefill 双值并排（prefill 行 Decode 显 --），走势线保留；计算逻辑不变（Decode=后端本行实时→全程均值→上一值→分摊，与 GPU 排队卡同源；Prefill=未缓存 prompt÷预填充耗时，同 Strata (prompt−reused)/prompt_ms 式）；prefill 行进度对 done/total 挪入 meta 行 // r31 = 10-14 并发卡显示身份钉稳[conc-pin-id]：REQ 号只是后端行槽位流水号（rt.seq，gauge 滞后+绑定抖动致同请求换号，用户所见「REQ-480923 一直变」），首见 REQ 号+vLLM rid 钉在槽位上随行轮换不变，meta 行显示「REQ-xxx · rid8」 // r30 = 10-14 并发卡速度口径与「GPU 排队·处理」卡对齐[conc-gq-rate]（用户确认排队卡数值正确并要求采用）：Decode=后端本行实时 avg_speed_3s → 本行全程均值 avg_speed（buildGpuQueueSegs 同款）→ 上一值(≤60s 不空窗) → 实例吞吐÷行数分摊（最后兜底）；撤除 r29 前端 rid 滑窗测速与 r26 提前的分摊层（两者都会让行值偏离排队卡口径）；sparkline 保留 rid 稳定键 // r29 = 10-14 并发卡每行独立实时测速[conc-rid-rate]：r26 的分摊兜底过前导致「所有并发速度都一样」（截图 6 行同显 11 tok/s·分摊）——tokens_generated 是引擎按 vLLM rid 上报真值，前端按 rid 每拍采样自算滑窗 Δg/Δt（rid 跨行轮换稳定，后端行窗因绑定抖动常不出数）；Decode 优先级改为 后端本行实时→前端本 rid 滑窗实测→本行全程均值→实例分摊(最后兜底)→上一值；sparkline 键改 rid 优先（REQ 轮换曲线不断） // r28 = 10-14 并发卡行数封顶 [conc-one-row-per-rid 1014b]：后端行集整拍轮换（REQ 号滚动+rid 闪断）时旧缺席保持行逐拍堆积，3 个并发显示 9 行（截图实锤）——保持行只补「本拍行数 < running」的缺口且补后总行数 ≤ running，多槽位竞争取最近可见者优先；并发数即行数上限 // r27 = 10-14 并发卡「一个并发一行」[conc-one-row-per-rid]：按 vLLM rid 判身份——同拍多行命中同一身份（绑定抖动期旧行仍挂 rid 别名+新行绑到同一 rid；REQ 号被接管后旧槽位留幽灵行）→ 身份并入同一槽位（排位取更早者）且只保留信息最全的一行（有 rid > 有 live 流预览 > 生成量大者），合并后的空壳槽位不再产生缺席保持幽灵行；根治用户所见「一个并发出现几行数据」 // r26 = 10-14 并发卡速度优先级对齐 Strata「生成中=当前 Decode」[strata-rule-1012b]：v3 每行实时滑窗在并发短请求下常未成熟（请求 2~5s 完成，窗需 ≥1.5s+末样本 ≤2.2s），旧逻辑此时回落本行全程均值（滞后恒定值，看起来"没变化"）——新增第二优先级：实例当前 Decode 吞吐(last_second.tokens)÷并发输出行数（标「实时 tok/s·分摊」，各行同值=Strata 速度卡当前 Decode 的行级等价）；完整链=本行实时实测→当前 Decode 分摊→本行全程均值→上一值(≤60s)，sparkline 同源 // r25 = 10-12 并发请求卡速度规则对齐「Strata 监控」速度卡[strata-rule-1012]：① Decode/Prefill 数值不空窗——回落链 当前实测→本请求全程均值→最近一次有效实测值（≤60s，行级缓存 __concSpdHold），回落时子标签明示「上一值」并半透明，滑窗未成熟期不再闪 --（同 Strata：生成中=当前 Decode，空闲=上次请求 Decode）；② decode 行预填充小字标语义：本请求实测 / 上次请求（后端回落值口径）/ 上一值；③ 空闲态在「等待请求...」下补显 上次请求 Decode/Prefill（主源=最近完成请求 request-traces 实测：decode_tps、prefill=(prompt−cached)/prefill_s 实算口径，与 Strata (prompt−reused)/prompt_ms 同式；无记录退回行级缓存 ≤2min）；④ sparkline 历史同源回落，曲线不再因单拍无值塌 0 // r24 = 10-12 行位固定补第二层防御[conc-hold]：后端某拍轮换掉仍在跑的行时，前端按上一拍数据原位保持显示 ≤2.5s（半透明+tooltip），整列不再因单拍缺行上下移；槽位释放窗口不变 15s // r23 = 10-12 并发请求卡行位固定（[conc-slot-pin 1012]）：后端 rt.live 行序因 gauge 滞后 retire + 身份 parked 按 rid 复活而整段轮换（实测 4 行每拍对调位置），前端新增 __concSlotOrder 按行身份（taskId||id）首现排位、新行追加末尾、缺席 15s 释放槽位，行位置不再动态排序；live token 流在重排前按后端原始顺序 zip 绑定（r.__lv），预览不串行 // r22 = 10-10 新增「崩溃记录」标签：独立页 /crash.html 展示引擎崩溃时间+根因+证据原文（筛选/搜索/KPI），数据源 = 独立守护进程 crash-watch.mjs（systemd --user fnx-crash-watch.service，不占控制台事件循环、不重启控制台）：model-manager 实例快照两轮缺席+/proc 校验=进程消失、看门狗「确认离线」精确时间戳、server.log 启停事件抑制人工停止/控制台重启连坐、日志尾部签名定根因（EngineDead/CUDA OOM/非法内存/NCCL/断言/段错误/磁盘满…）+ dmesg OOM/Xid 补充，首跑回填历史崩溃（watchdog 日志+vllm 日志+dmesg），产出 static/crash-records.json // r21 = 10-09 硬件监视页新增「GPU 高温自动关机守护」卡（[gpu-hotshield 1009]）：任一张 GPU max(核心,显存)温度 ≥ 阈值且持续 holdSec 秒 → 先优雅停全部 vLLM/SGLang 实例（限时 45s）→ gpu-ctl halt（root：sync + systemctl poweroff）关闭本机；graceSec 倒计时全屏红幅（任意标签可见+跨标签 alert 提醒）可手动取消，降温自动取消，数据盲态（>15s 无 GPU 采样）不判定并撤销倒计时，cooldownMin 防关机-开机振荡；配置 gpu-hotshield.json 热加载、POST /v1/internal/hotshield/cmd {save|cancel}、状态 1s 轮询、事件历史落 gpu-hotshield-state.json。 // r20 = 10-08 新增「Strata 监控」标签：克隆 Strata Web UI Monitor 页（http://192.168.1.38:8080/#monitor）——内嵌 /strata-monitor.html（模型状态/八指标卡带 sparkline/上下文仪表/逐请求表/会话缓存/MCP），后端 [strata-remote-monitor] 模块代理远端 /metrics+/health+/mcp（800ms TTL+单飞+AbortController 超时；目标地址 strata-remote.json 热加载，缺省 .38:8080；浏览器直连远端会被 CORS 拦，必须走代理）。 // r19 = 10-07 「最近完成请求」表新增 二级缓存命中 列（在 缓存命中 右侧）：数据是逐请求真值，非估算——vLLM 侧由 rt-patch #12（dsh_extcache_rt）在 Request.take_prefill_stats 摘取官方 PrefillStats 的一瞬记下 num_external_cached_tokens/num_local_cached_tokens 分项，请求完成时落盘 vllm-ext-cache.jsonl，后端按 rid join（含 -8hex 内部后缀）；SGLang 侧直接映射官方 exporter 的 cached_tokens_storage_backend/cached_tokens_local。无该项数据时如实显示 --（绝不用「缓存命中」总数冒充），并在表尾给一句原因说明；组头聚合并列显示 二级缓存命中率＝Σ二级命中/Σprompt。新列生效需引擎带补丁重启（控制台重启不影响）。 // r18 = 10-06 仪表盘曲线提速平滑 + 停刷防御：① PD 动态图轮询 1s→500ms、序列 EMA(α=0.3) 平滑、折线改 Catmull-Rom 贝塞尔、当前值读数用平滑值（曲线跟进更快、无逐秒锯齿）；② 并发卡（500ms 独立轮询）成功渲染即盖 _lastRenderAt——原实现只在主链整轮结束后盖章，后端毛刺期（stats 实测 p95≈1.9s、峰值 4s）主链一轮拖十几秒时看门狗误判正常不自愈，现并发卡心跳成为独立渲染推进信号；③ 后端 stats 加 350ms 结果缓存（同窗口多消费者只算一次）。 //  r17 = 10-06 并发实时测速稀释修复：v3TouchRow 活跃期全程均值分母钉在 min(now, 最后产出/新行)（停增/暂离期不发稀释值，截图 g=8·34s·0.2 形态根治）；v3goneAt 冻结滞留窗 15s→5s；bindRow 复活清 stale goneAt 锚；active_requests.elapsed_s 同源钉锚。 // 页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r16 = 10-05 修复 vLLM 运行日志空白：祖先链 argv 判据对「重定向在 wrapper shell 内部」的现行启动链失明（引擎属 root 读不到其 fd），新增祖先链 fd1/fd2 指向 .log + 内容校验判据 ancestorFdLogFile，接入选日志两条链（pickLogFromProcs ⓪ / pickScriptModelLogFile ①″）；端点透传 fallback、前端红条明示兜底 vllm.log；页面版本戳：右上角显示，用于识别浏览器是否跑的是旧缓存页（r15 = EPYC 板两处口径修复：① 封装温度——该机 /sys/class/thermal 为空、k10temp 只挂 hwmon，采样器加 hwmon 回落（Tctl/Package 优先、避开逐 CCD 的 Tccd 分量）；② CPU 缓存——后端从只读 cpu0 改为全核扫共享域聚合并行输出（7F52 的 16 个 16MB L3 域合计 256MB 如实呈现，前端加「N域×slice」标注）；r14 = 10-05 换装适配（AMD EPYC 7F52 16C/32T + H12D-8D + 3×CMP 170HX + 32GB 内存）：主端口自愈三层防御（6s 定时兜底重探 / ticker busy>15s 强制放行 / stats 空数据触发纠偏——换装开机时序竞态会令主端口永久粘滞缺省 8000、仪表盘整页假 {}）；cpu-ctl v3 跨平台化（睿频通道 intel_pstate/no_turbo⇄cpufreq/boost 自适应、温度 coretemp⇄k10temp 回落、platform 串运行时生成）；SCRIPT_MODELS.base 换 32GB 账（pp:3、kvoff:0、PLE INT8+disk）；新 standard 预设 current-pp3-1m-mtp4-int8disk-32g；双卡文案改卡数自适应；r13 = SM 数量改走 CUDA 属性直读（cuDeviceGetAttribute MULTIPROCESSOR_COUNT，真实拓扑含 SM-RECONFIG 解锁态=74）——r12 的核数折算是错的：GA102 每 SM=64 核且 NVML 核数字段是固件静态表不随解锁变；r12 = 修正 SM 数量口径：NVML GetNumGpuCores 实为 CUDA 核数（4736），后端按计算能力折算真 SM 数（GA102=128核/SM→37），明细表主值 SM 数、副值 CUDA 核数；r11 = 硬件监视页 GPU 卡显示 SM 数量（后端 NVML nvmlDeviceGetNumGpuCores 经 python3 ctypes 采集并入 __gpuStatic 5min 缓存；明细表新增「SM 数量」列 + 逐卡标题后缀「· N SM」）；r10 = 硬件监视页新增「GPU 功耗/频率调节」卡（gpu-ctl 白名单提权：pl 即时生效+同步开机持久化 drop-in / SM 频率锁 lgc/rgc / 功耗墙角标 / 快捷档 150-300W）；r9 = vLLM 标签页「CPU KV 二级缓存」详细化：新增后端 /v1/internal/kv-detail（连接器/容量/tmpfs 驻留/命中率/累计存取/6s 滑窗速率/整机内存压力），vllm.html 卡片四表+概览条+口径脚注；r8 = vLLM 标签页内嵌 /vllm.html（实例归因兜底走 listVllmInstances）；r7 = SGLang 适配：脚本栈启动参数 SG_* 下发/弹窗 runtime 跟随/二级缓存卡「不适用」口径/最近请求导出缺失黄条/新「SGLang」标签内嵌 /sglang.html；r6 = 显卡显存温度（温度 KPI 副值 / 明细表温度列 / 仪表盘逐卡徽章 / 页头温度 tooltip，源 nvidia-smi temperature.memory）+ vLLM 运行日志源改走「在跑引擎祖先链 argv」通用判据；r5 = 并发卡实时 tok/s 换 v3 引擎每步输出真值流（逐请求精确实测，speed_src v3/v3-exact）；r3 = 二级缓存·CPU 卡常驻三态 + /dev/shm 物理驻留真值 + 二级缓存查询/命中；r2 = 启动页采样默认定档 t1/p0.95/k20/minp0/rp1 + 思考深度默认 xhigh；r1 = 二级缓存卡双栈指标 + 运行参数 PLE 精度/驻留双栈判据）
 let chatMessages = [];
 let chatHistories = [];
 let isGenerating = false;
@@ -4035,10 +4037,12 @@ function renderRecentRequests() {
     const offBar = off ? '<div style="font-size:12px;line-height:1.6;padding:8px 12px;margin:6px 0;border-radius:8px;background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.45);color:var(--orange)">⚠ SGLang 实例（端口 ' + off.join(' / ') + '）启动时未带 <b>--export-metrics-to-file</b>，引擎不落盘逐请求记录，本表无法显示它的实测数据。<br>逐请求总量/速度看仪表盘 KPI（来自 /metrics，不受影响）；要补本表需在启动参数中加该 flag 并重启实例。</div>' : '';
     if (off && !reqs.some(r => r.runtime === 'sglang')) {
         el.innerHTML = offBar + '<div style="font-size:12px;color:var(--text-tertiary);padding:4px 0">已隐藏 ' + reqs.length + ' 条历史残留记录（非当前实例数据）。</div>';
+        renderVllmAggTable([]);   // [vllm-agg-1017] 明细表被隐藏时聚合表同步清空，不留孤儿统计
         return;
     }
     if (!reqs.length) {
         el.innerHTML = offBar + '<div style="font-size:12px;color:var(--text-tertiary);padding:8px 0">暂无记录（请求完成后出现）</div>';
+        renderVllmAggTable([]);
         return;
     }
     // 按归属分组（reqs 已按完成时间倒序）：跨卡（PP/TP 双卡）请求单独成组，只出一份数据
@@ -4073,6 +4077,133 @@ function renderRecentRequests() {
             ? buildRecentTable(gr.rows)
             : '<div style="font-size:12px;color:var(--text-tertiary);padding:6px 0">该卡暂无记录</div>')).join('');
     syncRecentHeaderSelects(groups);
+    // [vllm-agg-1017] 聚合表口径 = 上表「当前显示」的 vLLM 行（各组截断后），所见即所算
+    renderVllmAggTable(groups.reduce((acc, g) => acc.concat(g.rows), []));
+}
+
+// ====== [vllm-agg-1017] 最近完成请求 · vLLM 实测聚合（输出真实数据） ======
+// 对上表当前显示的 vLLM 行按实例（端口）汇总统计，SGLang 行不进本表（其逐行数据仍在上表）。
+// 口径铁律：聚合速度一律 Σ分子/Σ分母（加权真值），不是逐行速度的算术平均——
+// 算术平均会被短请求带偏，与引擎真实吞吐不符（与组头 tg TPS 同口径）；
+// 逐行实测速度的中位数/极值单独成列，保留算术口径看分布。
+function vllmAggStats(rows) {
+    const a = { n: 0, prompt: 0, cached: 0, ext: 0, extN: 0, uncached: 0, gen: 0,
+        prefillS: 0, decodeS: 0, drafted: 0, accepted: 0, tpss: [], gpus: {}, firstT: null, lastT: null };
+    for (const r of rows) {
+        a.n++;
+        const pt = parseInt(r.prompt_tokens) || 0;
+        const ct = Math.max(0, parseInt(r.cached_tokens) || 0);
+        a.prompt += pt; a.cached += ct; a.uncached += Math.max(0, pt - ct);
+        if (r.ext_cached_tokens != null) { a.ext += (parseInt(r.ext_cached_tokens) || 0); a.extN++; }
+        a.gen += (parseInt(r.gen_tokens) || 0);
+        a.prefillS += (parseFloat(r.prefill_s) || 0);
+        a.decodeS += (parseFloat(r.decode_s) || 0);
+        a.drafted += (parseInt(r.mtp_drafted) || 0);
+        a.accepted += (parseInt(r.mtp_accepted) || 0);
+        const tp = parseFloat(r.decode_tps);
+        if (tp > 0) a.tpss.push(tp);
+        reqGpuList(r).forEach(g => { a.gpus[g] = 1; });
+        const t = parseFloat(r.t);
+        if (isFinite(t)) {
+            if (a.firstT == null || t < a.firstT) a.firstT = t;
+            if (a.lastT == null || t > a.lastT) a.lastT = t;
+        }
+    }
+    return a;
+}
+function vllmAggMedian(arr) {
+    if (!arr || !arr.length) return null;
+    const b = arr.slice().sort((x, y) => x - y);
+    const m = b.length >> 1;
+    return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2;
+}
+function vllmAggT(t) { return t == null ? '--' : new Date(t * 1000).toTimeString().slice(0, 8); }
+function vllmAggRow(labelHtml, a, bold) {
+    const med = vllmAggMedian(a.tpss);
+    const lo = a.tpss.length ? Math.min.apply(null, a.tpss) : null;
+    const hi = a.tpss.length ? Math.max.apply(null, a.tpss) : null;
+    const ppT = a.prefillS > 0 ? a.uncached / a.prefillS : null;
+    const tgT = a.decodeS > 0 ? a.gen / a.decodeS : null;
+    const cachePct = a.prompt > 0 ? a.cached / a.prompt * 100 : null;
+    const mtpPct = a.drafted > 0 ? a.accepted / a.drafted * 100 : null;
+    const avgFt = a.n > 0 ? a.prefillS / a.n : null;
+    const td = 'padding:4px 8px;text-align:right';
+    const w = bold ? 'font-weight:700;' : '';
+    const ppColor = ppT == null ? 'var(--text-tertiary)' : (ppT >= 4000 ? 'var(--green)' : 'var(--orange)');
+    const tgColor = tgT == null ? 'var(--text-tertiary)' : (tgT >= 60 ? 'var(--green)' : (tgT >= 40 ? 'var(--orange)' : 'var(--text-tertiary)'));
+    const medColor = med == null ? 'var(--text-tertiary)' : (med >= 60 ? 'var(--green)' : (med >= 40 ? 'var(--orange)' : 'var(--text-tertiary)'));
+    return '<tr style="border-top:1px solid var(--border);font-variant-numeric:tabular-nums;' + (bold ? 'background:var(--bg-card-hover);' : '') + '">' +
+        '<td style="text-align:left;padding:4px 8px;color:var(--text-secondary);' + w + '">' + labelHtml + '</td>' +
+        '<td style="' + td + '">' + a.n + '</td>' +
+        '<td style="' + td + '">' + a.prompt.toLocaleString() + '</td>' +
+        '<td style="' + td + ';color:var(--green)" title="Σ缓存命中 / Σprompt = ' + (cachePct == null ? '--' : cachePct.toFixed(1) + '%') + '">' + a.cached.toLocaleString() +
+            (cachePct == null ? '' : ' <span style="color:var(--text-tertiary);font-size:10px">' + cachePct.toFixed(1) + '%</span>') + '</td>' +
+        '<td style="' + td + ';color:' + (a.extN ? 'var(--blue)' : 'var(--text-tertiary)') + '" title="' + (a.extN ? '二级缓存（CPU KV offload）回载命中 Σ　·　' + a.extN + '/' + a.n + ' 行有真值' : '该实例未上报每请求二级缓存命中（需 rt-patch #12 且启用 CPU 二级缓存）') + '">' + (a.extN ? a.ext.toLocaleString() : '--') + '</td>' +
+        '<td style="' + td + '">' + a.uncached.toLocaleString() + '</td>' +
+        '<td style="' + td + '">' + a.gen.toLocaleString() + '</td>' +
+        '<td style="' + td + ';font-weight:700;color:' + ppColor + '" title="聚合 pp TPS = Σ预填充 token / Σ首token耗时（加权真值）">' + (ppT == null ? '--' : ppT.toFixed(0) + ' tok/s') + '</td>' +
+        '<td style="' + td + ';color:var(--text-secondary)" title="Σ首token耗时 / 条数 = 平均每请求首 token 时间">' + (avgFt == null ? '--' : avgFt.toFixed(2) + 's') + '</td>' +
+        '<td style="' + td + '">' + a.decodeS.toFixed(1) + 's' + '</td>' +
+        '<td style="' + td + ';font-weight:700;color:' + tgColor + '" title="聚合 tg TPS = Σ生成 token / Σdecode 耗时（加权真值，输出吞吐）">' + (tgT == null ? '--' : tgT.toFixed(1) + ' tok/s') + '</td>' +
+        '<td style="' + td + ';font-weight:700;color:' + medColor + '" title="逐行实测速度的中位数（算术口径）">' + (med == null ? '--' : med.toFixed(1) + ' tok/s') + '</td>' +
+        '<td style="' + td + ';color:var(--text-tertiary)">' + (lo == null ? '--' : lo.toFixed(1) + ' ~ ' + hi.toFixed(1)) + '</td>' +
+        '<td style="' + td + ';color:' + (mtpPct == null ? 'var(--text-tertiary)' : 'var(--text)') + '" title="Σ接受 / Σ草稿（投机 token）">' + (mtpPct == null ? '--' : mtpPct.toFixed(1) + '%') + '</td>' +
+        '</tr>';
+}
+function renderVllmAggTable(displayRows) {
+    const el = document.getElementById('recentAggVllm');
+    if (!el) return;
+    const rows = (displayRows || []).filter(r => r && r.runtime !== 'sglang');
+    if (!rows.length) { el.innerHTML = ''; return; }
+    // 按实例端口分组（归因不到端口的进「?」组）；多实例时逐行列出，再给「合计」行
+    const byPort = {};
+    for (const r of rows) {
+        const k = (r.port == null) ? '?' : String(r.port);
+        if (!byPort[k]) byPort[k] = [];
+        byPort[k].push(r);
+    }
+    const keys = Object.keys(byPort).sort((x, y) => (x === '?') ? 1 : (y === '?') ? -1 : (parseInt(x, 10) - parseInt(y, 10)));
+    const gpuLabel = (a) => {
+        const gs = Object.keys(a.gpus).map(Number).sort((x, y) => x - y);
+        return gs.length ? 'GPU ' + gs.join('+') : 'GPU —';
+    };
+    const total = vllmAggStats(rows);
+    let bodyHtml = '';
+    if (keys.length > 1) {
+        for (const k of keys) {
+            const a = vllmAggStats(byPort[k]);
+            const label = (k === '?' ? '端口未知' : ':' + k) + ' <span style="color:var(--text-tertiary);font-weight:400">· ' + gpuLabel(a) + '</span>';
+            bodyHtml += vllmAggRow(label, a, false);
+        }
+    }
+    const totalLabel = keys.length > 1
+        ? '合计（' + keys.length + ' 个实例）'
+        : (keys[0] === '?' ? '端口未知' : ':' + keys[0]) + ' <span style="color:var(--text-tertiary);font-weight:400">· ' + gpuLabel(total) + '</span>';
+    bodyHtml += vllmAggRow(totalLabel, total, true);
+    const win = (total.firstT != null) ? ' · 时间窗 ' + vllmAggT(total.firstT) + ' ~ ' + vllmAggT(total.lastT) : '';
+    el.innerHTML =
+        '<div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:2px 0 6px;padding:6px 10px;background:var(--bg-card-hover);border:1px solid var(--border-light);border-radius:6px">' +
+        '<span style="display:inline-block;font-size:10px;line-height:1;padding:2px 6px;border-radius:4px;background:var(--blue-bg);color:var(--blue);font-weight:700">vLLM 聚合</span>' +
+        '<span style="font-size:13px;font-weight:600;color:var(--text-secondary)">最近完成请求 · vLLM 实测聚合（输出真实数据）</span>' +
+        '<span style="font-size:11px;color:var(--text-tertiary);margin-left:auto" title="统计范围=上表当前显示的 vLLM 行（各组行数设置截断后）；聚合速度=Σtoken/Σ时间（加权真值），非逐行速度算术平均；SGLang 行不进本表">范围：上表当前显示的 vLLM 行 · 聚合速度=Σtoken/Σ时间（加权）' + win + '</span>' +
+        '</div>' +
+        '<table style="width:100%;border-collapse:collapse;font-size:12px">' +
+        '<tr style="color:var(--text-tertiary);text-align:right">' +
+        '<th style="text-align:left;padding:3px 8px;font-weight:500">实例</th>' +
+        '<th style="padding:3px 8px;font-weight:500">条数</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="Σ prompt token">Prompt</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="Σ缓存命中 token（本级 GPU 前缀 + 二级）；小字=Σ命中/Σprompt">缓存命中</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="Σ二级缓存（CPU KV offload）回载命中；--=该实例未上报此项">二级缓存命中</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="Σ(prompt − 缓存命中) = 实际参与预填充计算的 token">预填充</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="Σ生成 token（输出）">生成</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="Σ预填充 token / Σ首token耗时（加权真值）">pp TPS</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="Σ首token耗时 / 条数">首token均值</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="Σ decode 耗时">decode耗时</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="Σ生成 token / Σdecode耗时（加权真值，输出吞吐）">tg TPS</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="逐行实测速度中位数（算术口径）">速度中位数</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="逐行实测速度 最小 ~ 最大">速度区间</th>' +
+        '<th style="padding:3px 8px;font-weight:500" title="Σ接受 / Σ草稿（投机 token）">MTP</th></tr>' +
+        bodyHtml + '</table>';
 }
 
 // 双卡实例在跑（数据全部归到「GPU 0+1」组）时，顶部对应单卡的行数下拉失去意义 → 隐藏，

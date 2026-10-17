@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>卡算力 · vLLM Console</title>
+<!--
+  每张 GPU 的算力视图（10-16 新增，[card-compute 1016]）。
+  零重启架构：本页放 /home/ll/deploy/static/ 由通用静态路由每请求读盘提供，
+  数据全部复用现有只读接口，不改 server.js、不重启控制台：
+    · GET /v1/internal/gpu      静态规格（SM 数/CUDA 核数/计算能力/功耗上限）+ 1s 采样（频率/利用率/功耗/温度）合并帧
+    · GET /v1/internal/gpu-ctl  显存频率 + 降频原因位（sw_power_cap/hw_slowdown/app_clocks，1.5s TTL 缓存）
+  口径铁律（写死在脚注里，勿删）：
+    · sm_clock_max(1695) 是芯片能力表，本机矿卡 VBIOS 实测 boost 顶 ≈1470~1485（09-26 实锤）→ 页面并列"观测加速档"（会话内实测最高 SM 频率）；
+    · GPU 利用率 = SM 上有常驻 warp 的时间占比，≠ 数据通路占用；decode 带宽受限，实际吞吐常远低于"实时估算算力"上限；
+    · SM 数 = CUDA 属性直读（含 cmpunlocker SM-RECONFIG 解锁态）；cc 8.0 GA100 每 SM 64 个 FP32 → 74×64=4736。
+  轮询纪律（09-23/09-25/10-03 铁律）：自建 AbortController+setTimeout 超时（禁 AbortSignal.timeout）；
+  续排放 finally（渲染抛错不能吃掉重排句柄）；失败保留上一帧画面+黄条；后台标签停轮询，回前台四类事件补帧。
+-->
+<style>
+:root{--bg:#f1f5f9;--panel:#ffffff;--panel2:#f8fafc;--bd:#e2e8f0;--bd2:#cbd5e1;--tx:#0f172a;--tx2:#475569;--tx3:#94a3b8;--ac:#6366f1;--ac2:#eef2ff;--ok:#059669;--warn:#b45309;--bad:#dc2626;--mono:'SF Mono',Consolas,monospace;--sh:0 1px 3px rgba(28,42,70,.06),0 4px 14px rgba(28,42,70,.05)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.6 -apple-system,'PingFang SC','Microsoft YaHei',sans-serif;padding:14px 16px}
+h1{font-size:16px;margin:0 0 2px}
+.sub{font-size:12px;color:var(--tx3);margin-bottom:10px}
+.errbar{display:none;background:#fef3c7;border:1px solid #fcd34d;color:#92400e;border-radius:10px;padding:8px 12px;font-size:12.5px;margin-bottom:10px}
+.kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.kpi{background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:10px 16px;box-shadow:var(--sh);min-width:150px}
+.kpi .v{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}
+.kpi .k{font-size:12px;color:var(--tx2)}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(560px,1fr));gap:12px}
+@media (max-width:640px){.cards{grid-template-columns:1fr}}
+.gcard{background:var(--panel);border:1px solid var(--bd);border-radius:14px;box-shadow:var(--sh);padding:14px 16px}
+.ghead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.ghead .gname{font-weight:700;font-size:14px}
+.tag{display:inline-block;padding:1px 8px;border-radius:6px;font-size:11px;border:1px solid var(--bd2);color:var(--tx2);white-space:nowrap}
+.badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:11px;font-weight:600;color:#fff;white-space:nowrap}
+.b-ok{background:var(--ok)}.b-warn{background:var(--warn)}.b-bad{background:var(--bad)}.b-idle{background:#94a3b8}
+.hero{display:flex;align-items:flex-end;gap:14px;flex-wrap:wrap}
+.hero .big{font-size:30px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.1}
+.hero .unit{font-size:13px;color:var(--tx2);font-weight:600}
+.hero .side{font-size:12px;color:var(--tx2);padding-bottom:4px}
+.pbar{position:relative;height:8px;background:var(--panel2);border:1px solid var(--bd);border-radius:99px;margin:8px 0 10px;overflow:hidden}
+.pbar>i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,#818cf8,#6366f1);border-radius:99px;transition:width .4s}
+.chartbox{height:74px;margin:2px 0 10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:6px 12px}
+.m{font-size:12px;color:var(--tx3)}
+.m b{display:block;font-size:13.5px;color:var(--tx);font-weight:700;font-variant-numeric:tabular-nums}
+.m small{color:var(--tx3);font-weight:400}
+.m .dim{color:var(--tx3);font-weight:400;font-size:11.5px}
+.foot{margin-top:14px;font-size:12px;color:var(--tx3);line-height:1.7}
+.foot b{color:var(--tx2)}
+.meta{font-size:12px;color:var(--tx3);margin-left:auto}
+.topbar{display:flex;gap:8px;align-items:center;margin-bottom:10px}
+.topbar button{background:var(--ac);color:#fff;border:0;border-radius:8px;padding:5px 14px;font-size:13px;cursor:pointer}
+</style>
+</head>
+<body>
+<h1>每张卡的算力</h1>
+<div class="sub">理论峰值 = CUDA 核数 × 2 FLOP/clk × SM 频率；实时估算 = 峰值 × 频率达成率 × GPU 利用率（上限口径，见页脚警示）。数据源：/v1/internal/gpu（1s）+ gpu-ctl 降频原因（3s），本页不改后端、无需重启控制台。</div>
+<div class="errbar" id="errbar"></div>
+<div class="kpis" id="kpis"></div>
+<div class="topbar"><button onclick="reloadNow()">刷新</button><span class="meta" id="meta"></span></div>
+<div class="cards" id="cards"></div>
+<div class="foot">
+  <b>口径警示（勿拿错数字当算力依据）：</b><br>
+  ① 「芯片表档」峰值按驱动上报的 clocks.max.sm（本机 1695 MHz，GA100 芯片能力表）折算；该矿卡 VBIOS <b>实测 boost 顶 ≈1470~1485 MHz</b>（09-26 高频采样实锤），带载还受 210W 功耗墙压制掉到 1185~1440 —— 所以「芯片表档」系统性偏高，实际可达性看「观测加速档」（本页会话内实测到的最高 SM 频率）与实时估算。<br>
+  ② GPU 利用率 = SM 上有常驻 warp 的时间占比，<b>≠ 数据通路占用率</b>；推理 decode 段受显存带宽支配，实际 FP32 吞吐常远低于「实时估算算力」。该估算适合看趋势与卡间对比，不适合当绝对吞吐承诺。<br>
+  ③ SM 数 = CUDA Driver 属性直读（含 cmpunlocker SM-RECONFIG 解锁态，74 SM）；cc 8.0（GA100）每 SM 64 个 FP32 核 → 74×64 = 4736。Tensor 参考值按架构倍率折算（GA100：TF32=8×、FP16/BF16=16×、INT8=32× FP32），非实测。<br>
+  ④ 功耗墙：限频原因位来自 clocks_event_reasons.active（0x4=SW Power Cap、0x8=HW Slowdown、0x2=Applications Clocks 锁）。抬功耗上限主要利好 prefill（算力受限段），decode 几乎不变。
+</div>
+<script src="/static/chart.umd.min.js"></script>
+<script>
+(function () {
+  'use strict';
+  var POLL_GPU_MS = 1000, POLL_CTL_MS = 3000, HIST_MAX = 300; // 曲线窗口 5 分钟
+  var lastGpu = null, lastCtl = null, gpuErr = null, ctlErr = null;
+  var hist = {};        // idx -> {t:[], tf:[]}
+  var obsMax = {};      // idx -> 会话内观测到的最高 SM 频率
+  var builtSig = '';    // 卡片 DOM 签名（卡集变化才重建，防每秒重建闪断）
+  var charts = {};      // idx -> Chart
+  var timerG = null, timerC = null;
+
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]; }); }
+  function safeRun(fn, tag) { try { fn(); } catch (e) { console.error('[compute-page] ' + (tag || '') + ': ' + (e && e.stack || e)); } }
+  function fmt(x, d) { return (x == null || !isFinite(x)) ? '--' : x.toFixed(d == null ? 1 : d); }
+  function setErr(msg) { var b = document.getElementById('errbar'); b.style.display = msg ? 'block' : 'none'; b.textContent = msg || ''; }
+
+  // ===== 算力模型 =====
+  function coresPerSm(cc, cudaCores, smCount) {
+    if (cudaCores && smCount) {
+      var r = cudaCores / smCount;
+      var cand = [32, 48, 64, 96, 128, 192];
+      for (var i = 0; i < cand.length; i++) if (Math.abs(r - cand[i]) < 0.01) return r;
+    }
+    var t = { '8.0': 64, '8.7': 64, '8.6': 128, '8.9': 128 };
+    return t[String(cc)] || null;
+  }
+  function tensorMult(cc) {
+    var s = String(cc || '');
+    if (s === '8.0' || s === '8.7') return { tf32: 8, fp16: 16, int8: 32 };   // GA100 数据中心
+    if (s === '8.6' || s === '8.9') return { tf32: 2, fp16: 4, int8: 8 };     // GA10x 消费级
+    return null;
+  }
+  function calc(g) {
+    var cps = coresPerSm(g.compute_cap, g.cuda_cores, g.sm_count);
+    var effCores = (g.sm_count && cps) ? g.sm_count * cps : (g.cuda_cores || null);
+    var clk = g.sm_clock, clkMax = g.sm_clock_max;
+    var obs = obsMax[g.index] || null;
+    var util = g.util_gpu;
+    var f = function (c) { return (c != null && isFinite(c)) ? c / 1e6 : null; }; // TFLOPS
+    var o = {};
+    o.effCores = effCores; o.cps = cps;
+    o.fp32Chip = f(effCores && clkMax ? effCores * 2 * clkMax : null);
+    o.fp32Obs  = f(effCores && obs ? effCores * 2 * obs : null);
+    o.live     = f((effCores && clk != null && util != null) ? effCores * 2 * clk * (util / 100) : null);
+    o.loadPct  = (clkMax && clk != null && util != null) ? (clk / clkMax) * (util / 100) * 100 : null;
+    o.clkPct   = (clkMax && clk != null) ? clk / clkMax * 100 : null;
+    var tm = tensorMult(g.compute_cap);
+    if (tm && o.fp32Chip != null) { o.tf32 = o.fp32Chip * tm.tf32; o.fp16 = o.fp32Chip * tm.fp16; o.int8 = o.fp32Chip * tm.int8; }
+    o.effPerW = (o.live != null && g.power_draw != null && g.power_draw > 5) ? o.live / g.power_draw : null;
+    return o;
+  }
+
+  // ===== 采样（历史曲线 + 观测加速顶） =====
+  function sample(d) {
+    var now = Date.now();
+    (d.gpus || []).forEach(function (g) {
+      if (g.index == null) return;
+      if (g.sm_clock != null) obsMax[g.index] = Math.max(obsMax[g.index] || 0, g.sm_clock);
+      var c = calc(g);
+      if (!hist[g.index]) hist[g.index] = { t: [], tf: [] };
+      var h = hist[g.index];
+      h.t.push(now); h.tf.push(c.live);
+      while (h.t.length > HIST_MAX) { h.t.shift(); h.tf.shift(); }
+      // 只保留 5 分钟窗口
+      while (h.t.length && now - h.t[0] > HIST_MAX * 1000) { h.t.shift(); h.tf.shift(); }
+    });
+  }
+
+  // ===== 渲染 =====
+  function ctlFor(idx) {
+    var gs = (lastCtl && lastCtl.state && lastCtl.state.gpus) || [];
+    for (var i = 0; i < gs.length; i++) if (gs[i].index === idx) return gs[i];
+    return null;
+  }
+  function renderKpis() {
+    var gpus = (lastGpu && lastGpu.gpus) || [];
+    var sumChip = 0, sumLive = 0, sumDraw = 0, sumLimit = 0, loadW = 0, loadN = 0, any = false;
+    gpus.forEach(function (g) {
+      var c = calc(g);
+      if (c.fp32Chip != null) { sumChip += c.fp32Chip; any = true; }
+      if (c.live != null) sumLive += c.live;
+      if (g.power_draw != null) sumDraw += g.power_draw;
+      if (g.power_limit != null) sumLimit += g.power_limit;
+      if (c.loadPct != null) { loadW += c.loadPct; loadN++; }
+    });
+    var k = [
+      { v: any ? fmt(sumChip, 1) + ' TF' : '--', k: '整机理论峰值 FP32（Σ·芯片表档）' },
+      { v: fmt(sumLive, 2) + ' TF', k: '整机实时估算算力（Σ）' },
+      { v: loadN ? fmt(loadW / loadN, 1) + ' %' : '--', k: '平均算力利用率' },
+      { v: (sumDraw || gpus.length) ? fmt(sumDraw, 0) + ' / ' + fmt(sumLimit, 0) + ' W' : '--', k: '总功耗 / 上限合计' },
+      { v: String(gpus.length), k: 'GPU 数量' }
+    ];
+    document.getElementById('kpis').innerHTML = k.map(function (x) {
+      return '<div class="kpi"><div class="v">' + esc(x.v) + '</div><div class="k">' + esc(x.k) + '</div></div>';
+    }).join('');
+  }
+  function mCell(label, val, sub) {
+    return '<div class="m">' + esc(label) + '<b>' + val + (sub ? ' <small>' + sub + '</small>' : '') + '</b></div>';
+  }
+  function buildCards(gpus) {
+    var box = document.getElementById('cards');
+    box.innerHTML = gpus.map(function (g) {
+      var i = g.index;
+      return '<div class="gcard" data-idx="' + i + '">'
+        + '<div class="ghead">'
+        + '<span class="gname">GPU ' + esc(i) + ' · ' + esc(g.name || '?') + '</span>'
+        + '<span class="tag">' + esc(g.sm_count != null ? g.sm_count + ' SM' : 'SM --') + '</span>'
+        + '<span class="tag">cc ' + esc(g.compute_cap || '--') + '</span>'
+        + '<span class="tag">' + esc(g.mem_total != null ? (g.mem_total / 1024).toFixed(0) + ' GB' : '显存 --') + '</span>'
+        + '<span class="tag" data-k="pstate">P--</span>'
+        + '<span data-k="throttle"></span>'
+        + '</div>'
+        + '<div class="hero">'
+        + '<div><span class="big" data-k="live">--</span> <span class="unit">TFLOPS · 实时估算 FP32</span></div>'
+        + '<div class="side">算力利用率 <b data-k="loadPct">--</b></div>'
+        + '</div>'
+        + '<div class="pbar"><i data-k="loadbar" style="width:0%"></i></div>'
+        + '<div class="chartbox"><canvas data-k="chart"></canvas></div>'
+        + '<div class="grid">'
+        + '<div class="m">理论峰值 FP32<b data-k="fp32Chip">--</b><span class="dim" data-k="fp32Obs">--</span></div>'
+        + '<div class="m">Tensor 参考<b data-k="tensor">--</b><span class="dim">TF32 / FP16 / INT8（芯片表档）</span></div>'
+        + '<div class="m">SM 频率<b data-k="clk">--</b><span class="dim" data-k="clkPct">--</span></div>'
+        + '<div class="m">显存频率<b data-k="memclk">--</b><span class="dim" data-k="eff">--</span></div>'
+        + '<div class="m">GPU 利用率<b data-k="util">--</b><span class="dim" data-k="mem">--</span></div>'
+        + '<div class="m">功耗<b data-k="power">--</b><span class="dim" data-k="pl">--</span></div>'
+        + '<div class="m">温度<b data-k="temp">--</b><span class="dim" data-k="tempmem">--</span></div>'
+        + '</div>'
+        + '</div>';
+    }).join('');
+    // Chart.js 逐卡折线（缺 Chart.js 时静默降级为无图，其余照常）
+    charts = {};
+    if (window.Chart) {
+      box.querySelectorAll('.gcard').forEach(function (card) {
+        var idx = card.getAttribute('data-idx');
+        var cv = card.querySelector('[data-k="chart"]');
+        if (!cv) return;
+        try {
+          charts[idx] = new Chart(cv.getContext('2d'), {
+            type: 'line',
+            data: { labels: [], datasets: [{ data: [], borderColor: '#6366f1', backgroundColor: 'rgba(99,102,241,.10)', borderWidth: 1.6, pointRadius: 0, fill: true, tension: 0.35 }] },
+            options: { responsive: true, maintainAspectRatio: false, animation: false,
+              plugins: { legend: { display: false }, tooltip: { enabled: true } },
+              scales: { x: { display: false }, y: { beginAtZero: true, ticks: { font: { size: 9 }, maxTicksLimit: 4, callback: function (v) { return v + ' TF'; } }, grid: { color: '#eef2f7' } } } }
+          });
+        } catch (e) { charts[idx] = null; }
+      });
+    }
+  }
+  function render() {
+    var gpus = (lastGpu && lastGpu.gpus) || [];
+    if (!gpus.length) {
+      if (!lastGpu) document.getElementById('cards').innerHTML = '<div class="gcard" style="grid-column:1/-1;color:var(--tx3)">加载中…（若持续为空：驱动异常或 nvidia-smi 熔断冷却中，硬件监视页同状态）</div>';
+      safeRun(renderKpis, 'kpis-empty');
+      return;
+    }
+    var sig = gpus.map(function (g) { return g.index + ':' + (g.name || ''); }).join('|');
+    if (sig !== builtSig) { buildCards(gpus); builtSig = sig; }
+    renderKpis();
+    var box = document.getElementById('cards');
+    gpus.forEach(function (g) {
+      var card = box.querySelector('.gcard[data-idx="' + g.index + '"]');
+      if (!card) return;
+      var c = calc(g);
+      var ctl = ctlFor(g.index);
+      var q = function (k) { return card.querySelector('[data-k="' + k + '"]'); };
+      var set = function (k, v) { var el = q(k); if (el) el.innerHTML = v; };
+      set('live', fmt(c.live, 2));
+      set('loadPct', fmt(c.loadPct, 1) + '%');
+      var bar = q('loadbar'); if (bar) bar.style.width = (c.loadPct == null ? 0 : Math.max(0, Math.min(100, c.loadPct))) + '%';
+      set('fp32Chip', fmt(c.fp32Chip, 2) + ' TF <small>' + esc(g.sm_clock_max != null ? '@' + g.sm_clock_max + 'MHz 芯片表' : '') + '</small>');
+      set('fp32Obs', c.fp32Obs != null ? '观测加速档 ' + fmt(c.fp32Obs, 2) + ' TF @' + (obsMax[g.index] || '--') + 'MHz（会话实测顶）' : '观测加速档 --（本会话未采到频率）');
+      set('tensor', (c.tf32 != null) ? fmt(c.tf32, 0) + ' / ' + fmt(c.fp16, 0) + ' / ' + fmt(c.int8, 0) : '--');
+      set('clk', (g.sm_clock != null ? g.sm_clock : '--') + ' <small>/ ' + (g.sm_clock_max != null ? g.sm_clock_max : '--') + ' MHz</small>');
+      set('clkPct', '频率达成率 ' + fmt(c.clkPct, 1) + '%');
+      set('memclk', (ctl && ctl.mem_clock != null) ? ctl.mem_clock + ' <small>/ ' + (ctl.mem_clock_max != null ? ctl.mem_clock_max : '--') + ' MHz</small>' : '--');
+      set('eff', c.effPerW != null ? '能效 ' + fmt(c.effPerW, 3) + ' TF/W（估算/实测功耗）' : '能效 --');
+      set('util', (g.util_gpu != null ? g.util_gpu : '--') + '%');
+      set('mem', '显存 ' + (g.mem_used != null ? g.mem_used : '--') + ' / ' + (g.mem_total != null ? g.mem_total : '--') + ' MiB');
+      set('power', (g.power_draw != null ? fmt(g.power_draw, 1) : '--') + ' <small>W</small>');
+      set('pl', '上限 ' + (g.power_limit != null ? g.power_limit : '--') + ' W' + (g.power_max_limit != null ? '（可设至 ' + g.power_max_limit + 'W）' : ''));
+      set('temp', (g.temp != null ? g.temp : '--') + ' ℃');
+      set('tempmem', g.temp_mem != null ? '显存 ' + g.temp_mem + ' ℃' : '显存温度 --');
+      set('pstate', esc(g.pstate || 'P--'));
+      // 降频原因徽标（gpu-ctl 3s 通道；拿不到就不显示，不猜）
+      var th = '';
+      if (ctl) {
+        if (ctl.hw_slowdown) th += '<span class="badge b-bad" title="clocks_event_reasons 0x8">HW Slowdown 热墙</span> ';
+        if (ctl.sw_power_cap) th += '<span class="badge b-warn" title="clocks_event_reasons 0x4：SM 频率被功耗墙压低（当前上限 ' + (g.power_limit != null ? g.power_limit + 'W' : '--') + '）">功耗墙限频</span> ';
+        if (ctl.app_clocks) th += '<span class="badge b-idle" title="clocks_event_reasons 0x2：Applications Clocks 锁定">锁频</span> ';
+        if (!th && (g.util_gpu != null && g.util_gpu > 5)) th = '<span class="badge b-ok">不限频</span>';
+        if (ctl.event_bits) th += '<span class="tag" title="clocks_event_reasons.active 原始位">限频位 ' + esc(ctl.event_bits) + '</span>';
+      }
+      set('throttle', th);
+      // 曲线
+      var ch = charts[String(g.index)];
+      if (ch) {
+        var h = hist[g.index] || { t: [], tf: [] };
+        ch.data.labels = h.t.map(function (t) { return new Date(t).toLocaleTimeString('zh-CN', { hour12: false }); });
+        ch.data.datasets[0].data = h.tf;
+        ch.update('none');
+      }
+    });
+    // 新鲜度
+    var ts = lastGpu.live_ts || lastGpu.ts || null;
+    var age = ts ? Math.round((Date.now() - ts) / 1000) : null;
+    document.getElementById('meta').textContent =
+      '采样 ' + (age != null ? age + 's 前' : '--') + (lastGpu.stale_error ? '（规格帧偏旧：' + lastGpu.stale_error + '）' : '')
+      + ' · 每 ' + (POLL_GPU_MS / 1000) + 's 自动刷新' + (gpuErr ? ' · 本轮失败：' + gpuErr : '') + (ctlErr ? ' · 降频原因失败：' + ctlErr : '');
+    if (gpuErr && lastGpu) setErr('本轮刷新失败：' + gpuErr + '（显示的是上次成功的数据）');
+    else if (!gpuErr) setErr('');
+  }
+
+  // ===== 轮询（自建超时 + finally 续排 + 后台门控） =====
+  function fetchJson(url, ms) {
+    return new Promise(function (resolve, reject) {
+      var ac = new AbortController();
+      var to = setTimeout(function () { ac.abort(); }, ms);
+      fetch(url, { signal: ac.signal, cache: 'no-store' }).then(function (r) {
+        clearTimeout(to);
+        if (!r.ok) { reject(new Error('HTTP ' + r.status)); return; }
+        r.json().then(resolve, function () { reject(new Error('JSON 解析失败')); });
+      }, function (e) { clearTimeout(to); reject(new Error(String((e && e.name) === 'AbortError' ? '超时' : (e && e.message) || e))); });
+    });
+  }
+  function tickGpu() {
+    fetchJson('/v1/internal/gpu?_=' + Date.now(), 8000).then(function (d) {
+      if (d && Array.isArray(d.gpus)) { lastGpu = d; gpuErr = null; sample(d); }
+      else gpuErr = '响应无 gpus 字段';
+    }, function (e) { gpuErr = (e && e.message) || String(e); })
+      .catch(function () {})
+      .finally(function () { safeRun(render, 'render'); scheduleG(); });
+  }
+  function tickCtl() {
+    fetchJson('/v1/internal/gpu-ctl?_=' + Date.now(), 16000).then(function (d) {
+      if (d && d.ok && d.state) { lastCtl = d; ctlErr = null; }
+      else ctlErr = (d && d.error) || 'gpu-ctl 不可用';
+    }, function (e) { ctlErr = (e && e.message) || String(e); })
+      .catch(function () {})
+      .finally(scheduleC);
+  }
+  function scheduleG() { clearTimeout(timerG); timerG = setTimeout(function () { if (!document.hidden) tickGpu(); else scheduleG(); }, POLL_GPU_MS); }
+  function scheduleC() { clearTimeout(timerC); timerC = setTimeout(function () { if (!document.hidden) tickCtl(); else scheduleC(); }, POLL_CTL_MS); }
+  function wake() { if (!document.hidden) { tickGpu(); tickCtl(); } }
+  ['visibilitychange'].forEach(function (ev) { document.addEventListener(ev, wake); });
+  window.addEventListener('pageshow', wake);
+  window.addEventListener('focus', wake);
+  window.addEventListener('online', wake);
+  window.reloadNow = function () { tickGpu(); tickCtl(); };
+  tickGpu(); tickCtl();
+})();
+</script>
+</body>
+</html>

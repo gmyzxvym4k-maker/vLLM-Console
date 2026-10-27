@@ -11528,6 +11528,9 @@ function cipNetClass(ip) {
 const CIP_MODEL_RE = /^\/v1\/(chat\/completions|completions|embeddings|rerank|messages|responses|audio\/|realtime)/;
 function cipPathKind(q) {
   const p = String(q || '').split('?')[0];
+  // count_tokens 是控制台为 SGLang 预填充进度自发引擎的辅助计数调用（10-27 实锤：
+  // 它若归 model 会劫持代理 pending 对账，真实 chat 回环行漏跳→127 虚增）。
+  if (p === '/v1/messages/count_tokens') return 'other';
   if (p === '/metrics' || p === '/health' || p === '/load' || p === '/stats' || p === '/ping'
       || p === '/server_info' || p === '/model_info' || p === '/get_load' || p === '/health_generate'
       || p === '/v1/models' || p.startsWith('/v1/models/')) return 'probe';

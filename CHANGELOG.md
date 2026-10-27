@@ -7,6 +7,7 @@
 - 后端 [client-ips 1027] 模块：GET /v1/internal/client-ips、POST .../cmd {clear|save}（口令拦截同规）；配置 client-ips.json 热加载（activeWindowSec/retentionDays/maxIps/geoEnabled）；计数落盘 client-ips-state.json（重启不丢），归属地缓存 client-ips-geo.json；前端页 static/client-ips.html（iframe 懒加载口径同 crash/compute，自愈轮询）。
 - 同窗上线 10-17 遗留的 kvoff-simple-metric 后端段（simple_kv_offload_* 指标族，前端 r46 已双态兼容）；并按「线上为基线」把 10-22 的 restore160/kvoff96-fix/heapoffload-guard 三处线上独有改动补入库（分叉清零）。
 - 部署验证：重启 dsh-console 后引擎 pid 15012 未变（引擎属 fnx-18420-watchdog cgroup，控制台重启不连坐）；线上回填即抓到 192.168.1.36（6324 次模型调用·内网）与公网 IP 110.184.28.37（1 次 chat 调用→解析为 中国 四川 成都·Chinanet）。
+- 上线当日实锤修复：`POST /v1/messages/count_tokens`（控制台为 SGLang 预填充进度自发引擎的辅助计数调用）原被 `/v1/messages` 前缀误归 model 类，会**劫持代理 pending 对账**（count_tokens 先落日志消耗掉 pending，真实 chat 回环行漏跳 → 127.0.0.1 虚增模型调用）；已单列归 other。回归=受控实验「一次代理请求：127 model 不涨、真实客户端 IP +1、pending 归零」。
 - 回滚：deploy/{server.js,index.html}.bak-cip-1027-<ts> + 删 static/client-ips.html。
 
 ## 2026-10-25 [gpu-powerlog 1025] GPU 高功耗记录（已上线 .127，页面 r48）

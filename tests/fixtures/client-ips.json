@@ -1,0 +1,45 @@
+{
+  "ok": true,
+  "now": 1793110000000,
+  "windowSec": 60,
+  "totals": { "unique": 4, "active": 2, "modelTotal": 12345, "probeTotal": 60011, "publicN": 1, "modelIps": 2 },
+  "ips": [
+    {
+      "ip": "192.168.1.36", "model": 9210, "probe": 20112, "other": 3,
+      "firstSeen": 1793109000000, "lastSeen": 1793109997000,
+      "active": true, "seededOnly": false, "viaProxy": false,
+      "region": "内网（局域网）", "regionIsp": "", "cls": "private",
+      "paths": [["POST /v1/chat/completions", 9207], ["GET /metrics", 12004], ["GET /v1/models", 8105], ["POST /tokenize", 3]],
+      "statuses": { "200": 29319, "400": 3 }
+    },
+    {
+      "ip": "192.168.1.50", "model": 3135, "probe": 9899, "other": 0,
+      "firstSeen": 1793108000000, "lastSeen": 1793109900000,
+      "active": false, "seededOnly": false, "viaProxy": true,
+      "region": "内网（局域网）", "regionIsp": "", "cls": "private",
+      "paths": [["POST /v1/chat/completions", 3135], ["GET /metrics", 9899]],
+      "statuses": { "200": 13034 }
+    },
+    {
+      "ip": "127.0.0.1", "model": 0, "probe": 30000, "other": 0,
+      "firstSeen": 1793100000000, "lastSeen": 1793109998000,
+      "active": true, "seededOnly": false, "viaProxy": false,
+      "region": "本机回环", "regionIsp": "", "cls": "loopback",
+      "paths": [["GET /metrics", 20000], ["GET /v1/models", 10000]],
+      "statuses": { "200": 30000 }
+    },
+    {
+      "ip": "203.0.113.9", "model": 0, "probe": 0, "other": 12,
+      "firstSeen": null, "lastSeen": null,
+      "active": false, "seededOnly": true, "viaProxy": false,
+      "region": "美国 加州 洛杉矶", "regionIsp": "Example ISP Inc.", "cls": "public",
+      "paths": [["GET /", 12]],
+      "statuses": { "404": 12 }
+    }
+  ],
+  "meta": {
+    "logFile": "/home/ll/deploy/vllm-flash-next-0310.log",
+    "logKind": "file", "proxyPending": 0, "geoPending": 0, "geoEnabled": true, "seeded": true,
+    "config": { "activeWindowSec": 60, "retentionDays": 30, "maxIps": 800, "geoEnabled": true }
+  }
+}

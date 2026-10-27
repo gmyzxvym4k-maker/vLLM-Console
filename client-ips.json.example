@@ -1,0 +1,6 @@
+{
+  "activeWindowSec": 60,
+  "retentionDays": 30,
+  "maxIps": 800,
+  "geoEnabled": true
+}

@@ -737,7 +737,7 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   // 官方 0.30.0 新栈的日志（start-flash-next-0300.sh 里 FN_LOG 缺省值）。祖先链 cmdline
   // 通常已能定位到它（见 ancestorLogFiles），这里兜底：cmdline 拿不到时仍能选中新日志。
   altLogs: ['/home/ll/deploy/vllm-flash-next-0310.log', '/home/ll/deploy/vllm-flash-next-0300.log'],
-  note: '官方 vLLM 0.31.0 运行时补丁栈 TP1×PP2（现行生产=W4A16-AutoRound-1M，PLE=INT8 磁盘 mmap，内存二级缓存 96GiB），加载约 5~8 分钟；回滚：touch /home/ll/deploy/vllm-0310/DISABLED → 退回 chroot 旧栈',  // [stack-0310-1006]
+  note: '官方 vLLM 0.31.0 运行时补丁栈 TP1×PP2（现行生产=W4A16-AutoRound-1M，PLE=INT8 磁盘 mmap，内存二级缓存 160GiB（PLE=INT8 磁盘 mmap，可回收页缓存）），加载约 5~8 分钟；回滚：touch /home/ll/deploy/vllm-0310/DISABLED → 退回 chroot 旧栈',  // [stack-0310-1006]
   base: {
     maxModelLen: 262144, gpuMemUtil: 0.90, maxNumSeqs: 4, maxBatchedTokens: 8192,  // [seqs4-1006] 用户 10-06 指定 4 并发（FULL 图捕获 [1,2,4]）
     // [gen-loopfix 0929] 采样基准回到 09-21 反循环定档 t0.6 / p0.95 / k20 / minp0 / pp0.1 / rp1.0（用户 09-29 拍板：09-27 的 1/0/1 裸档导致思考模型 uct/duct token 级硬循环）。
@@ -752,7 +752,7 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
     // ③ PLE 唯一可行档 = INT8+disk（mmap 47.7GiB 可回收页缓存，10-04 实跑验证；
     //    INT8 heap 匿名堆 48.3GiB 与 BF16 95.4GiB 均不可回收、必 OOM）。
     // （存档：0929/0927 定版的 kvoff=simple 96GiB 与 pleLoc=heap 均以大内存机为前提，已随换装作废。）
-    kvoff: 'simple', kvoffGiB: 160, pleInt8: '1', pleLoc: 'heap',  // [kvoff160 10-10] 251GB 机账：48.3 PLE匿名 + 160 pinned + ~12 引擎 ≈220/251，权重页缓存被挤（重启多付加载时长）；内存告警第一刀降 96。PLE 放内存=INT8 匿名堆不可回收。「放硬盘」档=mmap 可回收页缓存〔原生产档，随时可切回〕。 // [stack-0310-1006] 二级缓存=SimpleCPUOffloadConnector 96GiB（每 rank ≈48GiB 锁页）；PLE=INT8 产物磁盘 mmap（/media/ll/data/ple，47.7+0.6 GiB 可回收页缓存）。0.31 只有两档：mmap-INT8 / pinned-BF16——弹窗「精度=BF16」或「位置=heap」都会走官方锁页 BF16 95.4GiB
+    kvoff: 'simple', kvoffGiB: 160, pleInt8: '1', pleLoc: 'disk',  // [restore160-1022] 用户要求恢复 160GiB 二级缓存；PLE 同时由匿名堆改磁盘 mmap+mlock=0（160 pinned 下匿名堆 48.3GiB 必 OOM，10-22 实锤三次）  // [kvoff96-fix 1022] 启动 OOM 加固：160→96（预留 64GiB 给 131 shard 权重加载峰值）// [kvoff160 10-10] 251GB 机账：48.3 PLE匿名 + 160 pinned + ~12 引擎 ≈220/251，权重页缓存被挤（重启多付加载时长）；内存告警第一刀降 96。PLE 放内存=INT8 匿名堆不可回收。「放硬盘」档=mmap 可回收页缓存〔原生产档，随时可切回〕。 // [stack-0310-1006] 二级缓存=SimpleCPUOffloadConnector 96GiB（每 rank ≈48GiB 锁页）；PLE=INT8 产物磁盘 mmap（/media/ll/data/ple，47.7+0.6 GiB 可回收页缓存）。0.31 只有两档：mmap-INT8 / pinned-BF16——弹窗「精度=BF16」或「位置=heap」都会走官方锁页 BF16 95.4GiB
   },
   bannedArgs: ['--mamba-ssm-cache-dtype', '--mamba-cache-mode', '--language-model-only',
                '--enable-prompt-tokens-details', '--safetensors-load-strategy',
@@ -792,7 +792,7 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
       longCtx512ModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-Channel-INT8-w8a8-512K',  // [512k-reg-1016] YaRN×2 副本（10-16 建：cp -as 软链 144 + config 实体）
       pleInt8Dir: '/media/ll/data/ple-w8a8',  // w8a8 专属 INT8 表产物（ple_ngram_meta 完整校验通过 10-08）
       pp: 3, minGpus: 3,        // 权重 ~132GB：PP2 每段 66GB > 单卡 64GB 显存，必须 PP3（本机 3 卡在位）
-      kvoff: 'simple', kvoffGiB: 160, kvoffCap: 160,  // [kvoff160 10-10 用户要求 96→160] 251GB 机账：48.3 PLE + 160 pinned + 引擎 ≈220，权重页缓存(可回收)压余量；内存告警第一刀降 96
+      kvoff: 'simple', kvoffGiB: 160, kvoffCap: 160,  // [restore160-1022] 96->160（kvoffCap 仍 160）  // [kvoff96-fix 1022] 默认 160→96（OOM 加固，kvoffCap 仍允许手动选 160）// [kvoff160 10-10 用户要求 96→160] 251GB 机账：48.3 PLE + 160 pinned + 引擎 ≈220，权重页缓存(可回收)压余量；内存告警第一刀降 96
     },
   },  // __modelvariant_1008__
   maxModelLenLong: 1048576,
@@ -1369,6 +1369,12 @@ function scriptModelLaunchPlan(smIn, d) {
   // [pleclamp-1005] 低内存机防线：heap=48.3GiB(INT8)/95.4GiB(BF16) 匿名堆不可回收，
   // MemTotal <100GiB 的机器（本机 32GB）必被 oom-killer 杀 → EngineDead → 看门狗循环。
   // 旧缓存页面/手选/旧预设传来的 heap 一律在此强制降级 disk（inner 侧第二道兜底同判据）。
+  // [heapoffload-guard-1022] PLE 匿名堆(不可回收 48.3GiB) 与大二级缓存互斥：160GiB+heap 在 10-22 实测
+  // anon 246.8/249.8GiB 触发 CPU_OOM 三次（Worker_PP 被杀）。96GiB+heap 已验证稳定，故阈值 96。
+  if (env.FN_PLE_LOC === 'heap' && (parseInt(env.FN_SIMPLE_OFFLOAD, 10) || 0) > 96) {
+    env.FN_PLE_LOC = 'disk';
+    warnings.push('PLE=放内存(匿名堆 48.3GiB 不可回收) + 二级缓存 ' + env.FN_SIMPLE_OFFLOAD + 'GiB 会顶穿物理内存（10-22 已 OOM 三次）——已自动改为「放硬盘」（可回收页缓存）');
+  }
   if (env.FN_PLE_LOC === 'heap' && require('os').totalmem() < 100 * 1024 * 1024 * 1024) {
     env.FN_PLE_LOC = 'disk';
     warnings.push('本机物理内存 <100GiB，「PLE 表位置=放内存」会被 OOM 杀（历史四连 oom-kill）——已自动降级为「放硬盘」（mmap 可回收页缓存）');
@@ -11247,6 +11253,548 @@ function hotShieldHandle(req, res, urlObj) {
 }
 // ==== [gpu-hotshield 1009] END module ====
 
+// ====== [gpu-powerlog 1025] GPU 高功耗记录 ======
+// 需求：任一张 GPU 功耗超过阈值（默认 300W）即记录，快照含「各单卡功耗 + 当时 GPU 合计 +
+// 当时整机估算总功耗」，供事后核对瞬时过载（供电余量/功耗墙/异常尖峰）。
+// 设计（对齐 hotshield 的形态，零新增 nvidia-smi 压力）：
+//  · 数据源复用 GPU 采样器 global.__gpuLive（1s 异步采样，09-20 铁律通道）；
+//    数据缺失/过期(>15s) 不判定不记录（盲态宁缺毋假）。
+//  · 防洪泛：每卡独立去抖间隔 minIntervalSec —— 持续越阈时每间隔至多记一条；
+//    越阈期间的周期性快照反而是想要的（能看到超标持续了多久、功耗如何波动）。
+//  · 总功耗口径 = global.__energy.lastWatts（全部 GPU + CPU(RAPL) + 用户补偿值，
+//    与能耗统计页「整机估算总功耗」完全一致）；能耗采样未就绪时如实记 null（前端显示 --），
+//    不用 0 冒充（0 会被当成真值）。
+//  · 落盘 = gpu-power-log.jsonl 追加（单行 < 300B，最坏 ~1 行/s）；内存环形上限 maxRecords，
+//    累计追加达上限时按环整写截尾（摊还成本）；启动从文件尾读取，控制台重启不丢历史。
+//  · 配置 gpu-powerlog.json mtime 热加载（同 hotshield 模式）：
+//    {enabled(缺省 true), thresholdW(50-1000 缺省 300), minIntervalSec(1-600 缺省 5),
+//     maxRecords(50-5000 缺省 1000)}
+//  · API：GET /v1/internal/power-log（状态+最近记录）、POST .../cmd {action:save|clear}
+//    （POST 自动受 console-auth 口令拦截，与其它写接口同规）。日志前缀 [powerlog]。
+const POWERLOG_CONFIG_PATH = path.join(__dirname, 'gpu-powerlog.json');
+const POWERLOG_FILE_PATH = path.join(__dirname, 'gpu-power-log.jsonl');
+const PL_DEFAULTS = { enabled: true, thresholdW: 300, minIntervalSec: 5, maxRecords: 1000 };
+let __plCfg = Object.assign({ mtime: -1 }, PL_DEFAULTS);
+function powerLogCfg() {
+  try {
+    const st = fs.statSync(POWERLOG_CONFIG_PATH);
+    if (st.mtimeMs !== __plCfg.mtime) {
+      const j = JSON.parse(fs.readFileSync(POWERLOG_CONFIG_PATH, 'utf8'));
+      const clamp = (v, lo, hi, dft) => { const n = parseFloat(v); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : dft; };
+      __plCfg = {
+        mtime: st.mtimeMs,
+        enabled: j.enabled !== false, // 文件存在即默认启用（用户装它就是为了记）
+        thresholdW: clamp(j.thresholdW, 50, 1000, PL_DEFAULTS.thresholdW),
+        minIntervalSec: clamp(j.minIntervalSec, 1, 600, PL_DEFAULTS.minIntervalSec),
+        maxRecords: clamp(j.maxRecords, 50, 5000, PL_DEFAULTS.maxRecords),
+      };
+    }
+  } catch (e) { /* 文件缺失/损坏：保持上一次值（首跑即缺省：启用 + 300W） */ }
+  return __plCfg;
+}
+function powerLogSaveCfg(patch) {
+  const cur = powerLogCfg();
+  const next = Object.assign({}, PL_DEFAULTS, cur, patch, { mtime: -1 });
+  const out = { enabled: next.enabled !== false, thresholdW: next.thresholdW, minIntervalSec: next.minIntervalSec, maxRecords: next.maxRecords };
+  fs.writeFileSync(POWERLOG_CONFIG_PATH, JSON.stringify(out, null, 2));
+  return powerLogCfg();
+}
+// 运行时状态：记录环 + 逐卡上次记录时刻（去抖）+ 全期峰值（含从文件恢复的历史部分）
+const __pl = { records: [], lastLogAt: {}, appends: 0, peakW: null, peakTs: 0, peakIdx: null };
+function plDayKey(ts) {
+  const d = new Date(ts);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function plIngest(rec) {
+  if (!rec || typeof rec !== 'object' || rec.ts == null || rec.w == null) return;
+  __pl.records.push(rec);
+  if (__pl.peakW == null || rec.w > __pl.peakW) { __pl.peakW = rec.w; __pl.peakTs = rec.ts; __pl.peakIdx = rec.idx; }
+}
+function plLoadExisting() {
+  // 只读文件尾 256KB（记录行 < 300B，够装 ~80 万字符），首行可能是被切的半行 → 丢弃
+  try {
+    const size = fs.statSync(POWERLOG_FILE_PATH).size;
+    if (!size) return;
+    const win = Math.min(size, 262144);
+    const buf = Buffer.alloc(win);
+    const fd = fs.openSync(POWERLOG_FILE_PATH, 'r');
+    try { fs.readSync(fd, buf, 0, win, size - win); } finally { fs.closeSync(fd); }
+    const lines = buf.toString('utf8').split('\n');
+    if (size > win) lines.shift();
+    const cfg = powerLogCfg();
+    for (const ln of lines) {
+      if (!ln.trim()) continue;
+      try { plIngest(JSON.parse(ln)); } catch (e) {}
+    }
+    while (__pl.records.length > cfg.maxRecords) __pl.records.shift();
+    __pl.appends = __pl.records.length; // 保守计：恢复后很快触发一次整写截尾，收敛文件长度
+  } catch (e) {
+    // 文件不存在 = 正常首跑；其余错误（权限/坏盘）必须出声，防静默吞掉真故障
+    if (!e || e.code !== 'ENOENT') console.warn('[powerlog] 历史读取失败（从空记录开始）：' + String((e && e.message) || e));
+  }
+}
+plLoadExisting();
+function plRecord(cfg, trig, gpus, now) {
+  let gpuTotal = 0;
+  const cards = [];
+  for (const g of gpus) {
+    const w = (g.power_draw == null) ? null : g.power_draw;
+    cards.push({ i: g.index, w: w });
+    if (w != null) gpuTotal += w;
+  }
+  const en = global.__energy;
+  const totalFresh = !!(en && en.lastWatts != null && en.lastSampleAt && (now - en.lastSampleAt) < 15000);
+  const rec = {
+    ts: now,
+    idx: trig.index,
+    w: trig.power_draw,
+    cards: cards,
+    gpu_total: Math.round(gpuTotal * 10) / 10,
+    total_w: totalFresh ? Math.round(en.lastWatts * 10) / 10 : null, // 整机估算总功耗（能耗页同口径），无新鲜采样如实 null
+    util: trig.util_gpu == null ? null : trig.util_gpu,
+    temp: trig.temp == null ? null : trig.temp,
+    sm: trig.sm_clock == null ? null : trig.sm_clock,
+  };
+  plIngest(rec);
+  while (__pl.records.length > cfg.maxRecords) __pl.records.shift();
+  __pl.appends++;
+  try {
+    fs.appendFileSync(POWERLOG_FILE_PATH, JSON.stringify(rec) + '\n');
+    if (__pl.appends >= cfg.maxRecords) {
+      fs.writeFileSync(POWERLOG_FILE_PATH, __pl.records.map((r) => JSON.stringify(r)).join('\n') + (__pl.records.length ? '\n' : ''));
+      __pl.appends = 0;
+    }
+  } catch (e) { console.warn('[powerlog] 落盘失败（内存记录保留）：' + String((e && e.message) || e)); }
+  console.warn('[powerlog] GPU' + rec.idx + ' 功耗 ' + rec.w + 'W ≥ 阈值 ' + cfg.thresholdW + 'W · 各卡[' +
+    cards.map((c) => c.i + ':' + (c.w == null ? '--' : c.w + 'W')).join(' ') +
+    '] · GPU合计 ' + rec.gpu_total + 'W · 整机 ' + (rec.total_w == null ? '--' : rec.total_w + 'W'));
+}
+function plEvaluate(frame, now) {
+  const cfg = powerLogCfg();
+  if (!cfg.enabled) return;
+  const gpus = (frame && Array.isArray(frame.gpus)) ? frame.gpus.filter((g) => g && g.index != null) : [];
+  if (!gpus.length || !frame.ts || (now - frame.ts) > 15000) return; // 盲态不判定
+  for (const g of gpus) {
+    const w = g.power_draw;
+    if (w == null || !Number.isFinite(w) || w < cfg.thresholdW) continue;
+    const last = __pl.lastLogAt[g.index] || 0;
+    if (now - last < cfg.minIntervalSec * 1000) continue;
+    __pl.lastLogAt[g.index] = now;
+    plRecord(cfg, g, gpus, now);
+  }
+}
+function powerLogStatus(limit) {
+  const cfg = powerLogCfg();
+  const now = Date.now();
+  const dayK = plDayKey(now);
+  let today = 0;
+  const perCard = {};
+  for (const r of __pl.records) {
+    if (plDayKey(r.ts) === dayK) today++;
+    perCard[r.idx] = (perCard[r.idx] || 0) + 1;
+  }
+  return {
+    ok: true,
+    config: { enabled: cfg.enabled !== false, thresholdW: cfg.thresholdW, minIntervalSec: cfg.minIntervalSec, maxRecords: cfg.maxRecords },
+    stats: {
+      armed: cfg.enabled !== false,
+      count: __pl.records.length,
+      today: today,
+      per_card: perCard,
+      peak_w: __pl.peakW,
+      peak_ts: __pl.peakTs || null,
+      peak_idx: __pl.peakIdx,
+      last_ts: __pl.records.length ? __pl.records[__pl.records.length - 1].ts : null,
+      live_age_s: (global.__gpuLive && global.__gpuLive.ts) ? Math.round((now - global.__gpuLive.ts) / 1000) : null,
+    },
+    records: __pl.records.slice(-Math.max(1, Math.min(500, limit || 120))).reverse(),
+  };
+}
+async function powerLogCmd(req, res) {
+  const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  const body = await cpuCtlReadBody(req);
+  if (!body) return reply(400, { ok: false, msg: '请求体不是合法 JSON' });
+  const act = String(body.action || '');
+  if (act === 'clear') {
+    __pl.records = []; __pl.appends = 0; __pl.lastLogAt = {}; __pl.peakW = null; __pl.peakTs = 0; __pl.peakIdx = null;
+    try { fs.writeFileSync(POWERLOG_FILE_PATH, ''); } catch (e) {}
+    console.log('[powerlog] 记录已由控制台清空');
+    return reply(200, Object.assign({ action: act, ok: true, msg: '记录已清空（配置保留）' }, powerLogStatus(1)));
+  }
+  if (act === 'save') {
+    const patch = {};
+    if (body.enabled != null) patch.enabled = !!body.enabled;
+    if (body.thresholdW != null) { const v = parseFloat(body.thresholdW); if (!(v >= 50 && v <= 1000)) return reply(400, { ok: false, msg: 'thresholdW 需在 50~1000 之间' }); patch.thresholdW = v; }
+    if (body.minIntervalSec != null) { const v = parseInt(body.minIntervalSec, 10); if (!(v >= 1 && v <= 600)) return reply(400, { ok: false, msg: 'minIntervalSec 需在 1~600 之间' }); patch.minIntervalSec = v; }
+    if (body.maxRecords != null) { const v = parseInt(body.maxRecords, 10); if (!(v >= 50 && v <= 5000)) return reply(400, { ok: false, msg: 'maxRecords 需在 50~5000 之间' }); patch.maxRecords = v; }
+    powerLogSaveCfg(patch);
+    while (__pl.records.length > powerLogCfg().maxRecords) __pl.records.shift();
+    console.log('[powerlog] 配置已更新：' + JSON.stringify(powerLogCfg()).replace(/"mtime":-?\d+,/, ''));
+    return reply(200, Object.assign({ action: act, ok: true, msg: '设置已保存并即时生效' }, powerLogStatus(1)));
+  }
+  return reply(400, { ok: false, msg: 'action 必须是 save | clear' });
+}
+function powerLogHandle(req, res, urlObj) {
+  const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  const sub = urlObj.pathname.slice('/v1/internal/power-log'.length);
+  if (req.method === 'POST' && sub === '/cmd') return powerLogCmd(req, res);
+  return reply(200, powerLogStatus(parseInt(urlObj.searchParams.get('limit'), 10) || 120));
+}
+if (!global.__powerLogTimer) {
+  global.__powerLogTimer = setInterval(() => {
+    try { plEvaluate(global.__gpuLive || null, Date.now()); } catch (e) { console.warn('[powerlog] 评估异常（忽略本拍）：' + String((e && e.message) || e)); }
+  }, 1000);
+  if (global.__powerLogTimer.unref) global.__powerLogTimer.unref();
+}
+// ==== [gpu-powerlog 1025] END module ====
+
+// ====== [client-ips 1027] 调用方 IP 统计与归属地 ======
+// 需求：显示「当前有哪些 IP 在调用模型 API」（IP + 归属地 + 调用数 + 最近活跃时间）。
+// 数据源（两路合并）：
+//  ① 引擎访问日志增量 tail（uvicorn 行 `INFO:  IP:port - "POST /v1/chat/completions HTTP/1.1" 200 OK`）：
+//    覆盖所有直连引擎端口（18420 等）的调用方。日志文件跟随 getVllmLogSource() 的 argv/fd 判据链
+//    （10-05 铁律），结果缓存 30s——该函数全量扫 /proc，禁止每拍调用；fallback/docker/tty 来源不解析
+//    （陈年日志冒充当前数据是 09-27/10-05 的老坑，宁缺毋假，meta.logKind 透传给前端黄条明示）。
+//    uvicorn 行无逐行时间戳 → lastSeen 以控制台观测时刻打点（精度=轮询周期 3s）；
+//    首次运行且无历史时从日志尾部 ≤4MB 回填计数（回填条目 lastSeen=null，前端标「历史」）。
+//  ② 控制台 /v1 代理入口：引擎侧只会看到 127.0.0.1，故在代理入口记录真实客户端 IP（XFF 优先），
+//    每个生成请求 pending +1；引擎日志见到回环生成行则 pending -1 且跳过计数——同一请求不双计
+//    （本机直连脚本与代理流量混跑时个别行会归错到代理 IP，量级极小，接受）。
+// 归属地：回环/私网/CGNAT/链路本地按本地规则判（内网=局域网，不外查）；公网 IPv4 走
+//    ip-api.com 批量解析（lang=zh-CN，≤50/批、间隔 ≥2s，免费额度 45 请求/分钟），结果持久化
+//    client-ips-geo.json（TTL 7 天重查），失败退避 10 分钟不锤；IPv6 公网如实标「免费库不解析」。
+// 持久化：client-ips-state.json 聚合帧（30s 脏写、tmp+rename 原子替换），控制台重启不丢计数；
+//    retentionDays（缺省 30）清理久未出现的 IP，maxIps（缺省 800）封顶按最旧驱逐。
+// 配置 client-ips.json mtime 热加载（同 powerlog）：{activeWindowSec:60, retentionDays:30,
+//    maxIps:800, geoEnabled:true}。
+// API：GET /v1/internal/client-ips（快照）、POST .../cmd {action:'clear'|'save',...}
+//    （POST 自动受 console-auth 口令拦截，与其它写接口同规）。日志前缀 [client-ips]。
+// 铁律合规：不起子进程；日志读取为 ≤1MB/拍的小容量同步读（仅文件增长时，与日志面板同形态）；
+//    归属地 fetch 自建 AbortController+定时器结算，失败只退避不连坐。
+const CIP_STATE_PATH = path.join(__dirname, 'client-ips-state.json');
+const CIP_GEO_PATH = path.join(__dirname, 'client-ips-geo.json');
+const CIP_CONFIG_PATH = path.join(__dirname, 'client-ips.json');
+// ip -> {ip,model,probe,other,firstSeen,lastSeen,anchor,viaProxy,paths:{},statuses:{}}
+const cipMap = new Map();
+let cipGeo = {};                    // ip -> {ok,country,region,city,isp,ts,failUntil?,failCount?}
+const cipGeoQueue = new Set();      // 待查公网 IP
+let cipGeoBusy = false, cipGeoNextAt = 0;
+let cipProxyPending = 0;            // 经代理转发、待与引擎日志回环行对账的生成请求数
+let cipDirty = false, cipGeoDirty = false;
+let cipLastSrc = null;              // 最近一次 getVllmLogSource() 结果（供 meta 透传）
+const cipTail = { file: null, ino: 0, offset: 0, residue: '', seeded: false, src: null, srcAt: 0 };
+let cipCfg = { activeWindowSec: 60, retentionDays: 30, maxIps: 800, geoEnabled: true };
+let cipCfgMtime = -1;
+
+function cipLoadCfg() {
+  try {
+    const st = fs.statSync(CIP_CONFIG_PATH);
+    if (st.mtimeMs === cipCfgMtime) return;
+    cipCfgMtime = st.mtimeMs;
+    const j = JSON.parse(fs.readFileSync(CIP_CONFIG_PATH, 'utf8')) || {};
+    const cl = (v, d, lo, hi) => { const n = parseFloat(v); return (isFinite(n) && n >= lo && n <= hi) ? n : d; };
+    cipCfg = {
+      activeWindowSec: cl(j.activeWindowSec, 60, 5, 3600),
+      retentionDays: cl(j.retentionDays, 30, 1, 365),
+      maxIps: cl(j.maxIps, 800, 50, 5000),
+      geoEnabled: j.geoEnabled == null ? true : !!j.geoEnabled,
+    };
+  } catch (e) {
+    if (cipCfgMtime !== -2) { cipCfgMtime = -2; cipCfg = { activeWindowSec: 60, retentionDays: 30, maxIps: 800, geoEnabled: true }; }
+  }
+}
+function cipSaveCfg(patch) {
+  cipCfg = Object.assign({}, cipCfg, patch);
+  try { fs.writeFileSync(CIP_CONFIG_PATH, JSON.stringify(cipCfg, null, 2)); cipCfgMtime = -1; } catch (e) {}
+}
+
+function cipNormalizeIp(ip) {
+  let a = String(ip || '').trim();
+  if (a.startsWith('[') && a.endsWith(']')) a = a.slice(1, -1);
+  if (/^::ffff:\d+\.\d+\.\d+\.\d+$/i.test(a)) a = a.slice(7);
+  return a;
+}
+function cipNetClass(ip) {
+  if (!ip) return 'other';
+  if (ip === '::1' || /^127\./.test(ip)) return 'loopback';
+  if (/^10\./.test(ip) || /^192\.168\./.test(ip) || /^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return 'private';
+  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip)) return 'private';  // CGNAT 100.64/10
+  if (/^169\.254\./.test(ip) || /^fe80:/i.test(ip)) return 'linklocal';
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(ip)) return 'public';
+  if (ip.includes(':')) return 'public6';
+  return 'other';
+}
+// 路径分类：model=生成类（真正要归属地的「调用模型」）；probe=探活/指标轮询噪音；other=其余。
+const CIP_MODEL_RE = /^\/v1\/(chat\/completions|completions|embeddings|rerank|messages|responses|audio\/|realtime)/;
+function cipPathKind(q) {
+  const p = String(q || '').split('?')[0];
+  if (p === '/metrics' || p === '/health' || p === '/load' || p === '/stats' || p === '/ping'
+      || p === '/server_info' || p === '/model_info' || p === '/get_load' || p === '/health_generate'
+      || p === '/v1/models' || p.startsWith('/v1/models/')) return 'probe';
+  if (CIP_MODEL_RE.test(p) || p === '/tokenize' || p === '/detokenize' || p === '/generate'
+      || p === '/invocations' || p === '/encode') return 'model';
+  return 'other';
+}
+// uvicorn 访问行：`INFO:     192.168.1.36:55558 - "POST /v1/chat/completions HTTP/1.1" 200 OK`
+// host 用贪婪 (.+) + 端口锚定在 ` - "` 之前，兼容 IPv6（::ffff:1.2.3.4:54321）形态。
+const CIP_ACCESS_RE = /^(?:INFO|WARNING|ERROR):\s+(.+):(\d+)\s+-\s+"([A-Z]+)\s+(\S+)(?:\s+HTTP\/[\d.]+)?"\s+(\d{3})/;
+
+function cipTouch(ip, ts) {
+  let e = cipMap.get(ip);
+  if (!e) {
+    e = { ip, model: 0, probe: 0, other: 0, firstSeen: ts || null, lastSeen: null, anchor: Date.now(), viaProxy: false, paths: {}, statuses: {} };
+    cipMap.set(ip, e);
+  }
+  if (ts) { if (!e.firstSeen) e.firstSeen = ts; e.lastSeen = Math.max(e.lastSeen || 0, ts); e.anchor = ts; }
+  return e;
+}
+function cipIngestLine(line, ts) {
+  const m = CIP_ACCESS_RE.exec(line);
+  if (!m) return;
+  const ip = cipNormalizeIp(m[1]);
+  if (!ip || ip.length > 64) return;
+  const kind = cipPathKind(m[4]);
+  // 代理转发的生成请求已在代理入口按真实 IP 计过，引擎侧回环行对账后跳过（仅对带时间戳的实时行对账）
+  if (kind === 'model' && ts && cipNetClass(ip) === 'loopback' && cipProxyPending > 0) { cipProxyPending--; return; }
+  const e = cipTouch(ip, ts || 0);
+  if (kind === 'model') e.model++; else if (kind === 'probe') e.probe++; else e.other++;
+  const key = m[3] + ' ' + String(m[4]).split('?')[0];
+  e.paths[key] = (e.paths[key] || 0) + 1;
+  e.statuses[m[5]] = (e.statuses[m[5]] || 0) + 1;
+  cipDirty = true;
+}
+// 代理入口钩子：只记生成类请求（探活与引擎日志同源，记了会双计）。
+function cipRecordProxy(req, method, rawPath) {
+  try {
+    if (cipPathKind(rawPath) !== 'model') return;
+    let ip = '';
+    const xff = req.headers && req.headers['x-forwarded-for'];
+    if (xff) ip = cipNormalizeIp(String(xff).split(',')[0]);
+    if (!ip) ip = cipNormalizeIp((req.socket && req.socket.remoteAddress) || '');
+    if (!ip) return;
+    const e = cipTouch(ip, Date.now());
+    e.viaProxy = true;
+    e.model++;
+    const key = method + ' ' + String(rawPath).split('?')[0];
+    e.paths[key] = (e.paths[key] || 0) + 1;
+    if (cipProxyPending < 100000) cipProxyPending++;
+    cipDirty = true;
+  } catch (err) {}
+}
+
+function cipLogFile() {
+  const now = Date.now();
+  if (cipTail.src && now - cipTail.srcAt < 30000) return cipTail.src;
+  cipTail.srcAt = now;
+  let f = null;
+  try {
+    const s = getVllmLogSource();
+    cipLastSrc = s || null;
+    if (s && s.file && !s.docker && !s.tty && !s.fallback) f = s.file;
+  } catch (e) { cipLastSrc = null; }
+  cipTail.src = f;
+  return f;
+}
+function cipConsume(text, ts) {
+  const data = cipTail.residue + text;
+  const nl = data.lastIndexOf('\n');
+  if (nl < 0) { cipTail.residue = data.slice(0, 4096); return; }
+  cipTail.residue = data.slice(nl + 1).slice(0, 4096);
+  const lines = data.slice(0, nl).split('\n');
+  for (const ln of lines) if (ln.indexOf(' - "') > 0) cipIngestLine(ln, ts);
+}
+function cipSeed(file, size) {
+  const cap = Math.min(size, 4 << 20);
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const buf = Buffer.allocUnsafe(cap);
+    const got = fs.readSync(fd, buf, 0, cap, size - cap);
+    const lines = buf.toString('utf8', 0, got).split('\n');
+    lines.shift();  // 首行可能是半行
+    for (const ln of lines) if (ln.indexOf(' - "') > 0) cipIngestLine(ln, 0);
+  } catch (e) {} finally { if (fd != null) { try { fs.closeSync(fd); } catch (e) {} } }
+}
+function cipTick() {
+  cipLoadCfg();
+  const src = cipLogFile();
+  if (!src) { cipTail.file = null; return; }
+  let st = null;
+  try { st = fs.statSync(src); } catch (e) { return; }
+  if (cipTail.file !== src || cipTail.ino !== st.ino) {
+    cipTail.file = src; cipTail.ino = st.ino; cipTail.offset = st.size; cipTail.residue = '';
+    if (!cipTail.seeded && cipMap.size === 0) { cipSeed(src, st.size); cipTail.seeded = true; }
+    cipDirty = true;
+    return;
+  }
+  if (st.size < cipTail.offset) { cipTail.offset = st.size; return; }  // 截断/换文件：对齐末尾继续（不回头重读防双计）
+  const need = st.size - cipTail.offset;
+  if (need <= 0) return;
+  const cap = Math.min(need, 1 << 20);
+  let fd;
+  try {
+    fd = fs.openSync(src, 'r');
+    const buf = Buffer.allocUnsafe(cap);
+    const got = fs.readSync(fd, buf, 0, cap, cipTail.offset);
+    cipTail.offset += got;
+    cipConsume(buf.toString('utf8', 0, got), Date.now());
+  } catch (e) { /* 文件消失/被占：下一拍重试 */ } finally { if (fd != null) { try { fs.closeSync(fd); } catch (e) {} } }
+}
+
+function cipGeoEnqueue(ip) {
+  if (!cipCfg.geoEnabled || cipNetClass(ip) !== 'public') return;
+  const g = cipGeo[ip];
+  const now = Date.now();
+  if (g && g.ok && now - g.ts < 7 * 864e5) return;
+  if (g && !g.ok && g.failUntil && now < g.failUntil) return;
+  cipGeoQueue.add(ip);
+}
+async function cipGeoFlush() {
+  if (cipGeoBusy || !cipGeoQueue.size || Date.now() < cipGeoNextAt) return;
+  const batch = Array.from(cipGeoQueue).slice(0, 50);
+  cipGeoBusy = true;
+  const ac = new AbortController();
+  const timer = setTimeout(() => { try { ac.abort(); } catch (e) {} }, 8000);
+  try {
+    const r = await fetch('http://ip-api.com/batch?lang=zh-CN&fields=status,country,regionName,city,isp,query', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(batch.map((q) => ({ query: q }))), signal: ac.signal,
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const arr = await r.json();
+    const now = Date.now();
+    for (const it of (Array.isArray(arr) ? arr : [])) {
+      const ip = cipNormalizeIp(it.query || '');
+      if (!ip) continue;
+      cipGeoQueue.delete(ip);
+      if (it.status === 'success') cipGeo[ip] = { ok: true, country: it.country, region: it.regionName, city: it.city, isp: it.isp, ts: now };
+      else cipGeo[ip] = { ok: false, ts: now, failUntil: now + 10 * 60000, failCount: (cipGeo[ip] && cipGeo[ip].failCount ? cipGeo[ip].failCount + 1 : 1) };
+      cipGeoDirty = true;
+    }
+    cipGeoNextAt = Date.now() + 2000;
+  } catch (e) {
+    cipGeoNextAt = Date.now() + 15000;  // 无外网/超时：退避，队列保留稍后重试
+  } finally {
+    try { clearTimeout(timer); } catch (e) {}
+    cipGeoBusy = false;
+  }
+}
+function cipRegion(ip) {
+  const cls = cipNetClass(ip);
+  if (cls === 'loopback') return { cls, text: '本机回环' };
+  if (cls === 'private') return { cls, text: '内网（局域网）' };
+  if (cls === 'linklocal') return { cls, text: '链路本地' };
+  if (cls === 'public6') return { cls, text: '公网 IPv6（免费库不解析）' };
+  const g = cipGeo[ip];
+  if (g && g.ok) return { cls, text: [g.country, g.region, g.city].filter(Boolean).join(' ') || '公网', isp: g.isp || '' };
+  if (g && !g.ok) return { cls, text: '公网（解析失败，稍后重试）' };
+  return { cls, text: cipCfg.geoEnabled ? '公网（解析中…）' : '公网' };
+}
+function cipStatus() {
+  const now = Date.now();
+  const win = cipCfg.activeWindowSec * 1000;
+  const list = [];
+  const totals = { unique: 0, active: 0, modelTotal: 0, probeTotal: 0, publicN: 0, modelIps: 0 };
+  for (const [ip, e] of cipMap) {
+    cipGeoEnqueue(ip);
+    const r = cipRegion(ip);
+    const active = !!(e.lastSeen && now - e.lastSeen <= win);
+    totals.unique++; if (active) totals.active++;
+    totals.modelTotal += e.model; totals.probeTotal += e.probe;
+    if (e.model > 0) totals.modelIps++;
+    if (r.cls === 'public' || r.cls === 'public6') totals.publicN++;
+    const paths = Object.entries(e.paths).sort((a, b) => b[1] - a[1]).slice(0, 8);
+    list.push({ ip, model: e.model, probe: e.probe, other: e.other, firstSeen: e.firstSeen || null,
+      lastSeen: e.lastSeen || null, active, seededOnly: !e.lastSeen, viaProxy: !!e.viaProxy,
+      region: r.text, regionIsp: r.isp || '', cls: r.cls, paths, statuses: e.statuses });
+  }
+  list.sort((a, b) => (b.active - a.active) || ((b.lastSeen || 0) - (a.lastSeen || 0)) || (b.model - a.model) || (b.probe - a.probe));
+  const kind = !cipLastSrc ? 'none' : cipLastSrc.docker ? 'docker' : cipLastSrc.tty ? 'tty' : cipLastSrc.fallback ? 'fallback' : cipTail.file ? 'file' : 'none';
+  return { ok: true, now, windowSec: cipCfg.activeWindowSec, totals, ips: list, meta: {
+    logFile: cipTail.file || (cipLastSrc && cipLastSrc.file) || null, logKind: kind,
+    proxyPending: cipProxyPending, geoPending: cipGeoQueue.size, geoEnabled: cipCfg.geoEnabled,
+    seeded: cipTail.seeded, config: cipCfg } };
+}
+function cipPrune() {
+  const now = Date.now();
+  const maxAge = cipCfg.retentionDays * 864e5;
+  for (const [ip, e] of cipMap) { if (now - (e.lastSeen || e.anchor || 0) > maxAge) { cipMap.delete(ip); cipDirty = true; } }
+  if (cipMap.size > cipCfg.maxIps) {
+    const arr = Array.from(cipMap.values()).sort((a, b) => (a.lastSeen || a.anchor || 0) - (b.lastSeen || b.anchor || 0));
+    for (let i = 0; i < cipMap.size - cipCfg.maxIps; i++) { cipMap.delete(arr[i].ip); cipDirty = true; }
+  }
+}
+function cipSaveState() {
+  try {
+    const tmp = CIP_STATE_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({ savedAt: Date.now(), seeded: cipTail.seeded, entries: Array.from(cipMap.values()) }));
+    fs.renameSync(tmp, CIP_STATE_PATH);
+  } catch (e) {}
+}
+function cipLoadState() {
+  try {
+    const j = JSON.parse(fs.readFileSync(CIP_STATE_PATH, 'utf8'));
+    if (!j || !Array.isArray(j.entries)) return;
+    for (const e of j.entries) {
+      if (!e || typeof e.ip !== 'string') continue;
+      const ip = cipNormalizeIp(e.ip);
+      if (!ip) continue;
+      cipMap.set(ip, {
+        ip, model: e.model | 0, probe: e.probe | 0, other: e.other | 0,
+        firstSeen: e.firstSeen || null, lastSeen: e.lastSeen || null,
+        anchor: e.anchor || j.savedAt || Date.now(), viaProxy: !!e.viaProxy,
+        paths: (e.paths && typeof e.paths === 'object') ? e.paths : {},
+        statuses: (e.statuses && typeof e.statuses === 'object') ? e.statuses : {},
+      });
+    }
+    cipTail.seeded = !!j.seeded;
+    console.log('[client-ips] 恢复历史统计 ' + cipMap.size + ' 个 IP');
+  } catch (e) {}
+}
+function cipLoadGeo() { try { const j = JSON.parse(fs.readFileSync(CIP_GEO_PATH, 'utf8')); if (j && typeof j === 'object') cipGeo = j; } catch (e) {} }
+function cipSaveGeo() {
+  try { const tmp = CIP_GEO_PATH + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(cipGeo)); fs.renameSync(tmp, CIP_GEO_PATH); } catch (e) {}
+}
+async function cipCmd(req, res) {
+  const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  const body = await cpuCtlReadBody(req);
+  if (!body) return reply(400, { ok: false, msg: '请求体不是合法 JSON' });
+  const act = String(body.action || '');
+  if (act === 'clear') {
+    cipMap.clear(); cipProxyPending = 0;
+    cipTail.seeded = true;   // 清空即人工决定不要历史回填，重启后也不再从日志尾重灌
+    cipDirty = true;
+    try { fs.writeFileSync(CIP_STATE_PATH, JSON.stringify({ savedAt: Date.now(), seeded: true, entries: [] })); } catch (e) {}
+    console.log('[client-ips] 统计已由控制台清空（归属地缓存保留）');
+    return reply(200, { action: act, ok: true, msg: '统计已清空，从现在开始重新计数' });
+  }
+  if (act === 'save') {
+    const patch = {};
+    if (body.activeWindowSec != null) { const v = parseInt(body.activeWindowSec, 10); if (!(v >= 5 && v <= 3600)) return reply(400, { ok: false, msg: 'activeWindowSec 需在 5~3600 之间' }); patch.activeWindowSec = v; }
+    if (body.retentionDays != null) { const v = parseInt(body.retentionDays, 10); if (!(v >= 1 && v <= 365)) return reply(400, { ok: false, msg: 'retentionDays 需在 1~365 之间' }); patch.retentionDays = v; }
+    if (body.geoEnabled != null) patch.geoEnabled = !!body.geoEnabled;
+    if (Object.keys(patch).length) { cipSaveCfg(patch); }
+    console.log('[client-ips] 配置已更新：' + JSON.stringify(cipCfg));
+    return reply(200, { action: act, ok: true, msg: '设置已保存并即时生效', config: cipCfg });
+  }
+  return reply(400, { ok: false, msg: 'action 必须是 save | clear' });
+}
+function clientIpsHandle(req, res, urlObj) {
+  const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  const sub = urlObj.pathname.slice('/v1/internal/client-ips'.length);
+  if (req.method === 'POST' && sub === '/cmd') return cipCmd(req, res);
+  return reply(200, cipStatus());
+}
+cipLoadCfg(); cipLoadGeo(); cipLoadState(); cipPrune();
+if (!global.__cipTimers) {
+  global.__cipTimers = true;
+  const cipT1 = setInterval(() => { try { cipTick(); } catch (e) { console.warn('[client-ips] tail 异常（忽略本拍）：' + String((e && e.message) || e)); } }, 3000);
+  const cipT2 = setInterval(() => { try { cipGeoFlush(); } catch (e) {} }, 5000);
+  const cipT3 = setInterval(() => { try { cipPrune(); if (cipDirty) { cipSaveState(); cipDirty = false; } if (cipGeoDirty) { cipSaveGeo(); cipGeoDirty = false; } } catch (e) {} }, 30000);
+  [cipT1, cipT2, cipT3].forEach((t) => { if (t.unref) t.unref(); });
+}
+// ==== [client-ips 1027] END module ====
+
 const server = http.createServer(async (req, res) => {
 
   let urlObj;
@@ -13789,6 +14337,20 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // === GPU 高功耗记录 API（[gpu-powerlog 1025]：GET 状态+记录 / POST cmd {action:save|clear}）===
+  if (pathname === '/v1/internal/power-log' || pathname.startsWith('/v1/internal/power-log/')) {
+    return Promise.resolve(powerLogHandle(req, res, urlObj)).catch((e) => {
+      try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}
+    });
+  }
+
+  // === Internal API: 调用方 IP 统计与归属地（[client-ips 1027]，数据源=引擎访问日志增量 tail + 控制台 /v1 代理入口）===
+  if (pathname === '/v1/internal/client-ips' || pathname.startsWith('/v1/internal/client-ips/')) {
+    return Promise.resolve(clientIpsHandle(req, res, urlObj)).catch((e) => {
+      try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}
+    });
+  }
+
   // === Internal API: 内存带宽（硬件监视页 RAM 带宽卡；perf uncore IMC CAS 计数，1s 采样）===
   if (pathname === '/v1/internal/membw') {
     const live = global.__membw || null;
@@ -14653,6 +15215,8 @@ const server = http.createServer(async (req, res) => {
     // Multi-model routing: requests carrying a "model" field go to that
     // model's own vLLM backend (each pinned to one GPU).
     if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+      // [client-ips 1027] 代理入口记录真实调用方（只计生成类请求，回环行由 pending 对账去重）
+      cipRecordProxy(req, req.method, pathname);
       let body = '';
       req.on('data', (c) => { body += c; });
       req.on('end', () => {

@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>调用方 IP · vLLM Console</title>
+<!--
+  调用方 IP 列表与归属地（10-27 新增，[client-ips 1027]）。
+  数据源 = 后端 GET /v1/internal/client-ips（server.js CLIENT-IP 模块）：
+    · 引擎访问日志增量 tail（uvicorn 行，覆盖直连引擎端口的所有调用方；行无时间戳，
+      lastSeen=控制台观测时刻 ±3s；首次运行从日志尾 ≤4MB 回填计数，回填条目显示「历史」）；
+    · 控制台 /v1 代理入口记录真实客户端 IP（引擎侧只见 127.0.0.1，代理流量按真实 IP 归属，
+      回环行 pending 对账去重，来源标「代理」）。
+  归属地口径（勿删）：内网/回环/CGNAT 本地规则判定不外查；公网 IPv4 走 ip-api.com（中文，
+    7 天缓存，失败退避）；IPv6 公网免费库不解析，如实标注。
+  轮询纪律（09-23/09-25/10-03 铁律）：自建 AbortController+setTimeout 超时（禁 AbortSignal.timeout）；
+    续排放 finally（渲染抛错不能吃掉重排句柄）；失败保留上一帧画面+黄条；后台标签停轮询，
+    回前台四类事件补帧。
+-->
+<style>
+:root{--bg:#f1f5f9;--panel:#ffffff;--panel2:#f8fafc;--bd:#e2e8f0;--bd2:#cbd5e1;--tx:#0f172a;--tx2:#475569;--tx3:#94a3b8;--ac:#6366f1;--ac2:#eef2ff;--ok:#059669;--warn:#b45309;--bad:#dc2626;--mono:'SF Mono',Consolas,monospace;--sh:0 1px 3px rgba(28,42,70,.06),0 4px 14px rgba(28,42,70,.05)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.6 -apple-system,'PingFang SC','Microsoft YaHei',sans-serif;padding:14px 16px}
+h1{font-size:16px;margin:0 0 2px}
+.sub{font-size:12px;color:var(--tx3);margin-bottom:10px}
+.errbar{display:none;background:#fef3c7;border:1px solid #fcd34d;color:#92400e;border-radius:10px;padding:8px 12px;font-size:12.5px;margin-bottom:10px}
+.kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.kpi{background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:10px 16px;box-shadow:var(--sh);min-width:130px}
+.kpi .v{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}
+.kpi .k{font-size:12px;color:var(--tx2)}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.bar input[type=text]{border:1px solid var(--bd2);border-radius:9px;padding:6px 10px;font-size:13px;width:200px;background:var(--panel)}
+.bar label{font-size:12.5px;color:var(--tx2);display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none}
+.bar select{border:1px solid var(--bd2);border-radius:9px;padding:5px 8px;font-size:12.5px;background:var(--panel)}
+.card{background:var(--panel);border:1px solid var(--bd);border-radius:14px;box-shadow:var(--sh);overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{background:var(--panel2);color:var(--tx2);font-weight:600;font-size:12px;text-align:left;padding:8px 10px;border-bottom:1px solid var(--bd);white-space:nowrap;position:sticky;top:0}
+td{padding:7px 10px;border-bottom:1px solid var(--bd);vertical-align:top}
+tr.irow{cursor:pointer}
+tr.irow:hover{background:var(--ac2)}
+tr.drow td{background:#fbfcfe;font-size:12px;color:var(--tx2);padding:8px 14px 10px 34px}
+.ip{font-family:var(--mono);font-size:13px;font-weight:600}
+.num{font-variant-numeric:tabular-nums;text-align:right}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--bd2);margin-right:6px;vertical-align:1px}
+.dot.on{background:var(--ok);box-shadow:0 0 0 3px rgba(5,150,105,.15)}
+.tag{display:inline-block;padding:1px 8px;border-radius:6px;font-size:11px;border:1px solid var(--bd2);color:var(--tx2);white-space:nowrap;margin-right:4px}
+.tag.priv{background:#ecfdf5;border-color:#a7f3d0;color:#047857}
+.tag.pub{background:#fef2f2;border-color:#fecaca;color:#b91c1c}
+.tag.loop{background:#f1f5f9;border-color:var(--bd2);color:var(--tx2)}
+.tag.proxy{background:#eef2ff;border-color:#c7d2fe;color:#4338ca}
+.tag.hist{background:#fffbeb;border-color:#fde68a;color:#92400e}
+.rg{font-size:12.5px}
+.rg .isp{color:var(--tx3);font-size:11.5px}
+.rel{white-space:nowrap;font-size:12.5px}
+.rel .abs{color:var(--tx3);font-size:11px}
+.empty{padding:26px;text-align:center;color:var(--tx3);font-size:13px}
+.pchip{display:inline-block;background:var(--panel2);border:1px solid var(--bd);border-radius:7px;padding:1px 8px;margin:2px 6px 2px 0;font-family:var(--mono);font-size:11.5px}
+.foot{font-size:11.5px;color:var(--tx3);margin-top:10px;line-height:1.7}
+.foot b{color:var(--tx2)}
+</style>
+</head>
+<body>
+<h1>调用方 IP · 归属地</h1>
+<div class="sub">谁在调用模型 API：引擎访问日志（直连 18420 等端口的全部来源）+ 控制台 /v1 代理入口（按真实客户端归属）· <span id="ts">--</span></div>
+<div class="errbar" id="errbar"></div>
+
+<div class="kpis">
+  <div class="kpi"><div class="v" id="kActive" style="color:var(--ok)">--</div><div class="k">活跃调用方（<span id="kWin">60</span>s 内有请求）</div></div>
+  <div class="kpi"><div class="v" id="kModelIps">--</div><div class="k">调用过模型 API 的 IP</div></div>
+  <div class="kpi"><div class="v" id="kModel">--</div><div class="k">模型 API 调用累计</div></div>
+  <div class="kpi"><div class="v" id="kProbe">--</div><div class="k">探活/指标轮询累计</div></div>
+  <div class="kpi"><div class="v" id="kPub">--</div><div class="k">公网 IP</div></div>
+  <div class="kpi"><div class="v" id="kUniq">--</div><div class="k">观测到的 IP 总数</div></div>
+</div>
+
+<div class="bar">
+  <input type="text" id="q" placeholder="搜索 IP / 归属地…">
+  <label><input type="checkbox" id="fModel" checked>仅显示有模型调用的 IP</label>
+  <label><input type="checkbox" id="fLoop">显示本机回环</label>
+  <label><input type="checkbox" id="fPriv" >隐藏内网</label>
+  <label style="margin-left:auto">刷新 <select id="iv"><option value="3000" selected>3 秒</option><option value="10000">10 秒</option><option value="0">暂停</option></select></label>
+  <button class="tag" style="cursor:pointer" onclick="location.reload()">重载</button>
+</div>
+
+<div class="card">
+  <table>
+    <thead><tr>
+      <th style="width:34px"></th><th>IP 地址</th><th>网络类型</th><th>归属地</th>
+      <th class="num">模型调用</th><th class="num">探活</th><th>最近活跃</th><th>来源</th>
+    </tr></thead>
+    <tbody id="tb"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
+  </table>
+</div>
+
+<div class="foot">
+  <b>口径说明</b>：① 数据源为引擎访问日志（uvicorn 行）与控制台代理入口——日志行本身无时间戳，「最近活跃」是控制台观测时刻（精度 ±3 秒）；
+  首次启动从日志尾部回填的累计计数无法还原时间，标 <span class="tag hist">历史</span>（有后续新请求后即转实时）。
+  ② 归属地：内网（RFC1918/CGNAT）与回环为本地判定；公网 IPv4 经 ip-api.com 解析（中文结果，7 天缓存）；IPv6 公网免费库不支持解析，如实标注。
+  ③ 经控制台 /v1 代理转发的请求按<b>真实客户端 IP</b> 计入并标 <span class="tag proxy">代理</span>（引擎日志侧的回环行已对账去重，不双计）；
+  本机脚本直连引擎产生的 127.0.0.1 记录归入「本机回环」（默认隐藏，勾选可看）。
+  ④ 探活/指标轮询（/metrics、/v1/models、/health 等）单独计数，不算「调用模型」。
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var timer = null, last = null, err = null;
+  var expanded = {};   // ip -> true（展开明细，跨帧保留）
+
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]; }); }
+  function safeRun(fn, tag) { try { fn(); } catch (e) { console.error('[client-ips-page] ' + (tag || '') + ': ' + (e && e.stack || e)); } }
+  function setErr(msg) { var b = document.getElementById('errbar'); b.style.display = msg ? 'block' : 'none'; b.textContent = msg || ''; }
+  function n(x) { return (x == null) ? '--' : Number(x).toLocaleString('zh-CN'); }
+
+  function rel(ts) {
+    if (!ts) return '<span class="tag hist">历史</span>';
+    var d = Math.max(0, Date.now() - ts);
+    var s = Math.floor(d / 1000);
+    var t = s < 5 ? '刚刚' : s < 60 ? s + ' 秒前' : s < 3600 ? Math.floor(s / 60) + ' 分钟前' : s < 86400 ? Math.floor(s / 3600) + ' 小时前' : Math.floor(s / 86400) + ' 天前';
+    return '<span class="rel">' + t + ' <span class="abs">(' + esc(new Date(ts).toLocaleString('zh-CN', { hour12: false })) + ')</span></span>';
+  }
+  var CLS = { loopback: ['回环', 'loop'], private: ['内网', 'priv'], linklocal: ['链路本地', 'loop'], public: ['公网', 'pub'], public6: ['公网 IPv6', 'pub'], other: ['未知', 'loop'] };
+
+  function applyState(d) {
+    last = d;
+    var t = d.totals || {}, m = d.meta || {};
+    document.getElementById('kActive').textContent = n(t.active);
+    document.getElementById('kModelIps').textContent = n(t.modelIps);
+    document.getElementById('kModel').textContent = n(t.modelTotal);
+    document.getElementById('kProbe').textContent = n(t.probeTotal);
+    document.getElementById('kPub').textContent = n(t.publicN);
+    document.getElementById('kUniq').textContent = n(t.unique);
+    document.getElementById('kWin').textContent = d.windowSec || 60;
+    document.getElementById('ts').textContent = '更新 ' + new Date(d.now || Date.now()).toLocaleTimeString('zh-CN', { hour12: false })
+      + ' · 日志源 ' + (m.logFile ? m.logFile.split('/').pop() : '--');
+    var warn = [];
+    if (err) warn.push('取数失败（' + esc(err) + '），显示上次快照');
+    if (m.logKind && m.logKind !== 'file') warn.push('引擎访问日志暂不可读（' + esc(String(m.logKind)) + '），当前仅统计经控制台代理的调用');
+    setErr(warn.join(' · '));
+    renderTable();
+  }
+  function renderTable() {
+    if (!last) return;
+    var q = (document.getElementById('q').value || '').trim().toLowerCase();
+    var onlyModel = document.getElementById('fModel').checked;
+    var showLoop = document.getElementById('fLoop').checked;
+    var hidePriv = document.getElementById('fPriv').checked;
+    var rows = (last.ips || []).filter(function (e) {
+      if (!showLoop && e.cls === 'loopback') return false;
+      if (hidePriv && e.cls === 'private') return false;
+      if (onlyModel && !(e.model > 0)) return false;
+      if (q && (e.ip + ' ' + (e.region || '') + ' ' + (e.regionIsp || '')).toLowerCase().indexOf(q) < 0) return false;
+      return true;
+    });
+    var tb = document.getElementById('tb');
+    if (!rows.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">' + ((last.ips || []).length ? '无匹配行（调整筛选）' : '暂无调用记录——有新请求时自动出现') + '</td></tr>'; return; }
+    var html = '';
+    rows.forEach(function (e) {
+      var c = CLS[e.cls] || CLS.other;
+      html += '<tr class="irow" data-ip="' + esc(e.ip) + '">'
+        + '<td><span class="dot' + (e.active ? ' on' : '') + '"></span></td>'
+        + '<td class="ip">' + esc(e.ip) + '</td>'
+        + '<td><span class="tag ' + c[1] + '">' + c[0] + '</span></td>'
+        + '<td class="rg">' + esc(e.region || '--') + (e.regionIsp ? '<div class="isp">' + esc(e.regionIsp) + '</div>' : '') + '</td>'
+        + '<td class="num"><b>' + n(e.model) + '</b></td>'
+        + '<td class="num" style="color:var(--tx3)">' + n(e.probe) + '</td>'
+        + '<td>' + rel(e.lastSeen) + '</td>'
+        + '<td>' + (e.viaProxy ? '<span class="tag proxy">代理</span>' : '') + (e.other > 0 ? '<span class="tag">其它 ' + n(e.other) + '</span>' : '') + '</td>'
+        + '</tr>';
+      if (expanded[e.ip]) {
+        var paths = (e.paths || []).map(function (p) { return '<span class="pchip">' + esc(p[0]) + ' × ' + n(p[1]) + '</span>'; }).join('');
+        var sts = Object.entries(e.statuses || {}).sort(function (a, b) { return b[1] - a[1]; }).map(function (s) { return esc(s[0]) + '×' + n(s[1]); }).join('　');
+        html += '<tr class="drow"><td colspan="8">'
+          + (paths || '<span style="color:var(--tx3)">无路径明细</span>')
+          + '<div style="margin-top:4px">状态码：' + (sts || '--')
+          + ' · 首次观测：' + (e.firstSeen ? esc(new Date(e.firstSeen).toLocaleString('zh-CN', { hour12: false })) : '（历史回填，未知）')
+          + (e.viaProxy ? ' · 含经控制台代理转发' : '') + '</div></td></tr>';
+      }
+    });
+    tb.innerHTML = html;
+  }
+  document.getElementById('tb').addEventListener('click', function (ev) {
+    var tr = ev.target.closest ? ev.target.closest('tr.irow') : null;
+    if (!tr) return;
+    var ip = tr.getAttribute('data-ip');
+    if (expanded[ip]) delete expanded[ip]; else expanded[ip] = true;
+    safeRun(renderTable, 'renderTable');
+  });
+  ['q', 'fModel', 'fLoop', 'fPriv'].forEach(function (id) {
+    document.getElementById(id).addEventListener('input', function () { safeRun(renderTable, 'filter'); });
+  });
+
+  function fetchJson(url, ms) {
+    return new Promise(function (resolve, reject) {
+      var ac = new AbortController();
+      var to = setTimeout(function () { ac.abort(); }, ms);
+      fetch(url, { signal: ac.signal, cache: 'no-store' }).then(function (r) {
+        clearTimeout(to);
+        if (!r.ok) { reject(new Error('HTTP ' + r.status)); return; }
+        r.json().then(resolve, function () { reject(new Error('JSON 解析失败')); });
+      }, function (e) { clearTimeout(to); reject(new Error(String((e && e.name) === 'AbortError' ? '超时' : (e && e.message) || e))); });
+    });
+  }
+  function tick() {
+    fetchJson('/v1/internal/client-ips?_=' + Date.now(), 8000).then(function (d) {
+      if (d && d.ok && Array.isArray(d.ips)) { err = null; safeRun(function () { applyState(d); }, 'applyState'); }
+      else err = (d && d.error) || '响应异常';
+    }, function (e) { err = (e && e.message) || String(e); })
+      .catch(function () {})
+      .finally(schedule);
+  }
+  function ivMs() { var v = parseInt(document.getElementById('iv').value, 10); return isNaN(v) ? 3000 : v; }
+  function schedule() {
+    clearTimeout(timer);
+    var ms = ivMs();
+    if (!ms) return;   // 暂停
+    timer = setTimeout(function () { if (!document.hidden) tick(); else schedule(); }, ms);
+  }
+  document.getElementById('iv').addEventListener('change', schedule);
+  function wake() { if (!document.hidden && ivMs()) tick(); }
+  ['visibilitychange', 'pageshow', 'focus', 'online'].forEach(function (ev) { window.addEventListener(ev, wake); });
+  // 「最近活跃」相对时间每秒本地推进（不重发请求；后台标签不重绘）
+  setInterval(function () { if (!document.hidden) safeRun(renderTable, 'relTick'); }, 1000);
+  tick();
+})();
+</script>
+</body>
+</html>

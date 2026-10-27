@@ -1,5 +1,21 @@
 # 更新日志
 
+## 2026-10-27 [client-ips 1027] 调用方 IP 与归属地（已上线 .127，页面 r49）
+- 新标签「调用方 IP」：显示谁在调用模型 API——IP、网络类型（内网/回环/公网）、归属地（国家/省市/运营商）、模型调用数、探活数、最近活跃时间、来源（直连引擎/经控制台代理），行展开看路径明细与状态码分布。
+- 数据源两路合并：①引擎访问日志增量 tail（uvicorn 行，覆盖直连引擎端口的全部调用方；日志行无逐行时间戳，lastSeen=控制台观测时刻 ±3s；首次运行从日志尾 ≤4MB 回填计数标「历史」；日志文件跟随 getVllmLogSource argv/fd 判据链并缓存 30s，fallback/docker/tty 来源不解析防陈年日志冒充）②控制台 /v1 代理入口记真实客户端 IP（引擎侧只见 127.0.0.1；代理生成请求 pending 对账去重不双计）。
+- 归属地：回环/私网/CGNAT/链路本地走本地规则不外查；公网 IPv4 走 ip-api.com 中文批量解析（≤50/批、7 天缓存、失败退避 10 分钟）；IPv6 公网如实标「免费库不解析」。
+- 后端 [client-ips 1027] 模块：GET /v1/internal/client-ips、POST .../cmd {clear|save}（口令拦截同规）；配置 client-ips.json 热加载（activeWindowSec/retentionDays/maxIps/geoEnabled）；计数落盘 client-ips-state.json（重启不丢），归属地缓存 client-ips-geo.json；前端页 static/client-ips.html（iframe 懒加载口径同 crash/compute，自愈轮询）。
+- 同窗上线 10-17 遗留的 kvoff-simple-metric 后端段（simple_kv_offload_* 指标族，前端 r46 已双态兼容）；并按「线上为基线」把 10-22 的 restore160/kvoff96-fix/heapoffload-guard 三处线上独有改动补入库（分叉清零）。
+- 部署验证：重启 dsh-console 后引擎 pid 15012 未变（引擎属 fnx-18420-watchdog cgroup，控制台重启不连坐）；线上回填即抓到 192.168.1.36（6324 次模型调用·内网）与公网 IP 110.184.28.37（1 次 chat 调用→解析为 中国 四川 成都·Chinanet）。
+- 回滚：deploy/{server.js,index.html}.bak-cip-1027-<ts> + 删 static/client-ips.html。
+
+## 2026-10-25 [gpu-powerlog 1025] GPU 高功耗记录（已上线 .127，页面 r48）
+- 硬件监视页新卡：任一张 GPU 功耗 ≥ 阈值（默认 300W 可配）即记越阈快照——各单卡功耗 / GPU 合计 / 当时整机估算总功耗（与能耗页同口径，采样未就绪记 -- 不冒充 0）/ 利用率 / 温度 / SM 频率。
+- 判定复用 1s GPU 采样帧（零新增 nvidia-smi 压力，盲态 >15s 不判定）；同卡去抖 minIntervalSec（默认 5s）防洪泛；落盘 gpu-power-log.jsonl（重启不丢，环形 maxRecords 摊还截尾）；配置 gpu-powerlog.json mtime 热加载、缺省启用。
+- API：GET /v1/internal/power-log（状态+最近 120 条），POST .../cmd {save|clear}（口令拦截同规）。
+- 部署 = 线上基线 + 本模块（diff 审清：线上含 10-22 OOM 加固、本地 kvoff-simple-metric 段仍未上线未混提）；回滚 deploy/{server.js,index.html}.bak-powerlog-1025-<ts>。
+- 线上实测：60W 降阈造测即出真实快照（GPU0 130W/GPU1 180W/GPU2 39W、GPU 合计 349.6W、整机 503.7W），复原 300W 后保留。
+
 本文件记录对外发布的版本变更。版本号遵循语义化版本，标签形如 `v1.0.0`。
 
 ---

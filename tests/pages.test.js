@@ -138,6 +138,22 @@ const scenarios = {
       fetch: (u) => (u.indexOf('/v1/internal/gpu') >= 0 && u.indexOf('gpu-ctl') < 0 ? { supported: false, gpus: [], error: '熔断' } : live(u)),
       assert: (w, env, r) => (r.fetchCalls.filter((x) => x.indexOf('/v1/internal/gpu?') >= 0).length >= 5 ? null : ['空帧后轮询停止']) },
   ],
+  // [client-ips 1027] 「调用方 IP」标签内嵌页（部署在 static/client-ips.html）：
+  // 数据源 GET /v1/internal/client-ips（引擎访问日志 tail + /v1 代理入口聚合，含归属地）。
+  'client-ips.html': [
+    { name: '加载 + 轮询（真实载荷形态）', ms: 15000, fetch: live,
+      assert: (w, env, r) => {
+        const bad = [];
+        if (r.renders.text + r.renders.html < 10) bad.push('15s 内几乎没有渲染写入（轮询链可能没跑起来）');
+        if (!r.fetchCalls.some((x) => x.indexOf('/v1/internal/client-ips?') >= 0)) bad.push('未轮询 /v1/internal/client-ips');
+        return bad;
+      } },
+    { name: '全部接口 500 → 保留画面 + 黄条，轮询不得停', ms: 20000, fetch: () => 'fail',
+      assert: (w, env, r) => (r.fetchCalls.filter((x) => x.indexOf('/v1/internal/client-ips') >= 0).length >= 5 ? null : ['接口 500 后轮询停止（fetch 仅 ' + r.fetchCalls.length + ' 次）']) },
+    { name: 'ips=[]（刚清空统计）→ 空态提示且轮询继续', ms: 15000,
+      fetch: (u) => (u.indexOf('/v1/internal/client-ips') >= 0 ? { ok: true, now: Date.now(), windowSec: 60, totals: { unique: 0, active: 0, modelTotal: 0, probeTotal: 0, publicN: 0, modelIps: 0 }, ips: [], meta: { logFile: 'x.log', logKind: 'file', proxyPending: 0, geoPending: 0, geoEnabled: true, seeded: true, config: { activeWindowSec: 60, retentionDays: 30, maxIps: 800, geoEnabled: true } } } : live(u)),
+      assert: (w, env, r) => (r.fetchCalls.filter((x) => x.indexOf('/v1/internal/client-ips') >= 0).length >= 4 ? null : ['空列表后轮询停止']) },
+  ],
   'mobile.html': [{ name: '加载 + 轮询', ms: 15000, fetch: live }],
   // [strata-remote-monitor 1008] 「Strata 监控」标签内嵌页：克隆 .38:8080 Web UI Monitor。
   // fixture strata-remote.json = 控制台代理 GET /v1/internal/strata-remote 的真实载荷

@@ -1,0 +1,46 @@
+{
+  "ok": true,
+  "hardware_note": "显卡硬件/驱动不提供出厂累计通电时间（NVML/nvidia-smi 无此字段，10-29 实测核对），以下为系统开机记录可追溯口径",
+  "coverage_from": 1789774367000,
+  "machine_power_on_sec": 2908110,
+  "current_boot_since": 1793262133000,
+  "boots_count": 218,
+  "sources": {
+    "wtmp": true,
+    "journal": true
+  },
+  "refreshed_at": 1793267127267,
+  "error": null,
+  "gpus": [
+    {
+      "uuid": "GPU-75e3aa88-a4b8-7e63-d5bd-62e2f71c1285",
+      "index": 0,
+      "name": "NVIDIA CMP 170HX",
+      "first_seen_at": 1767226652000,
+      "first_seen_mode": "coverage",
+      "last_seen_at": 1793267041905,
+      "present": true,
+      "power_on_sec": 2908110
+    },
+    {
+      "uuid": "GPU-8383147b-bdf8-dec5-f0eb-171589d85823",
+      "index": 1,
+      "name": "NVIDIA CMP 170HX",
+      "first_seen_at": 1767226652000,
+      "first_seen_mode": "coverage",
+      "last_seen_at": 1793267041905,
+      "present": true,
+      "power_on_sec": 2908110
+    },
+    {
+      "uuid": "GPU-bad03bee-db2a-c7bd-cb66-a0e7ea0280fd",
+      "index": 2,
+      "name": "NVIDIA CMP 170HX",
+      "first_seen_at": 1767226652000,
+      "first_seen_mode": "coverage",
+      "last_seen_at": 1793267041905,
+      "present": true,
+      "power_on_sec": 2908110
+    }
+  ]
+}

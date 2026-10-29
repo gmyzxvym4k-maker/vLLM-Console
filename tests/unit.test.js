@@ -234,7 +234,7 @@ async function ta(name, fn) {
   });
 
   // ============ 9. GPU 累计通电时间解析（[gpu-uptime 1029]：wtmp∪journal 开机区间）============
-  const UP = load(['UP_DATE_WTMP_RE', 'UP_DATE_ISO_RE', 'upParseWtmp', 'upParseJournal', 'upMergeIv', 'upSum']);
+  const UP = load(['UP_DATE_WTMP_RE', 'UP_DATE_ISO_RE', 'upParseWtmp', 'upParseJournal', 'upMergeIv', 'upSum', 'upLiveIv']);
   await ta('upParseWtmp：still running 延到 now、干净配对取 end、忽略 shutdown/wtmp begins 行', async () => {
     const now = Date.parse('2026-10-29T17:00:00');
     const out = [
@@ -303,6 +303,19 @@ async function ta(name, fn) {
     const total = UP.upSum(iv, 0, now);
     const expect = (now - Date.parse('2026-10-29T16:22:13')) / 1000;
     return Math.abs(total - expect) < 1 || ('总时长错：' + total + ' vs ' + expect);
+  });
+  await ta('upLiveIv：liveTail 延尾到 now+起点可提前（10-29 修复：区间表 10min 冻结/本次开机 -- 的核）', async () => {
+    const now = Date.parse('2026-10-29T17:10:00');
+    const iv = [{ s: Date.parse('2026-10-29T08:00:00'), e: Date.parse('2026-10-29T10:00:00') }, { s: Date.parse('2026-10-29T16:22:13'), e: Date.parse('2026-10-29T17:00:00') }];
+    const live = UP.upLiveIv(iv, true, now, Date.parse('2026-10-29T16:22:10'));
+    if (live.length !== 2) return '区间数应不变';
+    if (live[0].s !== iv[0].s || live[0].e !== iv[0].e) return '非尾段不得改动';
+    if (live[1].e !== now) return '尾段未延到 now';
+    if (live[1].s !== Date.parse('2026-10-29T16:22:10')) return 'tailStart 未生效（应提前到 /proc/uptime 反推时刻）';
+    // liveTail=false 原样返回；tailStart 不早于原起点时不采纳
+    if (UP.upLiveIv(iv, false, now, null) !== iv) return '非 live 应原样';
+    const keep = UP.upLiveIv(iv, true, now, Date.parse('2026-10-29T16:30:00'));
+    return keep[1].s === iv[1].s || 'tailStart 晚于原起点不应生效';
   });
 
   // ============ 报告 ============

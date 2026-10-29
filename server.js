@@ -11523,6 +11523,19 @@ function upSum(iv, from, to) {
   }
   return sec;
 }
+// 实时尾段：区间表 10min 一采，当前这次开机的"结束"钉在采样时刻——不处理则整机累计通电
+// 两次采样间冻结（最长 10min 偏差）、"本次开机"超 90s 直接显示 --（10-29 用户实锤"时间没对"）。
+// liveTail=true 时把最后区间延到 now；tailStart 提供更精确起点时取更早者
+// （/proc/uptime 反推的内核启动时刻 == uptime -s，比 wtmp 记录写入时刻早数秒）。纯函数便于单测。
+function upLiveIv(iv, liveTail, now, tailStart) {
+  if (!iv || !iv.length) return [];
+  if (!liveTail) return iv;
+  const out = iv.slice(0, iv.length - 1);
+  const last = iv[iv.length - 1];
+  const s = (tailStart != null && Number.isFinite(tailStart) && tailStart < last.s) ? tailStart : last.s;
+  out.push({ s, e: Math.max(last.e, now) });
+  return out;
+}
 let __upFrame = null;
 let __upBuilding = false;
 function uptimeRefresh() {
@@ -11551,11 +11564,14 @@ function uptimeRefresh() {
       return;
     }
     const wtmpBoots = w ? String(w).split('\n').filter((l) => /^reboot\s/.test(l)).length : 0;
+    // 尾段是否"此刻仍通电"：合并后最后区间的 end 贴在采样时刻（来自 still running / journal idx 0 的延到 now 逻辑）
+    const liveTail = (now - iv[iv.length - 1].e) < 1500;
     __upFrame = {
       iv,
       coverage_from: iv[0].s,
       boots_count: wtmpBoots || iv.length,
       sources: { wtmp: !!w, journal: !!j },
+      live_tail: liveTail,
       refreshed_at: now,
       error: null,
     };
@@ -11584,8 +11600,22 @@ function uptimeStatus() {
   const now = Date.now();
   const frame = __upFrame;
   const st = uptimeState();
-  const iv = (frame && frame.iv) || [];
+  const iv0 = (frame && frame.iv) || [];
   const cov = (frame && frame.coverage_from) || now;
+  // 当前开机精确起点：/proc/uptime 反推的内核启动时刻（== uptime -s）。wtmp/journal 的 boot 记录
+  // 是启动过程中写入的，晚数秒——用户拿 uptime -s 对照会看到"时间没对"（10-29 实锤）。
+  // procfs 读取微秒级无 IO，同步读可接受；macOS 开发机无 /proc → catch 后如实回落 wtmp 起点。
+  let tailStart = null;
+  if (frame && frame.live_tail && iv0.length) {
+    try {
+      const up = parseFloat(String(fs.readFileSync('/proc/uptime', 'utf8')).split(/\s+/)[0]);
+      if (Number.isFinite(up) && up > 0) {
+        const bs = now - up * 1000;
+        if (bs > iv0[iv0.length - 1].s - 6 * 3600000 && bs < iv0[iv0.length - 1].s) tailStart = bs; // 只允许把起点提前几秒~小时级，异常值不采纳
+      }
+    } catch (e) { /* 无 /proc：保持区间起点 */ }
+  }
+  const iv = upLiveIv(iv0, !!(frame && frame.live_tail), now, tailStart);
   const gs = global.__gpuStatic;
   const present = gs && Array.isArray(gs.gpus) && gs.gpus.length ? gs.gpus : null;
   let dirty = false;
@@ -11628,15 +11658,20 @@ function uptimeStatus() {
       power_on_sec: iv.length ? Math.round(upSum(iv, from, now)) : null,
     };
   }).sort((a, b) => (a.index == null ? 99 : a.index) - (b.index == null ? 99 : b.index));
+  const machine = iv.length ? Math.round(upSum(iv, iv[0].s, now)) : null;
+  const windowSec = iv.length ? Math.round((now - iv[0].s) / 1000) : null;
   const lastIv = iv.length ? iv[iv.length - 1] : null;
   return {
     ok: true,
     hardware_note: '显卡硬件/驱动不提供出厂累计通电时间（NVML/nvidia-smi 无此字段，10-29 实测核对），以下为系统开机记录可追溯口径',
     coverage_from: frame ? frame.coverage_from : null,
-    machine_power_on_sec: iv.length ? Math.round(upSum(iv, iv[0].s, now)) : null,
-    current_boot_since: (lastIv && now - lastIv.e < 90000) ? lastIv.s : null,
+    machine_power_on_sec: machine,
+    window_sec: windowSec,
+    downtime_sec: (machine != null && windowSec != null) ? windowSec - machine : null,
+    current_boot_since: (frame && frame.live_tail && lastIv) ? lastIv.s : null,
     boots_count: frame ? frame.boots_count : null,
     sources: frame ? frame.sources : null,
+    live_tail: !!(frame && frame.live_tail),
     refreshed_at: frame ? frame.refreshed_at : null,
     error: frame ? (frame.error || null) : '尚未完成首次采集',
     gpus,

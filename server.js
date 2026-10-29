@@ -11448,21 +11448,23 @@ if (!global.__powerLogTimer) {
 }
 // ==== [gpu-powerlog 1025] END module ====
 
-// ==== [gpu-uptime 1029] GPU 累计通电时间（系统可追溯口径）====
+// ==== [gpu-uptime 1029] GPU 累计通电时间（出厂真值 + 系统可追溯双口径）====
 // 需求：显示显卡"出厂到现在"的累计通电时间。
-// 口径铁律（10-29 实测）：NVIDIA CMP/消费级卡不提供出厂累计通电时间——`nvidia-smi -q` 全文与
-//   `--help-query-gpu` 均无任何通电时长字段（唯一 lifetime 语义是 ECC aggregate 错误计数、无时间轴；
-//   power_smoothing.hw_lifetime_remaining_percent 是功耗平滑电路寿命百分比，不是通电时间）。
-//   本模块输出"系统开机记录可追溯"的最大范围并如实标注口径，绝不让估算值冒充出厂真值：
-//  · 开机区间表 = wtmp（`last -x -F reboot`：干净配对 end=关机时刻；"still running"=当前开机延到 now）
-//    ∪ journal（`journalctl --list-boots`：wtmp 轮转/截断时兜底；idx 0 的尾行滞后于断电，延到 now）。
-//    两源 ll 用户均可直读（journal 靠 adm 组、wtmp 全局可读），零提权、零 nvidia-smi 压力。
-//  · 整机通电 = Σ 合并去重叠后的区间；逐卡通电 = Σ 区间 ∩ [首见时刻, now]。
-//  · 首见时间按 GPU UUID 持久化 gpu-uptime.json：模块首跑即在场的卡按追溯起点计（更早历史无法
-//    按卡区分，如实标 first_seen_mode=coverage）；此后新出现的 UUID 按实测时刻计（observed）——
-//    换卡后新卡从换卡时刻起算，旧卡保留历史（present=false）。
-//  · 刷新：启动即刷 + 60s 一拍（区间表 10min 重采；GPU 在场跟踪每分钟维护，脏才写盘）。
-//    采集走放弃式 spawnCollect（countFail=false，不连坐 GPU 熔断，永不阻塞）；两源同时无数据
+// 口径修正（10-29 当日二版，用户实锤我首版漏检）：**出厂真值可读**——
+//   `nvidia-smi --query-gpu=bbx.time_run`（= -q 的 "Inforom Time Data → Time Run"，NVML
+//   nvmlDeviceGetBBXTimeData）是存于显卡 INFOROM 的终身通电计数器，断电不丢、逐卡独立、
+//   驱动 610.43.03 实测支持（本机三卡 143.2/165.2/125.0 天，与 08-21 历史读数跨月连续自洽）。
+//   首版误判根因：grep 关键词用了 hours/uptime/lifetime，字段名 "Time Run" 全部不中——
+//   查"有没有某字段"必须多名字变体+通读全文，不能只信一轮关键词检索。
+//  · 主口径 = bbx.time_run（power_on_basis=inforom）；驱动不支持/字段 N/A 时回落
+//    wtmp∪journal 系统开机区间口径（power_on_basis=system），两口径同时展示供对账。
+//  · 系统口径细节：开机区间表 = wtmp（`last -x -F reboot`：干净配对 end=关机时刻；"still running"=当前开机延到 now）
+//    ∪ journal（`journalctl --list-boots`：wtmp 轮转/截断时兜底；idx 0 的尾行滞后于断电，延到 now），
+//    两源 ll 用户均可直读（journal 靠 adm 组、wtmp 全局可读），零提权。
+//  · 整机通电 = Σ 合并去重叠后的区间；逐卡系统口径 = Σ 区间 ∩ [首见时刻, now]。
+//  · 首见时间按 GPU UUID 持久化 gpu-uptime.json（换卡区分；首跑在场=coverage 按追溯起点，新 UUID=observed）。
+//  · 刷新：启动即刷 + 60s 一拍（区间表与 time_run 10min 重采；GPU 在场跟踪每分钟维护，脏才写盘）。
+//    采集走放弃式 spawnCollect/gpuQuery（09-20 铁律通道，永不阻塞）；两源同时无数据
 //    保留上一帧（宁旧勿空，10-07 教训）；数据缺失一律 null，不以 0 冒充。
 //  · API：GET /v1/internal/gpu-uptime（只读，无 POST）。日志前缀 [gpu-uptime]。
 const UPTIME_STATE_PATH = path.join(__dirname, 'gpu-uptime.json');
@@ -11523,6 +11525,21 @@ function upSum(iv, from, to) {
   }
   return sec;
 }
+// 出厂真值解析：`nvidia-smi --query-gpu=index,uuid,bbx.time_run --format=csv,noheader,nounits`
+// 行如 "0, GPU-75e3aa88-…, 12372363"；字段不支持时整条查询报错（gpuQuery 回 null），
+// 个别卡 N/A 时该列无数字（gpuNum 归 null）——一律以"缺即无"处理，不以 0 冒充。
+function upParseTimeRun(out) {
+  const map = {};
+  if (!out) return map;
+  for (const line of String(out).split('\n')) {
+    const cols = line.split(',').map((s) => s.trim());
+    if (cols.length < 3) continue;
+    const uuid = cols[1];
+    const sec = parseFloat(String(cols[2]).replace(/[^0-9.]/g, ''));
+    if (/^GPU-/.test(uuid) && Number.isFinite(sec) && sec > 0) map[uuid] = Math.round(sec);
+  }
+  return map;
+}
 // 实时尾段：区间表 10min 一采，当前这次开机的"结束"钉在采样时刻——不处理则整机累计通电
 // 两次采样间冻结（最长 10min 偏差）、"本次开机"超 90s 直接显示 --（10-29 用户实锤"时间没对"）。
 // liveTail=true 时把最后区间延到 now；tailStart 提供更精确起点时取更早者
@@ -11547,7 +11564,8 @@ function uptimeRefresh() {
   Promise.all([
     spawnCollect('env', ['LC_ALL=C', 'last', '-x', '-F', 'reboot'], 8000, false),
     spawnCollect('env', ['LC_ALL=C', 'journalctl', '--list-boots', '--no-pager'], 8000, false),
-  ]).then(([w, j]) => {
+    gpuQuery(['--query-gpu=index,uuid,bbx.time_run', '--format=csv,noheader,nounits'], GPU_Q_MS_LIVE),
+  ]).then(([w, j, tr]) => {
     // 时钟漂移下限（10-29 线上实锤）：该机 BIOS RTC 曾复位，NTP 同步前写入的 boot 记录带假时间戳
     // （"Thu Jan  1 08:17:32 2026 - Sun Sep 20 16:20:12 2026 (262+08:02)" 一行虚增 262 天通电）。
     // wtmp 文件真实起点（wtmp begins 行）之前的区间起点一律钳到该下限——钳出的窗口与同期真实开机
@@ -11556,24 +11574,26 @@ function uptimeRefresh() {
     const bm = w ? String(w).match(/^wtmp begins (.*)$/m) : null;
     if (bm) { const t = Date.parse(bm[1]); if (Number.isFinite(t)) floor = t; }
     const iv = upMergeIv(upParseWtmp(w, now).concat(upParseJournal(j, now)), now, floor);
-    if (!iv.length) {
-      // 两源同时失败/解析为空：保留上一帧（宁旧勿空），只挂 error
-      if (__upFrame) __upFrame = Object.assign({}, __upFrame, { error: 'last/journalctl 本次均无有效数据，显示上一帧', refreshed_at: now });
-      else __upFrame = { iv: [], coverage_from: null, boots_count: null, sources: { wtmp: !!w, journal: !!j }, refreshed_at: now, error: 'last/journalctl 均无有效数据' };
-      console.warn('[gpu-uptime] 本次采集无有效开机区间（保留上一帧）');
+    const trMap = upParseTimeRun(tr);
+    if (!iv.length && !Object.keys(trMap).length) {
+      // 全部数据源同时失败：保留上一帧（宁旧勿空），只挂 error
+      if (__upFrame) __upFrame = Object.assign({}, __upFrame, { error: 'last/journalctl/bbx.time_run 本次均无有效数据，显示上一帧', refreshed_at: now });
+      else __upFrame = { iv: [], coverage_from: null, boots_count: null, sources: { wtmp: !!w, journal: !!j, time_run: false }, refreshed_at: now, error: 'last/journalctl/bbx.time_run 均无有效数据' };
+      console.warn('[gpu-uptime] 本次采集无有效数据（保留上一帧）');
       return;
     }
     const wtmpBoots = w ? String(w).split('\n').filter((l) => /^reboot\s/.test(l)).length : 0;
     // 尾段是否"此刻仍通电"：合并后最后区间的 end 贴在采样时刻（来自 still running / journal idx 0 的延到 now 逻辑）
-    const liveTail = (now - iv[iv.length - 1].e) < 1500;
+    const liveTail = iv.length > 0 && (now - iv[iv.length - 1].e) < 1500;
     __upFrame = {
       iv,
-      coverage_from: iv[0].s,
+      coverage_from: iv.length ? iv[0].s : null,
       boots_count: wtmpBoots || iv.length,
-      sources: { wtmp: !!w, journal: !!j },
+      sources: { wtmp: !!w, journal: !!j, time_run: Object.keys(trMap).length > 0 },
+      time_run: trMap,
       live_tail: liveTail,
       refreshed_at: now,
-      error: null,
+      error: iv.length ? null : '系统开机区间不可用（逐卡出厂口径不受影响）',
     };
   }).catch((e) => {
     console.warn('[gpu-uptime] 刷新异常（忽略）：' + String((e && e.message) || e));
@@ -11647,6 +11667,8 @@ function uptimeStatus() {
   const gpus = Object.keys(st.gpus).map((uuid) => {
     const r = st.gpus[uuid] || {};
     const from = Math.max(r.first_seen_at || cov, iv.length ? iv[0].s : cov);
+    const sysSec = iv.length ? Math.round(upSum(iv, from, now)) : null;
+    const trSec = (frame && frame.time_run && frame.time_run[uuid] != null) ? frame.time_run[uuid] : null;
     return {
       uuid,
       index: r.index != null ? r.index : null,
@@ -11655,7 +11677,10 @@ function uptimeStatus() {
       first_seen_mode: r.first_seen_mode || 'observed',
       last_seen_at: r.last_seen_at || null,
       present: !!(present && present.some((g) => g && g.uuid === uuid)),
-      power_on_sec: iv.length ? Math.round(upSum(iv, from, now)) : null,
+      power_on_sec: trSec != null ? trSec : sysSec,          // 主值：出厂真值优先，缺则系统口径
+      power_on_basis: trSec != null ? 'inforom' : (sysSec != null ? 'system' : null),
+      time_run_sec: trSec,                                    // 出厂真值（bbx.time_run，Inforom Time Run）
+      system_power_on_sec: sysSec,                            // 系统可追溯口径（开机区间∩首见，供对账）
     };
   }).sort((a, b) => (a.index == null ? 99 : a.index) - (b.index == null ? 99 : b.index));
   const machine = iv.length ? Math.round(upSum(iv, iv[0].s, now)) : null;
@@ -11663,7 +11688,7 @@ function uptimeStatus() {
   const lastIv = iv.length ? iv[iv.length - 1] : null;
   return {
     ok: true,
-    hardware_note: '显卡硬件/驱动不提供出厂累计通电时间（NVML/nvidia-smi 无此字段，10-29 实测核对），以下为系统开机记录可追溯口径',
+    hardware_note: '逐卡主值=显卡 INFOROM 终身通电计数器（nvidia-smi bbx.time_run / Inforom Time Data → Time Run，出厂至今、断电不丢）；系统开机记录口径（wtmp∪journal）作对账与回落，见各卡 power_on_basis',
     coverage_from: frame ? frame.coverage_from : null,
     machine_power_on_sec: machine,
     window_sec: windowSec,

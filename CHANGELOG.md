@@ -1,5 +1,14 @@
 # 更新日志
 
+## 2026-10-29 [gpu-uptime-inforom 1029] 通电时间主值切换出厂真值口径（已上线 .127，页面 r52）
+- **纠错**：首版（r50/r51）误判"硬件不提供出厂累计通电时间"。用户提示"之前能精确查到每张显卡通电时间"，翻查 08-21 历史会话转录（`~/.dsh/sessions/**/session.jsonl.zstd` 用 python zstandard 解压检索）实锤——出厂真值一直可读：`nvidia-smi --query-gpu=bbx.time_run`（= `-q` 的 `Inforom Time Data → Time Run`，NVML `nvmlDeviceGetBBXTimeData`），是存于显卡 INFOROM 的终身通电计数器，断电不丢、逐卡独立、驱动 610.43.03 实测支持。
+- **漏检根因（教训）**：首版用 `grep -iE 'hours|uptime|lifetime|power.on'` 检索 nvidia-smi 输出，而该字段名是 **"Time Run"**（`bbx.time_run`），一个关键词都没命中，于是错误地下了"硬件不提供"的结论。查字段存在性必须多名字变体 + 通读 `-q` 全文 + 翻历史会话，不能只信一轮关键词检索。
+- 逐卡主值改为 INFOROM 出厂真值（power_on_basis=inforom）；wtmp∪journal 系统开机区间口径降为"系统口径对账"列，并显示 **出厂真值 − 系统口径 = 该卡来本机之前的通电时间**（>1 天才显示）。驱动不支持 bbx.time_run 时主值自动回落系统口径并标黄"系统口径"，绝不以缺省值冒充。
+- 本机三卡出厂通电实测：GPU0=143.2 天 / GPU1=165.2 天 / GPU2=125.0 天（均为二手矿卡，来本机之前已通电 91~132 天）；整机系统口径 33.7 天不变（主板无出厂计数器，仍用开机记录口径）。
+- 后端 uptimeRefresh 增加第三数据源 `gpuQuery(['--query-gpu=index,uuid,bbx.time_run',...])`（走 09-20 铁律放弃式熔断通道），upParseTimeRun 解析（N/A/0/非法值一律缺省不入库，宁缺毋假）；全源失败才保留上一帧。
+- 回归：unit 48/0（+2：upParseTimeRun 正常解析含带单位列、N/A/0/垃圾行不冒充）；pages 22 场景 0 失败（真实载荷场景断言升级为出厂真值徽标 + 系统口径对账"之前 N 天"）；fixture 重抓线上真实帧（含 time_run_sec/system_power_on_sec/power_on_basis）。
+- 卡内脚注固化勘误说明。回滚：deploy/{server.js,index.html}.bak-gpuuptime-1029-1743。
+
 ## 2026-10-29 [gpu-uptime-live 1029] 通电时间精度修复（已上线 .127，页面 r51）
 - 用户实锤"时间没对，日期没准确，需要精确的时间"，三处根因一次修完：
 - ① **实时尾段**：区间表 10min 一采，当前开机区间 end 钉在采样时刻——整机累计通电两次采样间冻结（最长 10min 偏差、越看越旧），"本次开机"因 `now-e<90s` 判据在每次重采 90 秒后直接显示 --。后端区间帧加 live_tail 标记，uptimeStatus 读取时把尾段延到 now（纯函数 upLiveIv 便于单测），逐秒实时。

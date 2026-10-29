@@ -118,7 +118,8 @@ const scenarios = {
         const rows = w.document.getElementById('upRows').innerHTML || '';
         if (rows.indexOf('CMP 170HX') < 0) bad.push('upRows 未渲染逐卡行（实得 ' + JSON.stringify(rows.slice(0, 80)) + '）');
         if (rows.indexOf('秒') < 0) bad.push('upRows 时长未到秒精度');
-        if (rows.indexOf('上线即在场') < 0) bad.push('coverage 首见口径未显示');
+        if (rows.indexOf('出厂真值·Inforom') < 0) bad.push('inforom 主口径徽标未显示');
+        if (rows.indexOf('之前') < 0) bad.push('系统口径对账（来本机之前）未显示');
         const sum = w.document.getElementById('upSummary').innerHTML || '';
         if (sum.indexOf('追溯起点') < 0) bad.push('upSummary 缺追溯起点');
         if (!/20\d\d-\d\d-\d\d \d\d:\d\d:\d\d/.test(sum)) bad.push('时间戳未带年份到秒（实得 ' + JSON.stringify(sum.slice(0, 140)) + '）');

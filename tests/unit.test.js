@@ -234,7 +234,7 @@ async function ta(name, fn) {
   });
 
   // ============ 9. GPU 累计通电时间解析（[gpu-uptime 1029]：wtmp∪journal 开机区间）============
-  const UP = load(['UP_DATE_WTMP_RE', 'UP_DATE_ISO_RE', 'upParseWtmp', 'upParseJournal', 'upMergeIv', 'upSum', 'upLiveIv']);
+  const UP = load(['UP_DATE_WTMP_RE', 'UP_DATE_ISO_RE', 'upParseWtmp', 'upParseJournal', 'upMergeIv', 'upSum', 'upLiveIv', 'upParseTimeRun']);
   await ta('upParseWtmp：still running 延到 now、干净配对取 end、忽略 shutdown/wtmp begins 行', async () => {
     const now = Date.parse('2026-10-29T17:00:00');
     const out = [
@@ -316,6 +316,21 @@ async function ta(name, fn) {
     if (UP.upLiveIv(iv, false, now, null) !== iv) return '非 live 应原样';
     const keep = UP.upLiveIv(iv, true, now, Date.parse('2026-10-29T16:30:00'));
     return keep[1].s === iv[1].s || 'tailStart 晚于原起点不应生效';
+  });
+  await ta('upParseTimeRun：bbx.time_run 正常解析（出厂真值主口径，10-29 用户实锤字段名 Time Run）', async () => {
+    const out = '0, GPU-75e3aa88-a4b8-7e63-d5bd-62e2f71c1285, 12372363\n1, GPU-8383147b-bdf8-dec5-f0eb-171589d85823, 14276056 seconds\n';
+    const m = UP.upParseTimeRun(out);
+    if (m['GPU-75e3aa88-a4b8-7e63-d5bd-62e2f71c1285'] !== 12372363) return '纯数字列解析错：' + JSON.stringify(m);
+    if (m['GPU-8383147b-bdf8-dec5-f0eb-171589d85823'] !== 14276056) return '带单位列解析错';
+    return true;
+  });
+  await ta('upParseTimeRun：null/空行/N-A/非法值一律缺省不冒充（宁缺毋假）', async () => {
+    if (Object.keys(UP.upParseTimeRun(null)).length !== 0) return 'null 应得空表';
+    const m = UP.upParseTimeRun('0, GPU-aaa, [N/A]\n1, GPU-bbb, 0\ngarbage line\n2, GPU-ccc, 3600\n');
+    if (m['GPU-aaa'] != null) return 'N/A 不应入库';
+    if (m['GPU-bbb'] != null) return '0 秒（无数字）不应入库';
+    if (m['GPU-ccc'] !== 3600) return '正常行应入库';
+    return true;
   });
 
   // ============ 报告 ============

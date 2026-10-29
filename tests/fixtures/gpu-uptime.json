@@ -1,18 +1,19 @@
 {
   "ok": true,
-  "hardware_note": "显卡硬件/驱动不提供出厂累计通电时间（NVML/nvidia-smi 无此字段，10-29 实测核对），以下为系统开机记录可追溯口径",
+  "hardware_note": "逐卡主值=显卡 INFOROM 终身通电计数器（nvidia-smi bbx.time_run / Inforom Time Data → Time Run，出厂至今、断电不丢）；系统开机记录口径（wtmp∪journal）作对账与回落，见各卡 power_on_basis",
   "coverage_from": 1789774367000,
-  "machine_power_on_sec": 2908810,
-  "window_sec": 3493457,
+  "machine_power_on_sec": 2909462,
+  "window_sec": 3494109,
   "downtime_sec": 584647,
-  "current_boot_since": 1793262130444,
+  "current_boot_since": 1793262130449,
   "boots_count": 218,
   "sources": {
     "wtmp": true,
-    "journal": true
+    "journal": true,
+    "time_run": true
   },
   "live_tail": true,
-  "refreshed_at": 1793267816417,
+  "refreshed_at": 1793268466174,
   "error": null,
   "gpus": [
     {
@@ -21,9 +22,12 @@
       "name": "NVIDIA CMP 170HX",
       "first_seen_at": 1767226652000,
       "first_seen_mode": "coverage",
-      "last_seen_at": 1793267667284,
+      "last_seen_at": 1793268280371,
       "present": true,
-      "power_on_sec": 2908810
+      "power_on_sec": 12372468,
+      "power_on_basis": "inforom",
+      "time_run_sec": 12372468,
+      "system_power_on_sec": 2909462
     },
     {
       "uuid": "GPU-8383147b-bdf8-dec5-f0eb-171589d85823",
@@ -31,9 +35,12 @@
       "name": "NVIDIA CMP 170HX",
       "first_seen_at": 1767226652000,
       "first_seen_mode": "coverage",
-      "last_seen_at": 1793267667284,
+      "last_seen_at": 1793268280371,
       "present": true,
-      "power_on_sec": 2908810
+      "power_on_sec": 14276161,
+      "power_on_basis": "inforom",
+      "time_run_sec": 14276161,
+      "system_power_on_sec": 2909462
     },
     {
       "uuid": "GPU-bad03bee-db2a-c7bd-cb66-a0e7ea0280fd",
@@ -41,9 +48,12 @@
       "name": "NVIDIA CMP 170HX",
       "first_seen_at": 1767226652000,
       "first_seen_mode": "coverage",
-      "last_seen_at": 1793267667284,
+      "last_seen_at": 1793268280371,
       "present": true,
-      "power_on_sec": 2908810
+      "power_on_sec": 10802009,
+      "power_on_basis": "inforom",
+      "time_run_sec": 10802009,
+      "system_power_on_sec": 2909462
     }
   ]
 }

@@ -11448,6 +11448,220 @@ if (!global.__powerLogTimer) {
 }
 // ==== [gpu-powerlog 1025] END module ====
 
+// ==== [gpu-uptime 1029] GPU 累计通电时间（系统可追溯口径）====
+// 需求：显示显卡"出厂到现在"的累计通电时间。
+// 口径铁律（10-29 实测）：NVIDIA CMP/消费级卡不提供出厂累计通电时间——`nvidia-smi -q` 全文与
+//   `--help-query-gpu` 均无任何通电时长字段（唯一 lifetime 语义是 ECC aggregate 错误计数、无时间轴；
+//   power_smoothing.hw_lifetime_remaining_percent 是功耗平滑电路寿命百分比，不是通电时间）。
+//   本模块输出"系统开机记录可追溯"的最大范围并如实标注口径，绝不让估算值冒充出厂真值：
+//  · 开机区间表 = wtmp（`last -x -F reboot`：干净配对 end=关机时刻；"still running"=当前开机延到 now）
+//    ∪ journal（`journalctl --list-boots`：wtmp 轮转/截断时兜底；idx 0 的尾行滞后于断电，延到 now）。
+//    两源 ll 用户均可直读（journal 靠 adm 组、wtmp 全局可读），零提权、零 nvidia-smi 压力。
+//  · 整机通电 = Σ 合并去重叠后的区间；逐卡通电 = Σ 区间 ∩ [首见时刻, now]。
+//  · 首见时间按 GPU UUID 持久化 gpu-uptime.json：模块首跑即在场的卡按追溯起点计（更早历史无法
+//    按卡区分，如实标 first_seen_mode=coverage）；此后新出现的 UUID 按实测时刻计（observed）——
+//    换卡后新卡从换卡时刻起算，旧卡保留历史（present=false）。
+//  · 刷新：启动即刷 + 60s 一拍（区间表 10min 重采；GPU 在场跟踪每分钟维护，脏才写盘）。
+//    采集走放弃式 spawnCollect（countFail=false，不连坐 GPU 熔断，永不阻塞）；两源同时无数据
+//    保留上一帧（宁旧勿空，10-07 教训）；数据缺失一律 null，不以 0 冒充。
+//  · API：GET /v1/internal/gpu-uptime（只读，无 POST）。日志前缀 [gpu-uptime]。
+const UPTIME_STATE_PATH = path.join(__dirname, 'gpu-uptime.json');
+const UP_REFRESH_MS = 10 * 60 * 1000;
+const UP_DATE_WTMP_RE = /\b[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}\b/g;
+const UP_DATE_ISO_RE = /\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/g;
+function upParseWtmp(out, now) {
+  const iv = [];
+  for (const line of String(out || '').split('\n')) {
+    const m = line.match(/^reboot\s+system boot\s+\S+\s+(.*)$/);
+    if (!m) continue;
+    const ds = [];
+    for (const d of m[1].matchAll(UP_DATE_WTMP_RE)) { const t = Date.parse(d[0]); if (Number.isFinite(t)) ds.push(t); }
+    if (!ds.length) continue;
+    const s = ds[0];
+    const e = (/still running/.test(m[1]) || ds.length < 2) ? now : ds[1];
+    if (e > s) iv.push({ s, e: Math.min(e, now), src: 'wtmp' });
+  }
+  return iv;
+}
+function upParseJournal(out, now) {
+  const iv = [];
+  for (const line of String(out || '').split('\n')) {
+    const m = line.match(/^\s*(-?\d+)\s+([0-9a-f]{32})\s+(.*)$/);
+    if (!m) continue;
+    const ds = [];
+    for (const d of m[3].matchAll(UP_DATE_ISO_RE)) { const t = Date.parse(d[0].replace(' ', 'T')); if (Number.isFinite(t)) ds.push(t); }
+    if (ds.length < 2) continue;
+    const s = ds[0];
+    const e = m[1] === '0' ? now : ds[1]; // 当前 boot：journal 尾行滞后于实际断电，延到 now
+    if (e > s) iv.push({ s, e: Math.min(e, now), src: 'journal' });
+  }
+  return iv;
+}
+function upMergeIv(iv, now, floor) {
+  const f = Number.isFinite(floor) && floor > 0 ? floor : 0;
+  const a = (iv || [])
+    .filter((x) => x && Number.isFinite(x.s) && Number.isFinite(x.e) && x.e > x.s && x.s > now - 10 * 365 * 86400000 && x.s <= now)
+    .map((x) => ({ s: Math.max(x.s, f), e: Math.min(x.e, now), src: x.src })) // 时钟漂移下限钳制
+    .filter((x) => x.e > x.s)
+    .sort((p, q) => p.s - q.s);
+  const out = [];
+  for (const x of a) {
+    const last = out[out.length - 1];
+    // 60s 容差桥接同一次开机在 wtmp/journal 两源的起止偏差（journal 首末行晚于/早于真实通断电瞬间），避免重复计
+    if (last && x.s <= last.e + 60000) {
+      if (x.e > last.e) last.e = x.e;
+      if (last.src !== x.src) last.src = 'both';
+    } else out.push({ s: x.s, e: x.e, src: x.src });
+  }
+  return out;
+}
+function upSum(iv, from, to) {
+  let sec = 0;
+  for (const x of iv || []) {
+    const s = Math.max(x.s, from), e = Math.min(x.e, to);
+    if (e > s) sec += (e - s) / 1000;
+  }
+  return sec;
+}
+let __upFrame = null;
+let __upBuilding = false;
+function uptimeRefresh() {
+  if (__upBuilding) return;
+  __upBuilding = true;
+  const now = Date.now();
+  // env LC_ALL=C 强制英文输出：last/journalctl 的星期/月份名随 locale 翻译（zh_CN 下解析器会静默失效），
+  // systemd --user 服务环境带 LANG 时尤其致命——判据不能依赖部署机语言设置。
+  Promise.all([
+    spawnCollect('env', ['LC_ALL=C', 'last', '-x', '-F', 'reboot'], 8000, false),
+    spawnCollect('env', ['LC_ALL=C', 'journalctl', '--list-boots', '--no-pager'], 8000, false),
+  ]).then(([w, j]) => {
+    // 时钟漂移下限（10-29 线上实锤）：该机 BIOS RTC 曾复位，NTP 同步前写入的 boot 记录带假时间戳
+    // （"Thu Jan  1 08:17:32 2026 - Sun Sep 20 16:20:12 2026 (262+08:02)" 一行虚增 262 天通电）。
+    // wtmp 文件真实起点（wtmp begins 行）之前的区间起点一律钳到该下限——钳出的窗口与同期真实开机
+    // 区间重叠，合并去重后几乎不引入误差；解析不到则不设限（宁缺毋假，不影响区间本身）。
+    let floor = 0;
+    const bm = w ? String(w).match(/^wtmp begins (.*)$/m) : null;
+    if (bm) { const t = Date.parse(bm[1]); if (Number.isFinite(t)) floor = t; }
+    const iv = upMergeIv(upParseWtmp(w, now).concat(upParseJournal(j, now)), now, floor);
+    if (!iv.length) {
+      // 两源同时失败/解析为空：保留上一帧（宁旧勿空），只挂 error
+      if (__upFrame) __upFrame = Object.assign({}, __upFrame, { error: 'last/journalctl 本次均无有效数据，显示上一帧', refreshed_at: now });
+      else __upFrame = { iv: [], coverage_from: null, boots_count: null, sources: { wtmp: !!w, journal: !!j }, refreshed_at: now, error: 'last/journalctl 均无有效数据' };
+      console.warn('[gpu-uptime] 本次采集无有效开机区间（保留上一帧）');
+      return;
+    }
+    const wtmpBoots = w ? String(w).split('\n').filter((l) => /^reboot\s/.test(l)).length : 0;
+    __upFrame = {
+      iv,
+      coverage_from: iv[0].s,
+      boots_count: wtmpBoots || iv.length,
+      sources: { wtmp: !!w, journal: !!j },
+      refreshed_at: now,
+      error: null,
+    };
+  }).catch((e) => {
+    console.warn('[gpu-uptime] 刷新异常（忽略）：' + String((e && e.message) || e));
+  }).finally(() => { __upBuilding = false; });
+}
+let __upState = null;
+function uptimeState() {
+  if (__upState && typeof __upState === 'object' && __upState.gpus && typeof __upState.gpus === 'object') return __upState;
+  try {
+    const j = JSON.parse(fs.readFileSync(UPTIME_STATE_PATH, 'utf8'));
+    if (j && typeof j === 'object' && j.gpus && typeof j.gpus === 'object') { __upState = j; return __upState; }
+  } catch (e) { /* 首跑无文件/损坏 → 重建 */ }
+  __upState = { version: 1, initialized_at: Date.now(), gpus: {} };
+  return __upState;
+}
+function uptimeSaveState() {
+  try {
+    const tmp = UPTIME_STATE_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(__upState, null, 2));
+    fs.renameSync(tmp, UPTIME_STATE_PATH);
+  } catch (e) { console.warn('[gpu-uptime] 状态落盘失败（忽略）：' + String((e && e.message) || e)); }
+}
+function uptimeStatus() {
+  const now = Date.now();
+  const frame = __upFrame;
+  const st = uptimeState();
+  const iv = (frame && frame.iv) || [];
+  const cov = (frame && frame.coverage_from) || now;
+  const gs = global.__gpuStatic;
+  const present = gs && Array.isArray(gs.gpus) && gs.gpus.length ? gs.gpus : null;
+  let dirty = false;
+  if (present) {
+    for (const g of present) {
+      if (!g || !g.uuid) continue;
+      let rec = st.gpus[g.uuid];
+      if (!rec) {
+        // 模块首跑（初始化 10min 内）即在场的卡：无法区分更早历史，按追溯起点计；
+        // 运行中途新出现的 UUID：按实测时刻计。
+        const firstRun = now - (st.initialized_at || 0) < 10 * 60 * 1000;
+        rec = st.gpus[g.uuid] = {
+          first_seen_at: firstRun ? cov : now,
+          first_seen_mode: firstRun ? 'coverage' : 'observed',
+          index: g.index != null ? g.index : null,
+          name: g.name || null,
+          last_seen_at: now,
+        };
+        dirty = true;
+      } else {
+        if (rec.index !== (g.index != null ? g.index : null) || rec.name !== (g.name || null)) {
+          rec.index = g.index != null ? g.index : null; rec.name = g.name || null; dirty = true;
+        }
+        if (!rec.last_seen_at || now - rec.last_seen_at > 5 * 60 * 1000) { rec.last_seen_at = now; dirty = true; }
+      }
+    }
+    if (dirty) uptimeSaveState();
+  }
+  const gpus = Object.keys(st.gpus).map((uuid) => {
+    const r = st.gpus[uuid] || {};
+    const from = Math.max(r.first_seen_at || cov, iv.length ? iv[0].s : cov);
+    return {
+      uuid,
+      index: r.index != null ? r.index : null,
+      name: r.name || null,
+      first_seen_at: r.first_seen_at || null,
+      first_seen_mode: r.first_seen_mode || 'observed',
+      last_seen_at: r.last_seen_at || null,
+      present: !!(present && present.some((g) => g && g.uuid === uuid)),
+      power_on_sec: iv.length ? Math.round(upSum(iv, from, now)) : null,
+    };
+  }).sort((a, b) => (a.index == null ? 99 : a.index) - (b.index == null ? 99 : b.index));
+  const lastIv = iv.length ? iv[iv.length - 1] : null;
+  return {
+    ok: true,
+    hardware_note: '显卡硬件/驱动不提供出厂累计通电时间（NVML/nvidia-smi 无此字段，10-29 实测核对），以下为系统开机记录可追溯口径',
+    coverage_from: frame ? frame.coverage_from : null,
+    machine_power_on_sec: iv.length ? Math.round(upSum(iv, iv[0].s, now)) : null,
+    current_boot_since: (lastIv && now - lastIv.e < 90000) ? lastIv.s : null,
+    boots_count: frame ? frame.boots_count : null,
+    sources: frame ? frame.sources : null,
+    refreshed_at: frame ? frame.refreshed_at : null,
+    error: frame ? (frame.error || null) : '尚未完成首次采集',
+    gpus,
+  };
+}
+function gpuUptimeHandle(req, res) {
+  const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+  if (req.method !== 'GET') return reply(405, { ok: false, error: '仅支持 GET（本接口只读）' });
+  let st;
+  try { st = uptimeStatus(); } catch (e) { return reply(500, { ok: false, error: String((e && e.message) || e) }); }
+  return reply(200, st);
+}
+if (!global.__gpuUptimeTimer) {
+  global.__gpuUptimeTimer = setInterval(() => {
+    try {
+      const now = Date.now();
+      if (!__upFrame || now - __upFrame.refreshed_at >= UP_REFRESH_MS) uptimeRefresh();
+      uptimeStatus(); // 60s 一拍维护 GPU 在场跟踪与首见持久化（脏才写盘），无人访问也不丢新卡首见
+    } catch (e) { console.warn('[gpu-uptime] 周期任务异常（忽略本拍）：' + String((e && e.message) || e)); }
+  }, 60 * 1000);
+  if (global.__gpuUptimeTimer.unref) global.__gpuUptimeTimer.unref();
+  uptimeRefresh();
+}
+// ==== [gpu-uptime 1029] END module ====
+
 // ====== [client-ips 1027] 调用方 IP 统计与归属地 ======
 // 需求：显示「当前有哪些 IP 在调用模型 API」（IP + 归属地 + 调用数 + 最近活跃时间）。
 // 数据源（两路合并）：
@@ -14343,6 +14557,13 @@ const server = http.createServer(async (req, res) => {
   // === GPU 高功耗记录 API（[gpu-powerlog 1025]：GET 状态+记录 / POST cmd {action:save|clear}）===
   if (pathname === '/v1/internal/power-log' || pathname.startsWith('/v1/internal/power-log/')) {
     return Promise.resolve(powerLogHandle(req, res, urlObj)).catch((e) => {
+      try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}
+    });
+  }
+
+  // === GPU 累计通电时间 API（[gpu-uptime 1029]：GET 只读，wtmp∪journal 开机区间可追溯口径）===
+  if (pathname === '/v1/internal/gpu-uptime') {
+    return Promise.resolve(gpuUptimeHandle(req, res)).catch((e) => {
       try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}
     });
   }

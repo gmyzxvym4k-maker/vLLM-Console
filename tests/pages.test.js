@@ -110,6 +110,29 @@ const scenarios = {
       fetch: (u) => (u.indexOf('server-status') >= 0 ? fixtures['/server-status'] : (u.indexOf('stats') >= 0 ? {} : live(u))), setup: connected },
     { name: '全部接口 500 → 不得打死轮询', ms: 15000, fetch: () => 'fail', setup: connected,
       assert: (w, env, r) => (r.fetchCalls.length >= 5 ? null : ['接口 500 后轮询停止（fetch 仅 ' + r.fetchCalls.length + ' 次）']) },
+    // [gpu-uptime-1029] 硬件监视页「GPU 累计通电时间」卡：真实形态载荷渲染 + 空态不崩 + 轮询续排
+    { name: 'GPU 通电时间卡渲染（真实形态载荷）', ms: 8000, fetch: live,
+      setup: async (w) => { w.loadGpuUptime(); await new Promise((r) => setImmediate(r)); },
+      assert: (w, env, r) => {
+        const bad = [];
+        const rows = w.document.getElementById('upRows').innerHTML || '';
+        if (rows.indexOf('CMP 170HX') < 0) bad.push('upRows 未渲染逐卡行（实得 ' + JSON.stringify(rows.slice(0, 80)) + '）');
+        if (rows.indexOf('天') < 0) bad.push('upRows 缺折合天数列');
+        const hint = w.document.getElementById('upHint').textContent || '';
+        if (hint.indexOf('追溯起点') < 0) bad.push('upHint 未显示追溯起点（实得 ' + JSON.stringify(hint) + '）');
+        return bad;
+      } },
+    { name: 'GPU 通电时间卡：gpus=[]（首帧未就绪）→ 空态提示不崩', ms: 8000,
+      fetch: (u) => (u.indexOf('gpu-uptime') >= 0 ? { ok: true, hardware_note: 'x', coverage_from: null, machine_power_on_sec: null, current_boot_since: null, boots_count: null, sources: null, refreshed_at: null, error: '尚未完成首次采集', gpus: [] } : live(u)),
+      setup: async (w) => { w.loadGpuUptime(); await new Promise((r) => setImmediate(r)); },
+      assert: (w, env, r) => {
+        const bad = [];
+        const rows = w.document.getElementById('upRows').innerHTML || '';
+        if (rows.indexOf('等待 GPU 静态信息') < 0) bad.push('空态提示缺失（实得 ' + JSON.stringify(rows.slice(0, 80)) + '）');
+        const hint = w.document.getElementById('upHint').textContent || '';
+        if (hint.indexOf('数据暂缺') < 0) bad.push('error 未透传到 upHint（实得 ' + JSON.stringify(hint) + '）');
+        return bad;
+      } },
   ],
   'bench.html': [
     { name: '加载 + 轮询（真实 run 载荷）', ms: 15000, fetch: live,

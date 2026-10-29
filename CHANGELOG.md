@@ -1,5 +1,16 @@
 # 更新日志
 
+## 2026-10-29 [gpu-uptime 1029] GPU 累计通电时间（已上线 .127，页面 r50）
+- 硬件监视页新增「GPU 累计通电时间」卡：整机累计通电时长、追溯起点、开机次数、本次开机已通时长，逐卡（GPU0/1/2）按 UUID 列出累计通电（天/时分双口径）、首见口径与在场状态。
+- **口径铁律**：NVIDIA CMP/消费级卡的驱动与 NVML **不提供"出厂至今累计通电时间"**（10-29 实测 `nvidia-smi -q` 全文与 `--help-query-gpu` 均无该字段；ECC aggregate 是唯一 lifetime 计数但无时间轴），卡内如实标注，绝不让估算值冒充出厂真值。
+- 可追溯口径 = **wtmp ∪ journal 开机区间并集**：`last -x -F reboot`（干净配对 end=关机时刻，still running 延到 now）∪ `journalctl --list-boots`（当前 boot 延到 now），60s 容差合并去重叠；逐卡 = 区间 ∩ [UUID 首见, now]，首见持久化 gpu-uptime.json（模块首跑在场的卡按追溯起点计=coverage，此后新 UUID 按实测计=observed——换卡新卡从换卡时刻起算，旧卡保留历史标「已离场」）。
+- 上线当日实锤修复**时钟漂移虚增**：该机 BIOS RTC 曾复位，NTP 同步前写入的 boot 记录带假时间戳（"Thu Jan 1 08:17:32 2026 - Sun Sep 20 16:20:12 2026 (262+08:02)" 一行虚增 262 天，整机通电从 33.7 天被抬成 294 天）——以 `wtmp begins` 行作下限钳制区间起点（钳出窗口与同期真实开机重叠，合并后几乎无误差）；并强制 `env LC_ALL=C` 跑 last/journalctl（systemd 服务环境带 LANG=zh_CN 时星期/月份名翻译会让解析器静默失效）。
+- 后端 [gpu-uptime 1029] 模块：GET /v1/internal/gpu-uptime（只读，无 POST）；采集走放弃式 spawnCollect（countFail=false 不连坐 GPU 熔断，ll 直读零提权零 nvidia-smi），启动即刷 + 10min 重采 + 60s 在场跟踪（脏才写盘，tmp+rename 原子替换）；两源同时无数据保留上一帧（宁旧勿空，10-07 教训）；缺失一律 null 不以 0 冒充。
+- 前端卡 30s 轮询（hidden 门控）+ 指纹防 DOM 重建；错误态黄字透传不静默。
+- 回归：unit 45/0（新增 6 项：wtmp/journal 解析、容差合并、∩求和、两源并集不重复计、漂移钳制含 floor=0 回落）；pages 22 场景 0 失败（新增通电卡真实载荷渲染 + gpus=[] 空态 2 场景）；fixture gpu-uptime.json 为线上真实抓取。
+- 线上验证：追溯起点 09-19 07:32（=wtmp begins）、整机通电 33.7 天（40.4 天窗口扣 ~6.8 天停机，与夜间关机/重启风暴实况吻合）、boots 218、本次开机 16:22 与 uptime -s 一致、三卡在场 coverage；重启 dsh-console 引擎 pid 不变（引擎属 fnx-18420-watchdog cgroup）。
+- 回滚：deploy/{server.js,index.html}.bak-gpuuptime-1029-1743 + 删 deploy/gpu-uptime.json。
+
 ## 2026-10-27 [client-ips 1027] 调用方 IP 与归属地（已上线 .127，页面 r49）
 - 新标签「调用方 IP」：显示谁在调用模型 API——IP、网络类型（内网/回环/公网）、归属地（国家/省市/运营商）、模型调用数、探活数、最近活跃时间、来源（直连引擎/经控制台代理），行展开看路径明细与状态码分布。
 - 数据源两路合并：①引擎访问日志增量 tail（uvicorn 行，覆盖直连引擎端口的全部调用方；日志行无逐行时间戳，lastSeen=控制台观测时刻 ±3s；首次运行从日志尾 ≤4MB 回填计数标「历史」；日志文件跟随 getVllmLogSource argv/fd 判据链并缓存 30s，fallback/docker/tty 来源不解析防陈年日志冒充）②控制台 /v1 代理入口记真实客户端 IP（引擎侧只见 127.0.0.1；代理生成请求 pending 对账去重不双计）。

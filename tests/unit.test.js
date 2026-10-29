@@ -233,6 +233,78 @@ async function ta(name, fn) {
     return threw || '未抛错（可能返回了缺省值）';
   });
 
+  // ============ 9. GPU 累计通电时间解析（[gpu-uptime 1029]：wtmp∪journal 开机区间）============
+  const UP = load(['UP_DATE_WTMP_RE', 'UP_DATE_ISO_RE', 'upParseWtmp', 'upParseJournal', 'upMergeIv', 'upSum']);
+  await ta('upParseWtmp：still running 延到 now、干净配对取 end、忽略 shutdown/wtmp begins 行', async () => {
+    const now = Date.parse('2026-10-29T17:00:00');
+    const out = [
+      'reboot   system boot  5.15.0-139-gener Thu Oct 29 16:22:13 2026   still running',
+      'shutdown system down  5.15.0-139-gener Thu Oct 29 16:15:32 2026 - Thu Oct 29 16:22:13 2026  (00:06)',
+      'reboot   system boot  5.15.0-139-gener Thu Oct 29 07:31:00 2026 - Thu Oct 29 16:15:32 2026  (08:44)',
+      'wtmp begins Sat Sep 19 07:32:47 2026',
+      '',
+    ].join('\n');
+    const iv = UP.upParseWtmp(out, now);
+    if (iv.length !== 2) return '应得 2 区间，实得 ' + iv.length;
+    if (iv[0].s !== Date.parse('2026-10-29T16:22:13') || iv[0].e !== now) return 'still running 区间错：' + JSON.stringify(iv[0]);
+    if (iv[1].s !== Date.parse('2026-10-29T07:31:00') || iv[1].e !== Date.parse('2026-10-29T16:15:32')) return '干净配对区间错：' + JSON.stringify(iv[1]);
+    return true;
+  });
+  await ta('upParseJournal：历史 boot 取首末行、当前 boot(idx 0) 尾行滞后延到 now', async () => {
+    const now = Date.parse('2026-10-29T17:00:00');
+    const out = [
+      '-39 779b057565c14548bd11ca0f2d020010 Sun 2026-10-11 05:41:36 CST—Sun 2026-10-11 07:37:02 CST',
+      '  0 c02f59d5e9d8444c9a497ea992ebf4d0 Thu 2026-10-29 16:22:13 CST—Thu 2026-10-29 16:59:30 CST',
+    ].join('\n');
+    const iv = UP.upParseJournal(out, now);
+    if (iv.length !== 2) return '应得 2 区间，实得 ' + iv.length;
+    if (iv[0].s !== Date.parse('2026-10-11T05:41:36') || iv[0].e !== Date.parse('2026-10-11T07:37:02')) return '历史 boot 区间错：' + JSON.stringify(iv[0]);
+    if (iv[1].e !== now) return '当前 boot 未延到 now：' + JSON.stringify(iv[1]);
+    return true;
+  });
+  await ta('upMergeIv：重叠与 60s 容差桥接合并、大间隔不并、未来区间丢弃', async () => {
+    const now = Date.parse('2026-10-29T17:00:00');
+    const iv = UP.upMergeIv([
+      { s: now - 3600000, e: now - 1800000 },
+      { s: now - 1800000 - 30000, e: now - 900000 }, // 与上一区间仅差 30s ≤ 容差 → 合并成一段
+      { s: now - 7200000, e: now - 6000000 },
+      { s: now + 1000, e: now + 50000 },             // 未来（时钟漂移）→ 丢弃
+    ], now);
+    if (iv.length !== 2) return '应得 2 区间，实得 ' + iv.length + '：' + JSON.stringify(iv);
+    if (iv[0].s !== now - 7200000) return '未按起点排序';
+    if (iv[1].s !== now - 3600000 || iv[1].e !== now - 900000) return '合并边界错：' + JSON.stringify(iv[1]);
+    return true;
+  });
+  await ta('upMergeIv：时钟漂移下限钳制（10-29 线上实锤：RTC 复位致 boot 记录带 Jan 1 假时间戳，虚增 262 天）', async () => {
+    const now = Date.parse('2026-10-29T17:00:00');
+    const floor = Date.parse('2026-09-19T07:32:47'); // wtmp begins
+    const iv = UP.upMergeIv([
+      { s: Date.parse('2026-01-01T08:17:32'), e: Date.parse('2026-09-20T16:20:12'), src: 'wtmp' }, // 假起点
+      { s: Date.parse('2026-09-19T07:42:22'), e: Date.parse('2026-09-19T07:42:46'), src: 'wtmp' },
+    ], now, floor);
+    if (iv.length !== 1) return '钳制后应与真实区间桥接合并为 1 段，实得 ' + iv.length + '：' + JSON.stringify(iv);
+    if (iv[0].s !== floor) return '假起点未被钳到 wtmp begins 下限：' + iv[0].s;
+    if (iv[0].e !== Date.parse('2026-09-20T16:20:12')) return 'end 应保持原值';
+    // 无下限（floor=0）时不钳制
+    const iv2 = UP.upMergeIv([{ s: Date.parse('2026-01-01T08:17:32'), e: Date.parse('2026-01-02T08:17:32'), src: 'wtmp' }], now, 0);
+    return (iv2.length === 1 && iv2[0].s === Date.parse('2026-01-01T08:17:32')) || 'floor=0 不应改变起点';
+  });
+  await ta('upSum：区间 ∩ [from,to] 求和（逐卡通电 = 区间∩[首见,now] 的核）', async () => {
+    const iv = [{ s: 0, e: 100000 }, { s: 200000, e: 300000 }];
+    const sec = UP.upSum(iv, 50000, 250000); // 交集 50s + 50s = 100s
+    return sec === 100 || ('应得 100s，实得 ' + sec);
+  });
+  await ta('两源同一次开机并集不重复计（wtmp 宽区间 ∪ journal 窄区间 = 一段）', async () => {
+    const now = Date.parse('2026-10-29T17:00:00');
+    const w = UP.upParseWtmp('reboot   system boot  5.15.0-139-gener Thu Oct 29 16:22:13 2026   still running', now);
+    const j = UP.upParseJournal('  0 c02f59d5e9d8444c9a497ea992ebf4d0 Thu 2026-10-29 16:22:30 CST—Thu 2026-10-29 16:59:30 CST', now);
+    const iv = UP.upMergeIv(w.concat(j), now);
+    if (iv.length !== 1) return '应合并为 1 区间，实得 ' + iv.length;
+    const total = UP.upSum(iv, 0, now);
+    const expect = (now - Date.parse('2026-10-29T16:22:13')) / 1000;
+    return Math.abs(total - expect) < 1 || ('总时长错：' + total + ' vs ' + expect);
+  });
+
   // ============ 报告 ============
   console.log(`单元测试：通过 ${pass} / 失败 ${fail}`);
   failures.forEach((f) => console.log('  ✗ ' + f));

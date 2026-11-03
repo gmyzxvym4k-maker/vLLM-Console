@@ -17,13 +17,18 @@ function makeEnv(opts) {
   const byId = new Map();
   const counters = { text: 0, html: 0, fetch: 0 };
 
+  // 真实 DOM 语义：先写 textContent 再读 innerHTML 会得到转义后的文本。页面里的
+  // esc(t) 正是这条路（createElement('div') → textContent=t → return innerHTML），
+  // 桩里早先只回 _html，于是 esc() 一律返回空串，凡断言 esc 包过的内容都会假失败（1103 实锤）。
+  const domEscapeHtml = (v) => String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
   let now = 1700000000000;
   let seq = 1;
   const timers = new Map(); // id -> {at, ms, fn, once}
 
   function mkCtx(canvas) {
-    const noop = () => {};
-    const ctx = {};
+    const noop = () => {};    const ctx = {};
     ['clearRect', 'beginPath', 'moveTo', 'lineTo', 'stroke', 'fill', 'fillRect', 'strokeRect', 'clear',
       'arcTo', 'arc', 'closePath', 'save', 'restore', 'translate', 'scale', 'rotate', 'setTransform',
       'fillText', 'strokeText', 'bezierCurveTo', 'quadraticCurveTo', 'rect', 'clip', 'drawImage', 'setLineDash',
@@ -37,8 +42,7 @@ function makeEnv(opts) {
     return ctx;
   }
 
-  function mkEl(tag, id) {
-    const el = {
+  function mkEl(tag, id) {    const el = {
       tagName: String(tag || 'div').toUpperCase(), id: id || '', _text: '', _html: '',
       style: new Proxy({}, { get: (t, k) => (k in t ? t[k] : ''), set: (t, k, v) => { t[k] = v; return true; } }),
       classList: {
@@ -74,8 +78,18 @@ function makeEnv(opts) {
       animate() { return { cancel() {}, finished: Promise.resolve() }; },
       getContext() { return mkCtx(el); },
     };
-    Object.defineProperty(el, 'textContent', { get() { return this._text; }, set(v) { this._text = String(v); counters.text++; } });
-    Object.defineProperty(el, 'innerHTML', { get() { return this._html; }, set(v) { this._html = String(v); counters.html++; } });
+    Object.defineProperty(el, 'textContent', {
+      get() { return this._text; },
+      set(v) { this._text = String(v); this._html = domEscapeHtml(v); counters.text++; },
+    });
+    // 真实 DOM 语义：先写 textContent 再读 innerHTML 得到转义后的文本——页面里的 esc() 就是
+    // 靠这条路走的（`const d=document.createElement('div'); d.textContent=t; return d.innerHTML`）。
+    // 早期桩只回 _html，esc() 一律返回空串，凡是断言 esc 包裹过的内容都会假失败（1103 实锤），
+    // 现在补齐转义，让"没转义就拼 HTML"这类问题在仿真里也暴露得出来。
+    Object.defineProperty(el, 'innerHTML', {
+      get() { return this._html; },
+      set(v) { this._html = String(v); counters.html++; },
+    });
     Object.defineProperty(el, 'innerText', { get() { return this._text; }, set(v) { this._text = String(v); counters.text++; } });
     if (id) byId.set(id, el);
     return el;

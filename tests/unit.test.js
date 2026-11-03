@@ -333,6 +333,109 @@ async function ta(name, fn) {
     return true;
   });
 
+  // ============ 10. GPU 温度历史与曲线序列（[gpu-temp-1103] 硬件监视页显存温度曲线）============
+  const GT_NOW = 1780000000; // 固定"现在"（秒），窗口过滤才可判定
+  const GTG = {};            // 沙箱里的 global 替身（vm context 默认没有 global 这个变量）
+  const GT = load(['GPU_TEMP_KEEP', 'appendGpuTempHistory', 'gpuTempSeries', 'gpuTempPayload'], { global: GTG, Date: { now: () => GT_NOW * 1000 } });
+  await ta('appendGpuTempHistory：逐秒落点，只存核心/显存两值', async () => {
+    GTG.__gpuTempHistory = [];
+    GT.appendGpuTempHistory([{ index: 0, temp: 61, temp_mem: 68 }, { index: 1, temp: 58, temp_mem: 64 }]);
+    const H = GTG.__gpuTempHistory;
+    if (H.length !== 1) return '应落 1 点，实得 ' + H.length;
+    if (H[0].t !== GT_NOW) return '时间戳应为当前秒，实得 ' + H[0].t;
+    if (H[0].g['0'].c !== 61 || H[0].g['0'].m !== 68) return '值错：' + JSON.stringify(H[0].g);
+    return true;
+  });
+  await ta('appendGpuTempHistory：同一秒重复调用只记一次（防定时器重叠造出假密点）', async () => {
+    GT.appendGpuTempHistory([{ index: 0, temp: 61, temp_mem: 68 }]);
+    return GTG.__gpuTempHistory.length === 1 || ('实得 ' + GTG.__gpuTempHistory.length + ' 点');
+  });
+  await ta('appendGpuTempHistory：0/超 150℃/null 归 null，全缺则该拍不落点（不得画 0 ℃ 平线冒充）', async () => {
+    GTG.__gpuTempHistory = [];
+    GT.appendGpuTempHistory([{ index: 0, temp: 0, temp_mem: 0 }]);
+    if (GTG.__gpuTempHistory.length !== 0) return '全非法值不应落点';
+    GT.appendGpuTempHistory([{ index: 0, temp: 61, temp_mem: 0 }, { index: 1, temp: null, temp_mem: 400 }]);
+    const e0 = GTG.__gpuTempHistory[0].g['0'];
+    if (e0.m !== null) return '显存 0 ℃ 应归 null，实得 ' + e0.m;
+    if (e0.c !== 61) return '核心合法值应保留';
+    if (GTG.__gpuTempHistory[0].g['1'] !== undefined) return '核心与显存都非法的卡不应入帧：' + JSON.stringify(GTG.__gpuTempHistory[0].g['1']);
+    return true;
+  });
+  await ta('appendGpuTempHistory：非数组/空数组/无 index 一律不炸不落', async () => {
+    GTG.__gpuTempHistory = [];
+    GT.appendGpuTempHistory(null); GT.appendGpuTempHistory([]); GT.appendGpuTempHistory([{}]);
+    return GTG.__gpuTempHistory.length === 0 || '垃圾输入污染了历史';
+  });
+  await ta('appendGpuTempHistory：满 3600 点后环形截尾（长跑不涨内存，与 disk 历史同一手法）', async () => {
+    GTG.__gpuTempHistory = [];
+    for (let i = 0; i < 3600; i++) GTG.__gpuTempHistory.push({ t: GT_NOW - 3600 + i, g: { 0: { c: 60, m: 66 } } });
+    GT.appendGpuTempHistory([{ index: 0, temp: 62, temp_mem: 70 }]);
+    if (GTG.__gpuTempHistory.length !== 3600) return '应截尾保持 3600，实得 ' + GTG.__gpuTempHistory.length;
+    const tail = GTG.__gpuTempHistory[GTG.__gpuTempHistory.length - 1];
+    if (tail.t !== GT_NOW || tail.g['0'].m !== 70) return '新点未入尾：' + JSON.stringify(tail);
+    return GTG.__gpuTempHistory[0].t === GT_NOW - 3599 || ('头部未丢弃最旧：' + GTG.__gpuTempHistory[0].t);
+  });
+  await ta('gpuTempSeries：窗口过滤 + 桶均值抽稀到 ≤300 点（1 小时窗口响应也不膨胀）', async () => {
+    GTG.__gpuTempHistory = [];
+    for (let s = 0; s < 3600; s++) {
+      GTG.__gpuTempHistory.push({ t: GT_NOW - 3600 + s, g: { 0: { c: 60 + (s % 10), m: 70 + (s % 10) } } });
+    }
+    const r = GT.gpuTempSeries(3600);
+    if (r.points.length > 300) return '抽稀后应 ≤300 点，实得 ' + r.points.length;
+    if (r.raw_points !== 3600) return '窗口内原始点数错：' + r.raw_points;
+    if (r.sample_s < 12) return '桶宽应 ≥原始点/300=12，实得 ' + r.sample_s;
+    const r5 = GT.gpuTempSeries(600);
+    if (r5.raw_points !== 600) return '窗口过滤错：' + r5.raw_points;
+    return true;
+  });
+  await ta('gpuTempSeries：峰值/均值在原始逐秒点上算（抽稀不得抹平真实尖峰）', async () => {
+    GTG.__gpuTempHistory = [];
+    for (let s = 0; s < 300; s++) GTG.__gpuTempHistory.push({ t: GT_NOW - 300 + s, g: { 0: { c: 60, m: 70 } } });
+    GTG.__gpuTempHistory[150].g['0'].m = 99; // 单点真实尖峰：桶均值会摊成 70.x，统计层必须仍抓到 99
+    const st = GT.gpuTempSeries(300).stats['0'];
+    if (st.mem.max !== 99) return '峰值应为 99，实得 ' + st.mem.max;
+    if (st.mem.max_t !== GT_NOW - 150) return '峰值时刻错：' + st.mem.max_t;
+    if (st.mem.min !== 70 || st.mem.cur !== 70) return '谷值/现值错：' + JSON.stringify(st.mem);
+    if (!(st.mem.avg > 70 && st.mem.avg < 71)) return '均值应≈70.1，实得 ' + st.mem.avg;
+    return true;
+  });
+  await ta('gpuTempSeries：null 不参与均值、不被 0 顶替（缺列如实缺，同 09-22 铁律）', async () => {
+    GTG.__gpuTempHistory = [
+      { t: GT_NOW - 3, g: { 0: { c: 60, m: null } } },
+      { t: GT_NOW - 2, g: { 0: { c: 62, m: null } } },
+      { t: GT_NOW - 1, g: { 0: { c: null, m: null } } },
+    ];
+    const st = GT.gpuTempSeries(60).stats['0'];
+    if (st.mem.cur !== null || st.mem.max !== null || st.mem.avg !== null) return '显存全缺应全 null，实得 ' + JSON.stringify(st.mem);
+    if (st.core.cur !== 62 || st.core.avg !== 61) return '核心应只按 2 个有效点算：' + JSON.stringify(st.core);
+    return st.core.n === 2 || ('有效点计数错：' + st.core.n);
+  });
+  await ta('gpuTempSeries：多卡按数值序（GPU10 不排到 GPU2 前）且逐卡独立', async () => {
+    GTG.__gpuTempHistory = [{ t: GT_NOW - 1, g: { 10: { c: 60, m: 66 }, 2: { c: 61, m: 67 }, 0: { c: 62, m: 68 } } }];
+    const ks = Object.keys(GT.gpuTempSeries(60).stats);
+    return (ks[0] === '0' && ks[1] === '2' && ks[2] === '10') || ('排序错：' + JSON.stringify(ks));
+  });
+  await ta('gpuTempPayload：口径字段齐备（阈值分轨 + 卡名 + 追溯深度 + 采样年龄）', async () => {
+    GTG.__gpuTempHistory = [{ t: GT_NOW - 2, g: { 0: { c: 60, m: 66 } } }, { t: GT_NOW - 1, g: { 0: { c: 61, m: 67 } } }];
+    GTG.__gpuStatic = { gpus: [{ index: 0, name: 'CMP 170HX' }] };
+    GTG.__gpuLive = { ts: (GT_NOW - 1) * 1000 };
+    const p = GT.gpuTempPayload(300);
+    if (p.win_s !== 300) return 'win_s 未透传';
+    if (p.names['0'] !== 'CMP 170HX') return '卡名未合并：' + JSON.stringify(p.names);
+    if (p.thresholds.mem_warn !== 85 || p.thresholds.mem_crit !== 95 || p.thresholds.core_warn !== 70) return '阈值分轨错：' + JSON.stringify(p.thresholds);
+    if (p.depth_s !== 2) return '追溯深度应为 2 秒，实得 ' + p.depth_s;
+    if (p.live_age_s !== 1) return '采样年龄应为 1 秒，实得 ' + p.live_age_s;
+    return p.raw_points === 2 || ('原始点数错：' + p.raw_points);
+  });
+  await ta('gpuTempPayload：历史为空（控制台刚启动）→ 空序列不报错，前端据此显示"采样中"', async () => {
+    GTG.__gpuTempHistory = [];
+    delete GTG.__gpuLive;
+    const p = GT.gpuTempPayload(600);
+    if (p.points.length !== 0 || Object.keys(p.stats).length !== 0) return '应为空序列';
+    if (p.first_t !== null || p.last_t !== null) return '空序列首末应为 null';
+    return (p.depth_s === 0 && p.live_age_s === null) || ('空态元数据错：' + JSON.stringify({ d: p.depth_s, a: p.live_age_s }));
+  });
+
   // ============ 报告 ============
   console.log(`单元测试：通过 ${pass} / 失败 ${fail}`);
   failures.forEach((f) => console.log('  ✗ ' + f));

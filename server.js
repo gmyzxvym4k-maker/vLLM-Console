@@ -1318,6 +1318,11 @@ function scriptModelLaunchPlan(smIn, d) {
     }
     env.FN_PP = String(_pp);
   }
+  // [cuda-devs-1102] 快启预设可固定卡序（如 '1,2'）。18420 实跑 known-good 态用 GPU1,2（绕开 PCI 01:00 反复 Xid13；
+  // launch.env 注释 pinflip-1006）。inner 有消费点 CUDA_DEVS=${FN_CUDA_VISIBLE_DEVICES:-…} 且已在 CONSUMED 清单，
+  // 但 plan 此前不下发 → 快启预设无法携带卡序，点启动会静默回到「取前 N 张」。字段缺失=零漂移（旧行为不变）。
+  const _cudaDevs = String(d.cudaDevs || '').trim();
+  if (_cudaDevs) env.FN_CUDA_VISIBLE_DEVICES = _cudaDevs;
   env.FN_PREFIX_CACHE = String(String(d.prefixCaching) === '0' ? 0 : 1);
   env.FN_CHUNKED = String(String(d.chunkedPrefill) === '0' ? 0 : 1);
   env.FN_ASYNC = String(String(d.asyncScheduling) === '0' ? 0 : 1);
@@ -8574,6 +8579,123 @@ function getGpuStatic() {
   if (!global.__gpuStatic || now - (global.__gpuStaticAt || 0) > 60000) gpuStaticRebuild();
   return global.__gpuStatic || { supported: false, gpus: [], driver_version: null, pending: true };
 }
+// ==== [gpu-temp-1103] GPU 温度历史（硬件监视页「GPU 温度曲线」数据源）====
+// 口径与边界：
+//  · 落点与 __gpuLive 同拍（sampleGpuStats 每 1s，走 09-20 铁律的放弃式熔断通道）；
+//    本模块自身零子进程零 IO，不额外增加任何 nvidia-smi 压力。
+//  · 温度是慢变量，曲线看的是趋势不是瞬时——保留 1 小时逐秒点（3600 点 × 每卡 2 值，内存可忽略）。
+//  · 采样失败的那一拍**不落点**：绝不用上一拍旧值冒充当前温度续画（驱动卡死/熔断期间会画出
+//    "温度恒定"的假象）。前端按时间轴绘制并对缺口断线——留白=数据缺失，与 09-22「宁返 null
+//    也不返回缺省值被自愈层当真值」是同一条铁律。
+//  · c（核心，temperature.gpu）/ m（显存，temperature.memory）各自独立可为 null：
+//    CMP 170HX 实测两路都有，但驱动不支持显存温度的卡必须如实缺列，不得画成 0。
+const GPU_TEMP_KEEP = 3600;
+function appendGpuTempHistory(gpus) {
+  if (!Array.isArray(gpus) || !gpus.length) return;
+  const H = global.__gpuTempHistory || (global.__gpuTempHistory = []);
+  const t = Math.round(Date.now() / 1000);
+  const last = H[H.length - 1];
+  if (last && last.t === t) return; // 同一秒重复调用只记一次（防定时器重叠）
+  const g = {};
+  for (const x of gpus) {
+    if (x == null || x.index == null) continue;
+    // 合理性钳制：驱动不支持该列时 nvidia-smi 交回 0 或 [N/A]（旧 /stats 路径按 0 处理）。
+    // (0,150] 之外一律当"缺列"归 null——宁可曲线留白，也不画一条 0 ℃ 平线冒充真实温度。
+    const ok = (v) => (Number.isFinite(v) && v > 0 && v <= 150) ? v : null;
+    const c = ok(x.temp);
+    const m = ok(x.temp_mem);
+    if (c == null && m == null) continue;
+    g[String(x.index)] = { c: c, m: m };
+  }
+  if (!Object.keys(g).length) return;
+  H.push({ t: t, g: g });
+  if (H.length > GPU_TEMP_KEEP) H.splice(0, H.length - GPU_TEMP_KEEP);
+}
+// 取窗口内序列并按桶抽稀到 ≤300 点（桶内均值；60 分钟窗口也只有 300 点，响应不膨胀）。
+// 逐卡统计（现值/均值/峰/谷/峰值时刻）在**原始逐秒点**上算，不用抽稀后的桶——
+// 桶均值会抹掉真实尖峰，而统计的职责恰恰是抓最坏值。null 不参与均值，也不被 0 顶替。
+function gpuTempSeries(winS) {
+  const H = global.__gpuTempHistory || [];
+  const nowS = Math.round(Date.now() / 1000);
+  const from = nowS - winS;
+  let i = 0;
+  while (i < H.length && H[i].t < from) i++;
+  const pts = H.slice(i);
+  const idxs = [];
+  for (const p of pts) for (const k of Object.keys(p.g)) if (idxs.indexOf(k) < 0) idxs.push(k);
+  idxs.sort((a, b) => (+a) - (+b));
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const bucket = Math.max(1, Math.ceil(pts.length / 300));
+  const points = [];
+  for (let k = 0; k < pts.length; k += bucket) {
+    const seg = pts.slice(k, k + bucket);
+    const g = {};
+    for (const idx of idxs) {
+      let cs = 0, cn = 0, ms = 0, mn = 0;
+      for (const p of seg) {
+        const e = p.g[idx];
+        if (!e) continue;
+        if (e.c != null) { cs += e.c; cn++; }
+        if (e.m != null) { ms += e.m; mn++; }
+      }
+      if (cn || mn) g[idx] = { c: cn ? r1(cs / cn) : null, m: mn ? r1(ms / mn) : null };
+    }
+    if (Object.keys(g).length) points.push({ t: seg[seg.length - 1].t, g: g });
+  }
+  const stats = {};
+  for (const idx of idxs) {
+    const o = {
+      core: { cur: null, avg: null, min: null, max: null, max_t: null, n: 0 },
+      mem: { cur: null, avg: null, min: null, max: null, max_t: null, n: 0 },
+    };
+    let csum = 0, msum = 0;
+    for (const p of pts) {
+      const e = p.g[idx];
+      if (!e) continue;
+      if (e.c != null) {
+        o.core.cur = e.c; o.core.n++; csum += e.c;
+        o.core.min = o.core.min == null ? e.c : Math.min(o.core.min, e.c);
+        if (o.core.max == null || e.c > o.core.max) { o.core.max = e.c; o.core.max_t = p.t; }
+      }
+      if (e.m != null) {
+        o.mem.cur = e.m; o.mem.n++; msum += e.m;
+        o.mem.min = o.mem.min == null ? e.m : Math.min(o.mem.min, e.m);
+        if (o.mem.max == null || e.m > o.mem.max) { o.mem.max = e.m; o.mem.max_t = p.t; }
+      }
+    }
+    if (o.core.n) o.core.avg = r1(csum / o.core.n);
+    if (o.mem.n) o.mem.avg = r1(msum / o.mem.n);
+    stats[idx] = o;
+  }
+  return {
+    points: points, stats: stats, sample_s: bucket, raw_points: pts.length,
+    first_t: pts.length ? pts[0].t : null, last_t: pts.length ? pts[pts.length - 1].t : null,
+    now_s: nowS,
+  };
+}
+// 接口载荷（窗口抽稀 + 卡名 + 阈值口径）。卡名取静态帧缓存，静态未就绪时前端回落 "GPU N"。
+function gpuTempPayload(winS) {
+  const s = gpuTempSeries(winS);
+  const names = {};
+  try {
+    const st = global.__gpuStatic;
+    for (const g of ((st && st.gpus) || [])) if (g && g.index != null) names[String(g.index)] = g.name || null;
+  } catch (e) { /* 静态帧未就绪：如实无名列，不影响曲线 */ }
+  const live = global.__gpuLive || null;
+  const H = global.__gpuTempHistory || [];
+  return {
+    ts: Date.now(), win_s: winS,
+    sample_s: s.sample_s, raw_points: s.raw_points,
+    points: s.points, stats: s.stats,
+    first_t: s.first_t, last_t: s.last_t, now_s: s.now_s,
+    names: names,
+    // 显存阈值独立于核心（09-29 定档：显存天然比核心高几度，套核心阈值空载就满屏橙）
+    thresholds: { mem_warn: 85, mem_crit: 95, core_warn: 70, core_crit: 85 },
+    live_age_s: (live && live.ts) ? Math.round((Date.now() - live.ts) / 1000) : null,
+    // 曲线只从控制台进程启动开始积累（不落盘历史）——如实告知追溯深度，别让横轴左端被当成开机时刻
+    depth_s: H.length ? Math.round(Date.now() / 1000) - H[0].t : 0,
+  };
+}
 function sampleGpuStats() {
   // 09-18：execFileSync 同步阻塞主循环 → 改异步 + 防重入。
   // 10-07：再改走统一放弃式通道。原 execFile 的 timeout 靠发信号实现，对 D 状态进程无效，
@@ -8601,6 +8723,11 @@ function sampleGpuStats() {
       if (g.index != null) gpus.push(g);
     }
       global.__gpuLive = { ts: Date.now(), gpus };
+      // [gpu-temp-1103] 逐秒温度历史（硬件监视页「GPU 温度曲线」数据源）：与采样同拍落点，
+      // 零新增 nvidia-smi。失败的那一拍在上面已 return（不落点 → 曲线留白，绝不用旧值冒充当前温度）。
+      try { appendGpuTempHistory(gpus); } catch (e) { /* 历史落点异常绝不影响主采样 */ }
+      // [gpu-temp-1103] 与采样同拍落一条温度历史（本函数只多一次内存 push，零子进程）
+      appendGpuTempHistory(gpus);
     } catch (e) { /* 解析失败保留上次采样 */ }
   });
 }
@@ -14592,6 +14719,26 @@ const server = http.createServer(async (req, res) => {
       pcie_ts: (global.__gpuPcie && global.__gpuPcie.ts) || null,
       history: (global.__gpuPcieHistory || []).slice(-180), // ~1.2s/点 ≈ 3.6 分钟窗口，前端截近 3 分钟（150 点）
     })));
+    return;
+  }
+
+  // === Internal API: GPU 温度曲线（[gpu-temp-1103] 硬件监视页「GPU 温度曲线（核心 / 显存）」卡）===
+  // GET /v1/internal/gpu-temp?win=300   窗口秒，钳 30–3600，缺省 300
+  // 数据源＝GPU 采样器逐秒落的纯内存历史（零子进程零 IO，可 2s 轮询）；按桶均值抽稀到 ≤300 点，
+  // 60 分钟窗口的响应体量与 3 分钟窗口基本一致。
+  // 口径：points[].g[卡号] = {c:核心 ℃, m:显存 ℃}，null＝该拍缺列或采样失败 → 前端断线留白，绝不插值补画。
+  if (pathname === '/v1/internal/gpu-temp') {
+    let win = 300;
+    try { win = parseInt(urlObj.searchParams.get('win'), 10) || 300; } catch (e) { win = 300; }
+    win = Math.min(3600, Math.max(30, win));
+    let body;
+    try {
+      body = gpuTempPayload(win);
+    } catch (e) {
+      body = { ts: Date.now(), win_s: win, points: [], stats: {}, names: {}, error: String((e && e.message) || e) };
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(body));
     return;
   }
 

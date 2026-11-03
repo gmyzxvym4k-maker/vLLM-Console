@@ -92,6 +92,66 @@ async function runPage(file, scenario) {
 const live = (u) => fixtureFor(u);
 const connected = async (w) => {};
 
+// ==== [gpu-temp-1103]「GPU 温度曲线」绘制语义场景的公共件 ====
+// canvas 在桩里是空函数，这里换成算子记录器，直接验"画了什么"：纵轴刻度、显存阈值参考线、
+// 线尾打点，以及两种缺失形态是否真的断线——
+//   ① 单卡缺值（点在、该卡两列 null）→ 只能靠 null 分支断线；
+//   ② 整拍缺席（那几秒连点都没有）→ 只能靠时间缺口判据断线。
+// 两条判据分场景各测一侧，任一分支被改掉对应场景必红（已做变异自测，防止断言写成空转）。
+function gpuTempFixture(o) {
+  const N = 1700000000;   // dom-mock 虚拟时钟原点（秒）
+  const STEP = 15;        // 抽稀后每点间隔，必须与 sample_s 一致，否则正常步长会被当成缺口
+  const points = [];
+  for (let i = 0; i < 20; i++) {
+    if (o.dropBeats && i >= 14 && i <= 17) continue;
+    const t = N - 300 + i * STEP;
+    const nullCell = !!(o.nullCells && i === 8);   // 只缺 1 拍（Δ=2×STEP=30s < 缺口判据 45s）→ 只能由 null 分支断线，与时间缺口判据互不遮蔽
+    points.push({ t: t, g: {
+      0: { c: 60 + i, m: 70 + i * 1.2 },
+      1: nullCell ? { c: null, m: null } : { c: 58 + i, m: 68 + i },
+    } });
+  }
+  return {
+    ts: N * 1000, win_s: 300, sample_s: STEP, raw_points: 300, points: points,
+    stats: {
+      0: { core: { cur: 79, avg: 69.5, min: 60, max: 79, max_t: N - STEP, n: 20 }, mem: { cur: 92.8, avg: 81, min: 70, max: 92.8, max_t: N - STEP, n: 20 } },
+      1: { core: { cur: 77, avg: 67.5, min: 58, max: 77, max_t: N - STEP, n: 20 }, mem: { cur: 87, avg: 77, min: 68, max: 87, max_t: N - STEP, n: 20 } },
+    },
+    first_t: points[0].t, last_t: points[points.length - 1].t, now_s: N,
+    names: { 0: 'NVIDIA CMP 170HX', 1: 'NVIDIA CMP 170HX' },
+    thresholds: { mem_warn: 85, mem_crit: 95, core_warn: 70, core_crit: 85 },
+    live_age_s: 1, depth_s: 300,
+  };
+}
+function gpuTempInstallRec(w) {
+  const rec = { ops: [], text: [], arcs: 0 };
+  const fake = new Proxy({}, { get: (t, k) => {
+    if (k === 'fillText') return (txt) => { rec.ops.push('fillText'); rec.text.push(String(txt)); };
+    if (k === 'moveTo' || k === 'lineTo' || k === 'beginPath' || k === 'stroke') return () => { rec.ops.push(String(k)); };
+    if (k === 'arc') return () => { rec.arcs++; };
+    if (k === 'measureText') return () => ({ width: 10 });
+    return () => {};
+  }, set: () => true });
+  w.document.getElementById('gpuTempCanvas').getContext = () => fake;
+  w.__gpuTempRec = rec;
+  w.loadGpuTempTrend();
+  return new Promise((r) => setImmediate(r)).then(() => {
+    // 首帧已画完：冻结后续轮询重绘，断言只看这一次绘制的算子
+    w.loadGpuTempTrend = () => Promise.resolve();
+  });
+}
+// 每个 stroke 一组算子 → 该路径的子路径数：未断线=1，断一次=2。
+// 绘制顺序固定为 5 条网格 + 2 条阈值线 + 每卡（显存、核心）两条序列，故末尾 4 组=四条序列。
+function gpuTempSubpaths(rec) {
+  const out = []; let cur = 0;
+  for (const op of ((rec && rec.ops) || [])) {
+    if (op === 'beginPath') cur = 0;
+    else if (op === 'moveTo') cur++;
+    else if (op === 'stroke') out.push(cur);
+  }
+  return out;
+}
+
 const scenarios = {
   'index.html': [
     { name: '正常轮询（真实线上载荷）', ms: 20000, fetch: live, setup: connected,
@@ -136,6 +196,88 @@ const scenarios = {
         if (rows.indexOf('等待 GPU 静态信息') < 0) bad.push('空态提示缺失（实得 ' + JSON.stringify(rows.slice(0, 80)) + '）');
         const hint = w.document.getElementById('upHint').textContent || '';
         if (hint.indexOf('数据暂缺') < 0) bad.push('error 未透传到 upHint（实得 ' + JSON.stringify(hint) + '）');
+        return bad;
+      } },
+    // [gpu-temp-1103] 硬件监视页「GPU 温度曲线」卡：显存主曲线 + 核心对照线；缺口留白不插值
+    { name: 'GPU 温度曲线卡渲染（真实形态载荷）', ms: 8000, fetch: live,
+      setup: async (w) => { w.loadGpuTempTrend(); await new Promise((r) => setImmediate(r)); },
+      assert: (w, env, r) => {
+        const bad = [];
+        const legend = w.document.getElementById('gpuTempLegend').innerHTML || '';
+        if (legend.indexOf('CMP 170HX') < 0) bad.push('图例未渲染逐卡（实得 ' + JSON.stringify(legend.slice(0, 90)) + '）');
+        if (legend.indexOf('显存') < 0 || legend.indexOf('峰 ') < 0 || legend.indexOf('均 ') < 0) bad.push('图例缺显存现值/峰值/均值');
+        if (legend.indexOf('核心') < 0) bad.push('未显示核心对照值（默认应开）');
+        const hint = w.document.getElementById('storageGpuTempHint').textContent || '';
+        if (hint.indexOf('逐秒采样') < 0) bad.push('hint 未显示采样口径（实得 ' + JSON.stringify(hint) + '）');
+        if (hint.indexOf('85/95') < 0) bad.push('hint 未透传显存阈值 85/95（阈值分轨口径）');
+        const meta = w.document.getElementById('gpuTempMeta').textContent || '';
+        if (meta.indexOf('粗实线 = 显存') < 0) bad.push('meta 未标主线口径（实得 ' + JSON.stringify(meta) + '）');
+        if (meta.indexOf('最热显存') < 0) bad.push('meta 未给窗口内最热显存值');
+        if (meta.indexOf('不插值') < 0) bad.push('meta 未标缺口口径（留白=未采到）');
+        if (!r.fetchCalls.some((x) => x.indexOf('/v1/internal/gpu-temp?win=') >= 0)) bad.push('未轮询 /v1/internal/gpu-temp');
+        return bad;
+      } },
+    { name: 'GPU 温度曲线卡：显存列全缺（驱动不返回 temperature.memory）→ 标不可用，绝不画 0 ℃', ms: 8000,
+      fetch: (u) => (u.indexOf('gpu-temp') >= 0 ? (() => {
+        const n = Math.floor(Date.now() / 1000);
+        return { ts: n * 1000, win_s: 600, sample_s: 10, raw_points: 3,
+          points: [{ t: n - 30, g: { 0: { c: 61, m: null } } }, { t: n - 20, g: { 0: { c: 62, m: null } } }, { t: n - 10, g: { 0: { c: 63, m: null } } }],
+          stats: { 0: { core: { cur: 63, avg: 62, min: 61, max: 63, max_t: null, n: 3 }, mem: { cur: null, avg: null, min: null, max: null, max_t: null, n: 0 } } },
+          now_s: n, names: { 0: 'NVIDIA CMP 170HX' },
+          thresholds: { mem_warn: 85, mem_crit: 95, core_warn: 70, core_crit: 85 }, live_age_s: 1, depth_s: 300 };
+      })() : live(u)),
+      setup: async (w) => { w.loadGpuTempTrend(); await new Promise((r) => setImmediate(r)); },
+      assert: (w, env, r) => {
+        const legend = w.document.getElementById('gpuTempLegend').innerHTML || '';
+        const bad = [];
+        if (legend.indexOf('显存温度不可用') < 0) bad.push('未标"显存温度不可用"（实得 ' + JSON.stringify(legend.slice(0, 120)) + '）');
+        if (legend.indexOf('显存 <b') >= 0) bad.push('缺失值被当成测量值画出了数值');
+        return bad;
+      } },
+    { name: 'GPU 温度曲线卡：采样中断 90s（驱动熔断）→ 黄字明示曲线停更，不得静默', ms: 8000,
+      fetch: (u) => (u.indexOf('gpu-temp') >= 0 ? Object.assign({}, fixtureFor(u), { live_age_s: 90 }) : live(u)),
+      setup: async (w) => { w.loadGpuTempTrend(); await new Promise((r) => setImmediate(r)); },
+      assert: (w, env, r) => {
+        const hint = w.document.getElementById('storageGpuTempHint').textContent || '';
+        return (hint.indexOf('采样已中断 90 秒') >= 0) ? null : ['未透传采样中断提示（实得 ' + JSON.stringify(hint) + '）'];
+      } },
+    { name: 'GPU 温度曲线卡：接口 500 → 保留上一帧，轮询不得停', ms: 15000,
+      fetch: (u) => (u.indexOf('gpu-temp') >= 0 ? 'fail' : live(u)),
+      setup: async (w) => { w.loadGpuTempTrend(); await new Promise((r) => setImmediate(r)); },
+      assert: (w, env, r) => {
+        const n = r.fetchCalls.filter((x) => x.indexOf('gpu-temp') >= 0).length;
+        return n >= 5 ? null : ['取数失败后轮询停止（gpu-temp 仅 ' + n + ' 次）'];
+      } },
+    // 绘制语义：canvas 的 ctx 在桩里是空函数，这里换成记录器，直接验"画了什么"——
+    // 纵轴刻度、显存阈值线、缺口是否真的断线（不是连成一条斜线骗眼睛）、线尾打点。
+    { name: 'GPU 温度曲线卡：绘制语义·单卡缺值断线 + 阈值线 + 线尾打点', ms: 8000,
+      fetch: (u) => (u.indexOf('gpu-temp') < 0 ? live(u) : gpuTempFixture({ nullCells: true, dropBeats: false })),
+      setup: async (w) => gpuTempInstallRec(w),
+      assert: (w, env, r) => {
+        const rec = w.__gpuTempRec || { ops: [], text: [], arcs: 0 };
+        const bad = [];
+        const txt = rec.text.join(' | ');
+        if (rec.text.length < 5) bad.push('画布几乎没有落笔（fillText ' + rec.text.length + ' 次）');
+        if (txt.indexOf('显存警戒 85') < 0 || txt.indexOf('显存危险 95') < 0) bad.push('显存阈值参考线未画（实得 ' + txt + '）');
+        if (!/\d+ ℃/.test(txt)) bad.push('纵轴无 ℃ 刻度');
+        const sp = gpuTempSubpaths(rec).slice(-4);
+        if (sp.length !== 4) bad.push('序列线条数应为 4（2 卡 × 显存/核心），实得 ' + sp.length);
+        else {
+          if (!(sp[2] >= 2 && sp[3] >= 2)) bad.push('GPU1 单卡缺值处未断线（子路径 ' + JSON.stringify(sp) + '，曲线被连成假直线）');
+          if (sp[0] !== 1 || sp[1] !== 1) bad.push('GPU0 全程有值却被误断线（子路径 ' + JSON.stringify(sp) + '）');
+        }
+        if (rec.arcs !== 2) bad.push('线尾当前值打点应每卡一个，实得 ' + rec.arcs);
+        return bad;
+      } },
+    { name: 'GPU 温度曲线卡：绘制语义·整拍缺席按时间缺口断线', ms: 8000,
+      fetch: (u) => (u.indexOf('gpu-temp') < 0 ? live(u) : gpuTempFixture({ nullCells: false, dropBeats: true })),
+      setup: async (w) => gpuTempInstallRec(w),
+      assert: (w, env, r) => {
+        const rec = w.__gpuTempRec || { ops: [] };
+        const sp = gpuTempSubpaths(rec).slice(-4);
+        const bad = [];
+        if (sp.length !== 4) bad.push('序列线条数应为 4，实得 ' + sp.length);
+        else if (sp.some((n) => n < 2)) bad.push('整拍缺席处未断线（子路径 ' + JSON.stringify(sp) + '：连续 4 拍没有样本点却连成一条线）');
         return bad;
       } },
   ],

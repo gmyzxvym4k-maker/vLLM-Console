@@ -6731,11 +6731,19 @@ function drawGpuTempTrend(cvId, metaId, pts, series, d, winS, winLabel) {
         }
     }
     if (!Number.isFinite(lo)) { lo = 40; hi = 90; }
-    lo = Math.min(lo, tw) - 2;
-    hi = Math.max(hi, tw + 2);
-    if (hi >= tc - 10) hi = Math.max(hi, tc + 2);
-    const bottom = Math.max(0, Math.floor(lo / 5) * 5);
-    const top = Math.max(bottom + 10, Math.ceil(hi / 5) * 5);
+    // 轴范围：默认把「显存警戒线」框进来（温度曲线要看得见余量），但只有数据真的逼近危险线
+    // 才把 95 也拉进图内——否则空载时曲线会被挤在画布下沿一小条。
+    const dataLo = lo, dataHi = hi;
+    lo = Math.min(dataLo, tw) - 2;
+    hi = Math.max(dataHi, tw + 2);
+    if (dataHi >= tc - 8) hi = Math.max(hi, tc + 2);
+    // 网格档位：选让格数 ≤6 的最小整档（2/5/10/20），保证刻度落在 40/60/80 这种整数值上——
+    // 直接按 (top-bottom)/4 等分会得到 44/63/81 这种没法读的刻度（1103 截图实锤）。
+    const range = Math.max(10, hi - lo);
+    let gridStep = 20;
+    for (const cand of [2, 5, 10, 20]) { if (range / cand <= 6) { gridStep = cand; break; } }
+    const bottom = Math.max(0, Math.floor(lo / gridStep) * gridStep);
+    const top = Math.max(bottom + gridStep * 2, Math.ceil(hi / gridStep) * gridStep);
     const padL = 40, padR = 10, padT = 8, padB = 16;
     const plotW = Math.max(10, W - padL - padR), plotH = Math.max(10, H - padT - padB);
     const nowS = (d && d.now_s) ? d.now_s : Math.floor(Date.now() / 1000);
@@ -6743,8 +6751,7 @@ function drawGpuTempTrend(cvId, metaId, pts, series, d, winS, winLabel) {
     const x = (t) => padL + plotW * Math.max(0, Math.min(1, (t - t0) / winS));
     const y = (v) => padT + plotH * (1 - (Math.max(bottom, Math.min(top, v)) - bottom) / (top - bottom));
     ctx.font = '10px sans-serif'; ctx.lineWidth = 1;
-    for (let gi = 0; gi <= 4; gi++) {
-        const gv = bottom + (top - bottom) * (gi / 4);
+    for (let gv = bottom; gv <= top + 0.001; gv += gridStep) {
         const gy = Math.round(y(gv)) + 0.5;
         ctx.strokeStyle = 'rgba(148,163,184,.16)';
         ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(W - padR, gy); ctx.stroke();

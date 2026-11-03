@@ -260,6 +260,15 @@ const scenarios = {
         if (rec.text.length < 5) bad.push('画布几乎没有落笔（fillText ' + rec.text.length + ' 次）');
         if (txt.indexOf('显存警戒 85') < 0 || txt.indexOf('显存危险 95') < 0) bad.push('显存阈值参考线未画（实得 ' + txt + '）');
         if (!/\d+ ℃/.test(txt)) bad.push('纵轴无 ℃ 刻度');
+        // 纵轴刻度必须是 5 的整档且等距——原实现按 (top-bottom)/4 等分，线上截图实锤得到
+        // 44/63/81 这种读不出来的刻度（1103 修）。
+        const ticks = rec.text.filter((t) => /^\d+ ℃$/.test(t)).map((t) => parseInt(t, 10));
+        if (ticks.length < 3) bad.push('纵轴刻度少于 3 条（实得 ' + JSON.stringify(ticks) + '）');
+        else {
+          if (ticks.some((v) => v % 5 !== 0)) bad.push('纵轴刻度不是 5 的整档：' + JSON.stringify(ticks));
+          const diffs = ticks.slice(1).map((v, i) => v - ticks[i]);
+          if (new Set(diffs).size !== 1) bad.push('纵轴刻度不等距：' + JSON.stringify(ticks));
+        }
         const sp = gpuTempSubpaths(rec).slice(-4);
         if (sp.length !== 4) bad.push('序列线条数应为 4（2 卡 × 显存/核心），实得 ' + sp.length);
         else {

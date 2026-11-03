@@ -436,6 +436,101 @@ async function ta(name, fn) {
     return (p.depth_s === 0 && p.live_age_s === null) || ('空态元数据错：' + JSON.stringify({ d: p.depth_s, a: p.live_age_s }));
   });
 
+
+// ============ 15. 脚本模型快启参数下发 [spec-dflash-1103] ============
+// 背景（09-26「参数三跳」铁律的第三跳断点）：plan 的 dflash 分支此前只 push 警告、从不设
+// env.FN_SPEC，inner 于是落到自己的缺省 MTP4 —— 弹窗/快启选 DFlash2 会静默变 MTP 且警告相反。
+// 注意：SCRIPT_MODELS 的 w4a16 条目是顶层 ExpressionStatement（SCRIPT_MODELS[...] = {...}），
+// pieces 只收 FunctionDeclaration/VariableDeclaration，故这里手工切「声明 + 追加赋值」整段。
+function loadPlanChain(totalmemGiB) {
+  const i0 = SRC.indexOf('const SCRIPT_MODELS = {');
+  const i1 = SRC.indexOf('\nfunction scriptModelForName(', i0);
+  const vr0 = SRC.indexOf('function scriptModelVariantResolve(');
+  const vr1 = SRC.indexOf('function scriptModelLaunchPlan(', vr0);
+  const lp1 = SRC.indexOf('// ====== SGLang 脚本栈', vr1);
+  if (i0 < 0 || i1 < 0 || vr0 < 0 || vr1 < 0 || lp1 < 0) throw new Error('plan 链切片锚点失效');
+  const code = 'var MODEL_ALIASES = {};\n' + SRC.slice(i0, i1) + '\n' + SRC.slice(vr0, lp1);
+  const ctx = vm.createContext({
+    console, JSON, Math, parseInt, parseFloat, isNaN, String, Number, Object, Array, process,
+    require: (m) => (m === 'os' ? { totalmem: () => totalmemGiB * 1024 * 1024 * 1024 } : require(m)),
+  });
+  vm.runInContext(code + '\n;globalThis.__box = { scriptModelLaunchPlan, SCRIPT_MODELS };', ctx);
+  return ctx.__box;
+}
+{
+  // 251GiB = 11-03 生产机实况（heapoffload/低内存护栏依赖 os.totalmem，测试必须钉死内存而非跟随测试机）
+  const P = loadPlanChain(251);
+  const SM = () => Object.assign({ key: 'qwen3.8-flash-next-w4a16' }, P.SCRIPT_MODELS['qwen3.8-flash-next-w4a16']);
+  const baseParams = {
+    modelName: 'Qwen3.8-Flash-Next-W4A16-AutoRound', port: 18420, servedName: 'qwen3.8-flash-next',
+    maxModelLen: '1048576', longCtx: '1m', parallelMode: 'pp', gpuCount: '2',
+    maxNumSeqs: '4', maxBatchedTokens: '8192', blockSize: '1680', gpuMemUtil: '0.95',
+    kvoff: 'simple', kvoffGiB: '96', pleInt8: '0', pleLoc: 'heap',
+    thinking: '1', thinkingEffort: 'xhigh',
+  };
+  t('dflash=1 → FN_SPEC 真下发（键序 method→model→num_speculative_tokens，与 launch.env 逐字可比）', () => {
+    const e = P.scriptModelLaunchPlan(SM(), Object.assign({}, baseParams, { dflash: '1', mtpTokens: '7' })).env;
+    return e.FN_SPEC === '{"method":"dflash","model":"/media/ll/data/models/Qwen3.8-Flash-Next-DFlash2","num_speculative_tokens":7}' || String(e.FN_SPEC);
+  });
+  t('dflash 草稿可被预设显式 specDraftModel 覆盖（固化档自带草稿路径，不随注册表默认漂移）', () => {
+    const e = P.scriptModelLaunchPlan(SM(), Object.assign({}, baseParams, { dflash: '1', mtpTokens: '7', specDraftModel: '/media/ll/data/models/Other' })).env;
+    return JSON.parse(e.FN_SPEC).model === '/media/ll/data/models/Other' || e.FN_SPEC;
+  });
+  t('dflash 步数钳 1~8（前端口径；0/99 不得原样下发给引擎）', () => {
+    const lo = JSON.parse(P.scriptModelLaunchPlan(SM(), Object.assign({}, baseParams, { dflash: '1', mtpTokens: '0' })).env.FN_SPEC).num_speculative_tokens;
+    const hi = JSON.parse(P.scriptModelLaunchPlan(SM(), Object.assign({}, baseParams, { dflash: '1', mtpTokens: '99' })).env.FN_SPEC).num_speculative_tokens;
+    return (lo === 1 && hi === 8) || (`lo=${lo} hi=${hi}`);
+  });
+  t('mtp=1 优先级与旧行为不变（method=mtp + use_local_argmax_reduction，dflash 未设时不受新分支影响）', () => {
+    const e = P.scriptModelLaunchPlan(SM(), Object.assign({}, baseParams, { mtp: '1', mtpTokens: '4' })).env;
+    return e.FN_SPEC === '{"method":"mtp","num_speculative_tokens":4,"use_local_argmax_reduction":false}' || String(e.FN_SPEC);
+  });
+  t('mtp=1 时即便同时勾了 dflash 也走 MTP（分支次序不得改动，防既有档位行为漂移）', () => {
+    const e = P.scriptModelLaunchPlan(SM(), Object.assign({}, baseParams, { mtp: '1', mtpTokens: '4', dflash: '1' })).env;
+    return JSON.parse(e.FN_SPEC).method === 'mtp' || e.FN_SPEC;
+  });
+  t('dspark=1 → 显式 FN_SPEC=none（警告称"无投机"必须成为真值，不得放任 inner 缺省 MTP4）', () => {
+    const r = P.scriptModelLaunchPlan(SM(), Object.assign({}, baseParams, { dspark: '1' }));
+    return r.env.FN_SPEC === 'none' || String(r.env.FN_SPEC);
+  });
+  t('未选任何投机 → FN_SPEC=none（回归：旧 else 分支语义不变）', () => {
+    const e = P.scriptModelLaunchPlan(SM(), Object.assign({}, baseParams, { mtp: '0' })).env;
+    return e.FN_SPEC === 'none' || String(e.FN_SPEC);
+  });
+  t('线上真实预设文件的 standard 档 = 11-03 实跑真值（固化回归锚：block1680/dflash7/simple96/heap/PP2/1M）', () => {
+    const cards = JSON.parse(fs.readFileSync(path.join(ROOT, 'quickstart-presets.json'), 'utf8'));
+    const std = (cards.flashnext.presets || []).find((x) => x.standard);
+    if (!std) return 'flashnext 卡没有 standard 档';
+    const e = P.scriptModelLaunchPlan(SM(), Object.assign({ modelName: std.modelName }, std.params || {})).env;
+    const want = { FN_BLOCK: '1680', FN_PP: '2', FN_TP: '1', FN_MAXLEN: '1048576', FN_GPUMEM: '0.95',
+      FN_SEQS: '4', FN_MBTOKENS: '8192', FN_SIMPLE_OFFLOAD: '96', FN_PLE_INT8: '0', FN_PLE_LOC: 'heap',
+      FN_LONGCTX: '1', FN_YARN_FACTOR: '4', FN_PORT: '18420', FN_SERVED: 'qwen3.8-flash-next',
+      FN_CHATKWARGS: '{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}',
+      FN_1M_MODEL_PATH: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-1M',
+      FN_MODEL_PATH: '/media/ll/data/models/Qwen3.8-Flash-Next-W4A16-AutoRound',
+      FN_SPEC: '{"method":"dflash","model":"/media/ll/data/models/Qwen3.8-Flash-Next-DFlash2","num_speculative_tokens":7}' };
+    const bad = Object.keys(want).filter((k) => e[k] !== want[k]).map((k) => `${k}: 得 ${e[k]} 期望 ${want[k]}`);
+    if (bad.length) return bad.join(' | ');
+    // 采样键刻意不下发（实跑走 inner 缺省 t1.0/p0.95/k20/minp0/pp0/rp1.0）
+    return e.FN_GENCFG === undefined || 'FN_GENCFG 不该下发：' + e.FN_GENCFG;
+  });
+  t('固化历史不覆盖：旧档位（w8a8 PP3/MTP4 等）params 未被本次改动影响', () => {
+    const cards = JSON.parse(fs.readFileSync(path.join(ROOT, 'quickstart-presets.json'), 'utf8'));
+    const keys = (cards.flashnext.presets || []).map((x) => x.key);
+    const must = ['w8a8-pp3-1m-mtp4', 'w8a8-pp3-512k-mtp4', 'w8a8-pp3-750k-mtp4', 'w4a16-pp2-1m-mtp4-bf16pin-gpu01'];
+    const missing = must.filter((k) => keys.indexOf(k) < 0);
+    if (missing.length) return '旧档位丢失：' + missing.join(',');
+    const w8 = (cards.flashnext.presets || []).find((x) => x.key === 'w8a8-pp3-1m-mtp4');
+    const e = P.scriptModelLaunchPlan(SM(), Object.assign({ modelName: w8.modelName }, w8.params)).env;
+    return (e.FN_SPEC === '{"method":"mtp","num_speculative_tokens":4,"use_local_argmax_reduction":false}' && e.FN_PP === '3' && e.FN_BLOCK === '1616') || JSON.stringify({ s: e.FN_SPEC, pp: e.FN_PP, b: e.FN_BLOCK });
+  });
+  t('低内存机护栏仍生效：PLE heap + 二级缓存 96GiB 在 <100GiB 机被强制降级 disk（新档不得绕过）', () => {
+    const Pl = loadPlanChain(32);
+    const e = Pl.scriptModelLaunchPlan(SM(), Object.assign({}, baseParams, { dflash: '1', mtpTokens: '7' })).env;
+    return e.FN_PLE_LOC === 'disk' || '未降级：' + e.FN_PLE_LOC;
+  });
+}
+
   // ============ 报告 ============
   console.log(`单元测试：通过 ${pass} / 失败 ${fail}`);
   failures.forEach((f) => console.log('  ✗ ' + f));

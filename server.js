@@ -798,6 +798,9 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   maxModelLenLong: 1048576,
   maxModelLen512: 524288,  // [512k-reg-1016] 512K 档 = YaRN×2；mrope 缓存恒 262144×4=1048576，512K 在缓存内安全
   longCtx512ModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-W4A16-AutoRound-512K',  // [512k-reg-1016] 顶层缺省与 longCtxModelPath 同形态（variant 命中时被覆盖）
+  // [spec-dflash-1103] DFlash 外部草稿 ckpt（Flash-Next 专属，非 27b 那份）。11-03 生产实跑真值：
+  // --speculative-config {"method":"dflash","model":"<本路径>","num_speculative_tokens":7}
+  dflashDraftModel: '/media/ll/data/models/Qwen3.8-Flash-Next-DFlash2',
 };
 MODEL_ALIASES['qwen3.8-flash-next-w4a16'] = 'qwen3.8-flash-next';
 MODEL_ALIASES['Qwen3.8-Flash-Next-W4A16-AutoRound'] = 'qwen3.8-flash-next';
@@ -1231,6 +1234,7 @@ function scriptModelVariantResolve(sm, d) {
   if (v.longCtxModelPath) { out.longCtxModelPath = v.longCtxModelPath; out.altModelPaths = [v.longCtxModelPath]; }
   if (v.longCtx512ModelPath) out.longCtx512ModelPath = v.longCtx512ModelPath;  // [512k-reg-1016] 512K 副本按 variant 下发（否则 tierPath 为空 → inner 拒启）
   if (v.pleInt8Dir !== undefined) out.pleInt8Dir = v.pleInt8Dir;
+  if (v.dflashDraftModel) out.dflashDraftModel = v.dflashDraftModel;  // [spec-dflash-1103] 草稿 ckpt 按 checkpoint 归属（不同权重量化各有专属草稿）
   if (v.pp) { out.variantPp = v.pp; out.variantMinGpus = v.minGpus || v.pp; }
   if (v.kvoff) out.variantKvoff = String(v.kvoff);
   if (v.kvoffGiB) out.variantKvoffGiB = v.kvoffGiB;
@@ -1414,7 +1418,7 @@ function scriptModelLaunchPlan(smIn, d) {
     }
     env.FN_CHATKWARGS = JSON.stringify(kw);
   }
-  // 投机：MTP 可用但本镜像 PP2 下不稳；DFlash/DSpark 无对应草稿 ckpt
+  // 投机：MTP / DFlash 均可真下发；DSpark 在本脚本栈无草稿 ckpt。
   if (String(d.mtp) === '1') {
     const n = int(d.mtpTokens, b.mtpTokens || 6);
     env.FN_SPEC = JSON.stringify({ method: 'mtp', num_speculative_tokens: n, use_local_argmax_reduction: false });
@@ -1422,8 +1426,22 @@ function scriptModelLaunchPlan(smIn, d) {
     warnings.push(sm.key === 'qwen3.8-flash-next-w4a16'
       ? `已启用 MTP(x${n})：W4A16 档实测稳定（09-19：接受长度 2.84、decode 111 tok/s、输出无乱码）。注意草稿档位受 QSA ring capacity 整除约束——block-size 1616 下合法档为 1~4 与 9~12，5~8 会启动即崩。`
       : `已启用 MTP(x${n})：本镜像 PP2 下 MTP 有连续长请求 device assert 残余 bug，不稳定请改回「无投机」`);
-  } else if (String(d.dflash) === '1' || String(d.dspark) === '1') {
-    warnings.push('Flash-Next-NVFP4 无 DFlash/DSpark 草稿 ckpt，已按「无投机」启动');
+  } else if (String(d.dflash) === '1') {
+    // [spec-dflash-1103] 修复「第三跳断点」（09-26 参数三跳铁律的复发形态）：本分支此前与 DSpark
+    // 合并成一句「无草稿 ckpt，已按无投机启动」的警告，但**从不设 env.FN_SPEC** —— inner 于是落到
+    // 自己的缺省 `{"method":"mtp","num_speculative_tokens":4,...}`，弹窗/快启选 DFlash2 静默变 MTP4，
+    // 且警告文案与实际下发相反。11-03 固化生产实跑档（dflash + DFlash2 草稿 + 7）时必须接通。
+    // 键序与实跑 launch.env 逐字一致（method→model→num_speculative_tokens），便于 diff 验收。
+    const n = Math.max(1, Math.min(8, int(d.mtpTokens, 7)));   // 前端口径 1~8；DFlash2 推荐 7（11-03 实跑值）
+    const draft = String(d.specDraftModel || sm.dflashDraftModel || '').trim()
+      || '/media/ll/data/models/Qwen3.8-Flash-Next-DFlash2';
+    env.FN_SPEC = JSON.stringify({ method: 'dflash', model: draft, num_speculative_tokens: n });
+    // 外部草稿不吃 MTP 的 QSA ring 整除约束（inner 对非 mtp method 跳过该自检，见 0310 inner §1）
+    warnings.push(`已启用 DFlash 投机：草稿 ${draft}，num_speculative_tokens=${n}。外部 block-diffusion 草稿不受 MTP 的 QSA ring 整除约束（block-size 可自由取档）。`);
+  } else if (String(d.dspark) === '1') {
+    // DSpark 无本栈草稿 ckpt：显式下发 none（而非放任 inner 缺省 MTP4），让警告文案成为真值。
+    env.FN_SPEC = 'none';
+    warnings.push('Flash-Next 脚本栈无 DSpark 草稿 ckpt，已按「无投机」启动（显式 FN_SPEC=none，不会回落脚本缺省的 MTP4）');
   } else {
     // 未选投机：显式下发 none，避免脚本侧缺省值（W4A16 缺省=MTP4）被误用
     env.FN_SPEC = 'none';

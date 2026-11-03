@@ -1,5 +1,18 @@
 # 更新日志
 
+## 2026-11-03 [qs-dflash-1103] 固化当前 vLLM 实跑参数为快启默认档 + 打通 DFlash 下发链（已上线 .127）
+- 把 11-03 18:21:31 在跑的 18420 实例（pid 1114856，官方 vLLM 0.31 新栈）逐键固化为 flashnext 卡新默认档 `w4a16-pp2-1m-dflash7-b1680`：**W4A16-AutoRound 的 1M YaRN×4 副本 · TP1×PP2 · block-size 1680 · DFlash 外部草稿×7 · SimpleCPU 二级缓存 96GiB · PLE BF16 锁页 · 思考 xhigh · 采样落 inner 缺省（t1/p0.95/k20/minp0/pp0/rp1）**。
+- **不覆盖历史**：四条旧档位（w8a8 PP3 1M/512K/750K、11-02 的 w4a16-pp2-1m-mtp4-bf16pin-gpu01）params 逐字段原样保留、全部留在下拉，只把 `standard` 默认标记从 11-02 档移到新档（旧档名尾标〔…·旧默认〕）；uncensored 卡零改动。校验＝逐档 diff 旧 params 全等 + 新组单测「固化历史不覆盖」锁住。
+- **必修前提（`[spec-dflash-1103]`，server.js）**：`scriptModelLaunchPlan()` 的 dflash 分支此前与 DSpark 合并成一句"无草稿 ckpt，已按无投机启动"的警告，但**从不设 `env.FN_SPEC`** → inner 落到自己的缺省 `{"method":"mtp","num_speculative_tokens":4}`，弹窗/快启选 DFlash2 **静默变 MTP4 且警告文案与真值相反**——是 09-26「脚本化模型参数三跳」铁律的第三跳断点（前两跳已通，最后一跳没人接）。现按实跑键序真下发 `{"method":"dflash","model":<草稿>,"num_speculative_tokens":<N>}`（草稿优先级 预设 `specDraftModel` > 注册表 `sm.dflashDraftModel` > Flash-Next 内置草稿；步数钳 1~8 同前端口径），并给正面提示而非"未启用"。DSpark 分支保留警告但改为显式 `FN_SPEC=none`，让文案成为真值。MTP 分支次序与语义零改动（`mtp=1` 仍优先）。
+- 注册表新增 `SCRIPT_MODELS['qwen3.8-flash-next-w4a16'].dflashDraftModel`（Flash-Next 专属草稿 `/media/ll/data/models/Qwen3.8-Flash-Next-DFlash2`，非 27b 那份）+ `scriptModelVariantResolve` 支持按 checkpoint 变体覆盖草稿；旧预设都不带 dflash 键 → 不进新分支，**既有档位行为不漂移**。
+- 采样键刻意不写进预设：plan 判与 `base` 全同即不下发 `FN_GENCFG`，引擎落 inner 缺省——与实跑 `--override-generation-config` 逐字相同（写了反而多一条会随 base 漂移的下发）。`cudaDevs` 同理不带（实跑 launch.env 无该键，inner 按 PP×TP 缺省取 0,1）。
+- **三重验收**（全部用线上件、在目标机上跑，防本机内存差异污染 `os.totalmem()` 护栏判断）：① 切 `scriptModelLaunchPlan` 跑新预设 params ↔ `vllm-0310/launch.env` → **21 键逐字一致**，3 处差异均等价（plan 多下 `FN_KVOFF=0` 同 inner 缺省、`FN_PLE_INT8_DIR` 同 inner 缺省；实跑多 `FN_PLE_MMAP=0` 由 `FN_PLE_INT8=0` 推得）；② plan.env 喂 inner `FN_DRY_RUN=1`（root，绕开 `FN_SIMPLE_OFFLOAD>0` 的非 root 预检）打 argv ↔ `/proc/<pid>/cmdline` → **58/58 token 全等**，且 inner「未消费参数体检」零告警（23 键全被消费）；③ 控制台 `GET /v1/internal/model-params` 显示层真值逐项吻合（block 1680 / pp 2 / `dflash=true` / speculative_config 与预设下发串逐字同 / xhigh / ple bf16-pinned）。
+- 回归：unit 69/0（+11，新组「脚本模型快启参数下发」——dflash 下发含键序、specDraftModel 覆盖、步数钳 1/8、MTP 优先与旧行为、mtp+dflash 同选仍走 MTP、dspark 显式 none、无投机 none、线上 standard 档固化锚、旧档位未被影响、32GiB 低内存机 PLE 强制降级）；pages 全场景 0 失败。
+- 同批把仓库缺失的 0310 启动三件套按线上入库（`vllm-0310/bin/flash-next-0310-inner.sh`、`start/stop-flash-next-0310.sh`，md5 与线上逐字节一致）+ `quickstart-presets.json` 以线上 11-02 版为基线收敛（仓库原落后 4KB）。
+- 部署：`server.js`（需重启 `dsh-console`）+ `quickstart-presets.json`（每请求 fs 热读，scp 即生效）。上线后 `systemctl --user restart dsh-console` → **引擎 pid 1114856 未变**（引擎属 `fnx-18420-watchdog.service` cgroup，与控制台是兄弟，10-17/10-27 三条再证）；18420 `/v1/models` 200、8889 首页 200。
+- ⚠️ 运维提醒：本档依赖新版 server.js 的 dflash 下发；若回滚 server.js 而留着新档，点它会静默落回 MTP4（回滚必须两件一起）。看门狗 `fnx-18420-watchdog.service` 当前 inactive，且其自愈路径历史上会剥档（10-11 条），崩溃自愈后需按本档手工或控制台重起。
+- 回滚：`deploy/server.js.bak-dflash-1103-184715`（回滚须与下件同时）+ `deploy/quickstart-presets.json.bak-cur-1103-184715`。
+
 ## 2026-11-03 [gpu-temp 1103] GPU 温度曲线（显存 / 核心）（已上线 .127，页面 r53）
 - 硬件监视页新增「GPU 温度曲线」卡：**主曲线=显存温度**（`temperature.memory`，逐卡一色粗实线 + 线尾打点），对照曲线=核心温度（同色细虚线，可开关），窗口 3/10/30/60 分钟。选显存作主值是因为 GDDR 热点比核心更早出损伤（与 10-09 高温关机守护取 `max(核心,显存)` 同源口径）。
 - 后端 `[gpu-temp 1103]`：GPU 采样器 `sampleGpuStats` 同拍落一条逐秒温度历史（`global.__gpuTempHistory`，环形保留 3600 点=1 小时），**零新增 nvidia-smi**（复用 09-20 铁律放弃式熔断通道的既有采样）；新只读接口 `GET /v1/internal/gpu-temp?win=`（窗口钳 30–3600s，桶均值抽稀到 ≤300 点，1 小时窗口响应仍只 ~7KB）。

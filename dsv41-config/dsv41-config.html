@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DSV4.1-Flash 专属配置 · vLLM 管理台</title>
+<style>
+  :root{
+    --bg:#f1f5f9; --card:#ffffff; --inset:#f8fafc; --border:#e2e8f0; --line:#f1f5f9;
+    --text:#0f172a; --text2:#475569; --text3:#94a3b8;
+    --accent:#6366f1; --accent-bg:#eef2ff; --green:#10b981; --green-bg:#ecfdf5;
+    --orange:#f59e0b; --orange-bg:#fffbeb; --red:#ef4444; --red-bg:#fef2f2;
+    --blue:#3b82f6; --blue-bg:#eff6ff;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0b1120; --card:#131c31; --inset:#1a2642; --border:#1e293b; --line:#1a2642;
+      --text:#e2e8f0; --text2:#94a3b8; --text3:#64748b;
+      --accent:#818cf8; --accent-bg:#1e1b4b; --green:#34d399; --green-bg:#064e3b;
+      --orange:#fbbf24; --orange-bg:#451a03; --red:#f87171; --red-bg:#450a0a;
+      --blue:#60a5fa; --blue-bg:#1e3a5f;
+    }
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;padding:16px 18px 36px}
+  .head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+  .head h1{font-size:17px;font-weight:700;display:flex;align-items:center;gap:8px}
+  .head h1 i{width:9px;height:9px;border-radius:50%;background:var(--accent);display:inline-block}
+  .sub{font-size:12px;color:var(--text3)}
+  .spacer{flex:1}
+  .badge{font-size:12px;font-weight:600;padding:4px 11px;border-radius:20px;background:var(--green-bg);color:var(--green);white-space:nowrap}
+  .badge.warn{background:var(--orange-bg);color:var(--orange)}
+  .badge.err{background:var(--red-bg);color:var(--red)}
+  .badge.gray{background:var(--inset);color:var(--text3)}
+  button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text2);padding:7px 13px;font-size:13px;transition:.15s}
+  button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  button.primary:hover:not(:disabled){filter:brightness(1.08);color:#fff}
+  button.danger{color:var(--red)}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin-bottom:13px}
+  .card h2{font-size:13px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+  .card h2::before{content:"";width:3px;height:13px;border-radius:2px;background:var(--accent);display:inline-block}
+  .card h2 .hint{font-size:11px;font-weight:400;color:var(--text3);margin-left:auto}
+  .note{font-size:12px;line-height:1.7;border-radius:9px;padding:9px 12px;margin-bottom:12px}
+  .note.info{background:var(--blue-bg);color:var(--blue)}
+  .note.warn{background:var(--orange-bg);color:var(--orange)}
+  .note.err{background:var(--red-bg);color:var(--red)}
+  .note.ok{background:var(--green-bg);color:var(--green)}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:9px}
+  .kpi{background:var(--inset);border:1px solid var(--border);border-radius:9px;padding:9px 11px;min-height:64px}
+  .kpi .l{font-size:11px;color:var(--text3);margin-bottom:3px}
+  .kpi .v{font-size:17px;font-weight:700;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .kpi .v small{font-size:11px;font-weight:500;color:var(--text3)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px 16px}
+  .fld label{display:block;font-size:12px;font-weight:600;margin-bottom:5px;color:var(--text2)}
+  .fld label span{font-weight:400;color:var(--text3);cursor:help;border-bottom:1px dotted var(--text3)}
+  .fld input,.fld select{width:100%;font:inherit;font-size:13px;padding:7px 9px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);outline:none}
+  .fld input:focus,.fld select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
+  .fld .tip{font-size:11px;color:var(--text3);margin-top:4px;line-height:1.5}
+  .fld .tip b{color:var(--text2);font-weight:600}
+  .fld .tip.warn{color:var(--orange)}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+  .chip{padding:4px 11px;font-size:12px;line-height:1.4;border-radius:20px;background:var(--inset);color:var(--text2);font-variant-numeric:tabular-nums}
+  .chip:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+  .chip.active{background:var(--accent-bg);border-color:var(--accent);color:var(--accent);font-weight:700}
+  .actions{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin-top:14px;padding-top:13px;border-top:1px solid var(--line)}
+  .actions .grow{flex:1}
+  .keybox{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text3)}
+  .keybox input{width:120px;font-size:12px;padding:5px 8px;border-radius:7px;border:1px solid var(--border);background:var(--card);color:var(--text)}
+  .chk{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);white-space:nowrap;cursor:pointer}
+  .chk input{width:14px;height:14px;accent-color:var(--accent);cursor:pointer}
+  .chk.disabled{opacity:.45;cursor:not-allowed}
+  pre{background:var(--inset);border:1px solid var(--border);border-radius:9px;padding:10px 12px;font:11px/1.55 var(--mono);color:var(--text2);max-height:230px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+  .kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:6px 18px;font-size:12px}
+  .kv div{display:flex;gap:8px;border-bottom:1px solid var(--line);padding:5px 0}
+  .kv b{color:var(--text3);font-weight:500;min-width:96px;flex-shrink:0}
+  .kv span{font-family:var(--mono);font-size:11px;word-break:break-all;color:var(--text2)}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--text3);font-weight:500;font-size:11px}
+  td.mono{font-family:var(--mono);font-size:11px}
+  .diff{font-size:12px;color:var(--orange);margin-top:8px;line-height:1.7}
+  .diff b{color:var(--text2)}
+  .hidden{display:none!important}
+  .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:r .8s linear infinite;vertical-align:-1px;margin-right:5px}
+  @keyframes r{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="head">
+  <h1><i></i>DSV4.1-Flash 专属配置</h1>
+  <span class="sub">DeepSeek-V4.1-Flash · 4× CMP 170HX · Docker recipe</span>
+  <span class="sub" id="buildTag" title="页面构建标记，用于确认浏览器加载的是最新版本">build 1111-1112</span>
+  <span class="spacer"></span>
+  <span id="svcBadge" class="badge gray">检测中…</span>
+  <button onclick="load(true)">刷新</button>
+</div>
+
+<div id="msg"></div>
+
+<div class="card">
+  <h2>当前运行状态 <span class="hint" id="checkedAt">—</span></h2>
+  <div class="kpis" id="kpis"><div class="kpi"><div class="l">加载中</div><div class="v">—</div></div></div>
+  <div id="pendingBox"></div>
+  <div class="actions" style="margin-top:12px">
+    <button class="primary" id="btnStart" onclick="serviceAction('start')">启动模型</button>
+    <button class="danger" id="btnStop" onclick="serviceAction('stop')">停止模型</button>
+    <span class="grow"></span>
+    <span class="sub" id="svcHint">—</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>配置编辑 <span class="hint">修改写入 .env，应用后需重建容器（约 6–9 分钟）</span></h2>
+  <div class="note info">这些参数在 vLLM 启动时固定，保存后必须点「保存并应用」才会生效。应用期间 API 会短暂不可用；管理控制台、CORS 网关与 P2P 修复不受影响。改端口后 CORS 网关(8001)与浏览器跨域重定向会自动指向新端口，但客户端里填的 Base URL 要手动同步。</div>
+  <div class="grid">
+    <div class="fld">
+      <label>模型名称 <span title="对外 API 显示的模型 ID">(?)</span></label>
+      <input id="f_SERVED_MODEL_NAME" spellcheck="false" placeholder="dsv41-flash">
+      <div class="tip">/v1/models 与请求里的 model 字段；改名后客户端配置要同步。</div>
+    </div>
+    <div class="fld">
+      <label>并发数 <span title="--max-num-seqs">(?)</span></label>
+      <input id="f_MAX_SEQS" type="number" min="1" max="32" step="1">
+      <div class="tip">同时处理的最大请求数（1–32），超出的排队。</div>
+    </div>
+    <div class="fld">
+      <label>服务端口 <span title="start.sh 的 PORT">(?)</span></label>
+      <input id="f_PORT" type="number" min="1024" max="65535" step="1" placeholder="8000">
+      <div class="tip">对外 API 端口（1024–65535）。8001/8002/8889/5173 已被占用。应用后 CORS 网关与跨域重定向自动跟随，客户端 Base URL 需同步改。</div>
+    </div>
+    <div class="fld">
+      <label>上下文大小 <span title="--max-model-len">(?)</span></label>
+      <input id="f_MAX_MODEL_LEN" type="number" min="8192" max="1048576" step="1024">
+      <div class="chips" id="ctxChips">
+        <button type="button" class="chip" data-ctx="131072">128K</button>
+        <button type="button" class="chip" data-ctx="262144">256K</button>
+        <button type="button" class="chip" data-ctx="524288">512K</button>
+        <button type="button" class="chip" data-ctx="1048576">1M</button>
+      </div>
+      <div class="tip" id="ctxTip">单请求最大 token（8192–1048576，模型原生上限 1M）。256K 为默认值。</div>
+    </div>
+    <div class="fld">
+      <label>批量 Token 上限 <span title="--max-num-batched-tokens">(?)</span></label>
+      <input id="f_MAX_BATCHED" type="number" min="256" max="8192" step="128">
+      <div class="tip">调度器每步处理的最大 token 总量（256–8192）。</div>
+    </div>
+    <div class="fld">
+      <label>P2P 模式 <span title="跨卡直连">(?)</span></label>
+      <select id="f_P2P">
+        <option value="auto">auto · 校验后启用（推荐）</option>
+        <option value="off">off · 关闭全部跨卡传输</option>
+        <option value="force">force · 跳过校验（有掉卡风险）</option>
+      </select>
+      <div class="tip">auto 依赖已固化的 ACS 修复服务；force 可能触发 GPU 掉总线。</div>
+    </div>
+    <div class="fld">
+      <label>API Key <span title="留空表示不修改">(?)</span></label>
+      <input id="f_API_KEY" type="text" spellcheck="false" autocomplete="off" placeholder="留空 = 不修改">
+      <div class="tip" id="apiKeyTip">当前密钥已隐藏；留空表示不修改。</div>
+    </div>
+  </div>
+  <div class="actions">
+    <div class="keybox">管理密钥 <input id="adminKey" type="password" autocomplete="off" placeholder="与 API Key 相同" title="写操作需要填写当前 API Key，仅保存在本浏览器会话"></div>
+    <button onclick="preview()">预览改动</button>
+    <button onclick="save(false)">仅保存（不重启）</button>
+    <button class="primary" id="applyBtn" onclick="save(true)">保存并应用</button>
+    <label class="chk" title="点「保存」或「保存并应用」时，把这次写入 .env 的参数同时保存为可恢复的默认启动配置。"><input type="checkbox" id="saveAsDefault"> 同时存为默认启动配置</label>
+    <span class="grow"></span>
+    <button onclick="dryRun()">预演启动命令</button>
+  </div>
+  <div id="previewBox"></div>
+</div>
+
+<div class="card" id="defaultCard">
+  <h2>默认启动配置 <span class="hint">确认可用的启动参数快照 · 可随时恢复</span></h2>
+  <div class="note info">「默认启动配置」是一份与当前 .env 独立的参数快照：保存后即使后续改动把参数调乱，也能一键载入表单或覆盖回 .env。<b>容器运行中时优先保存「运行中配置」</b>——它反映当前真实生效的参数（已排除 .env 里尚未应用的编辑）；「.env」则是下次启动将使用的参数。启用下方参数后，点「启动模型」会先把默认配置写回 .env 再启动；「保存并应用」永远使用表单里当前保存的配置。</div>
+  <div id="defaultBody" class="sub">加载中…</div>
+  <div class="actions">
+    <button class="primary" id="btnSaveRunning" onclick="saveDefault('running')">保存运行中配置为默认</button>
+    <button id="btnSaveDefault" onclick="saveDefault('env')">保存 .env 为默认</button>
+    <button id="btnLoadDefaultForm" onclick="loadDefaultToForm()">载入默认配置到表单</button>
+    <button id="btnRestoreDefault" onclick="restoreDefaultEnv()">用默认配置覆盖 .env</button>
+    <button class="danger" id="btnClearDefault" onclick="clearDefault()">清除默认配置</button>
+    <span class="grow"></span>
+    <label class="chk" id="autoDefaultWrap" title="启用后，点「启动模型」会先把默认启动配置写回 .env 再启动；容器重建（保存并应用）不受影响。"><input type="checkbox" id="autoDefault" onchange="setAutoDefault(this.checked)"> 启动模型时自动套用默认配置</label>
+  </div>
+</div>
+
+<div class="card" id="applyCard">
+  <h2>任务进度 <span class="hint" id="applyPhase">空闲</span></h2>
+  <div id="applyMsg" class="sub">点击「保存并应用」或「启动 / 停止模型」后，这里会显示任务日志与状态。</div>
+  <pre id="applyLog" style="margin-top:9px"></pre>
+</div>
+
+<div class="card">
+  <h2>只读信息 <span class="hint">这些值由部署固定，本页不修改</span></h2>
+  <div class="kv" id="readonly"></div>
+  <div style="font-size:11px;color:var(--text3);margin-top:10px">
+    EXTRA_ARGS 中的 <code>--allowed-origins ["*"]</code> 是 Cherry Studio 跨域必需参数，保存时会自动保留。
+  </div>
+</div>
+
+<div class="card">
+  <h2>配置备份 <span class="hint">每次保存前自动备份，最多保留 20 份</span></h2>
+  <div id="backups" class="sub">—</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let timer = null, applying = false, lastValues = {}, kvBudget = 0, svcState = '', svcHealthy = false;
+let currentDefaults = {};   // [default-start-1111] 最近一次 /api/config 返回的默认启动配置
+
+function msg(text, kind){
+  $('msg').innerHTML = text ? '<div class="note '+kind+'">'+text+'</div>' : '';
+}
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function key(){ return $('adminKey').value.trim(); }
+function headers(){ return {'Content-Type':'application/json','X-Admin-Key':key()}; }
+
+// 本页通常由配置服务自己（:8002）提供；若被控制台 / 静态托管 / 本地副本以别的
+// 来源打开，/api/* 不能按相对路径解析（会打到 8889 之类的服务上得到 Not Found），
+// 统一显式指向 :8002。配置服务允许跨域（ACAO *），因此这条兜底始终可用。
+const API_BASE = (location.port === '8002' || location.protocol === 'file:')
+  ? (location.protocol === 'file:' ? 'http://127.0.0.1:8002' : '')
+  : ('http://' + (location.hostname || '127.0.0.1') + ':8002');
+
+async function api(path, opt){
+  const url = API_BASE + path;
+  let r;
+  try{
+    r = await fetch(url + (url.indexOf('?') < 0 ? '?' : '&') + '_t=' + Date.now(),
+                    Object.assign({cache:'no-store'}, opt || {}));
+  }catch(e){
+    throw new Error('连不上配置服务 ' + url + '（' + e.message + '）');
+  }
+  let d; try { d = await r.json(); } catch(e){
+    throw new Error('HTTP ' + r.status + '：' + url + ' 返回的不是 JSON，可能被别的服务接管');
+  }
+  if(!r.ok) throw new Error((d.error || (d.errors||[]).join('；') || ('HTTP ' + r.status))
+                            + (r.status === 404 ? '（' + url + '）' : ''));
+  return d;
+}
+
+function collect(){
+  const v = {};
+  for(const k of ['SERVED_MODEL_NAME','MAX_SEQS','MAX_MODEL_LEN','MAX_BATCHED','PORT','P2P']){
+    v[k] = $( 'f_'+k ).value.trim();
+  }
+  const k = $('f_API_KEY').value.trim();
+  if(k) v.API_KEY = k;
+  return v;
+}
+
+function fmtTok(n){
+  if(n >= 1048576) return (n/1048576).toFixed(n % 1048576 ? 2 : 0) + 'M';
+  if(n >= 1024) return Math.round(n/1024) + 'K';
+  return String(n);
+}
+
+function markCtx(){
+  const cur = parseInt(($('f_MAX_MODEL_LEN').value || '').replace(/[^\d]/g,''), 10) || 0;
+  document.querySelectorAll('#ctxChips .chip').forEach(c=>{
+    c.classList.toggle('active', parseInt(c.dataset.ctx, 10) === cur);
+  });
+  let html = '单请求最大 token（8192–1048576，模型原生上限 1M）。256K 为默认值。';
+  let warn = false;
+  if(cur){
+    if(kvBudget){
+      const conc = Math.floor(kvBudget / cur);
+      html += ' 当前 <b>' + fmtTok(cur) + '</b>（' + cur.toLocaleString() + ' tokens），按 KV 预算 '
+            + kvBudget.toLocaleString() + ' tokens 估算，约 <b>' + conc + '</b> 路可同时跑满。';
+    } else {
+      html += ' 当前 <b>' + fmtTok(cur) + '</b>（' + cur.toLocaleString() + ' tokens）。';
+    }
+    if(cur >= 524288){
+      warn = true;
+      html += ' 512K 以上会显著压缩并发，1M 时全系统只够 1 路跑满长上下文。';
+    }
+    if(cur > 1048576){
+      warn = true;
+      html += ' 超过模型原生上限，启动会失败。';
+    }
+  }
+  const tip = $('ctxTip');
+  tip.className = 'tip' + (warn ? ' warn' : '');
+  tip.innerHTML = html;
+}
+
+function setCtx(v){ $('f_MAX_MODEL_LEN').value = v; markCtx(); }
+
+async function load(silent){
+  try{
+    const d = await api('/api/config');
+    lastValues = d.values || {};
+    const rt = d.runtime || {}, cmd = rt.cmdline || {};
+    const ok = rt.health === 200;
+    svcHealthy = ok;
+    const b = $('svcBadge');
+    b.className = 'badge' + (ok ? '' : (rt.container === 'running' ? ' warn' : ' err'));
+    b.textContent = ok ? '服务在线' : (rt.container === 'running' ? '加载中 / 暂不可用' : '服务离线');
+    $('checkedAt').textContent = '采样 ' + (rt.checked_at || '—');
+
+    const kp = [
+      ['健康接口', ok ? '200 OK' : '—', ok ? '' : (rt.health || '000')],
+      ['服务端口', rt.serving_port || '—', rt.gateway_port && rt.gateway_port !== rt.serving_port ? '网关 '+rt.gateway_port : '端口'],
+      ['运行模型', rt.live_model || cmd['served-model-name'] || '—', ''],
+      ['生效上下文', (rt.live_max_model_len || cmd['max-model-len'] || '—'), 'tokens'],
+      ['生效并发', cmd['max-num-seqs'] || '—', '路'],
+      ['容器', rt.container || '—', rt.restart_policy || ''],
+      ['GPU', rt.gpu_count != null ? rt.gpu_count + ' / 4' : '—', '张在线'],
+      ['P2P', rt.p2p || '—', rt.ring ? 'ring on' : ''],
+      ['稳定性', (rt.stability || '').replace(/^\S+ \S+ /,'') || '—', '']
+    ];
+    $('kpis').innerHTML = kp.map(x=>'<div class="kpi"><div class="l">'+esc(x[0])+'</div><div class="v">'+esc(x[1])+(x[2]?' <small>'+esc(x[2])+'</small>':'')+'</div></div>').join('');
+
+    const pending = d.pending || [];
+    $('pendingBox').innerHTML = pending.length
+      ? '<div class="diff">⚠ 有 <b>'+pending.length+'</b> 项改动尚未应用：'+pending.map(p=>esc(p.field)+' <b>'+esc(p.running)+'</b> → '+esc(p.saved)).join('；')+'。点「保存并应用」后生效。</div>'
+      : (applying ? '' : '<div class="note ok" style="margin:10px 0 0">当前运行参数与 .env 一致，无需重启。</div>');
+
+    for(const k of Object.keys(lastValues)){
+      const el = $('f_'+k); if(!el || k==='API_KEY') continue;
+      if(document.activeElement !== el || !silent) el.value = lastValues[k];
+    }
+    kvBudget = Number(d.kv_cache_tokens) || 0;
+    svcState = rt.container || 'absent';
+    markCtx();
+    syncSvcBtns();
+    $('apiKeyTip').textContent = d.has_api_key ? '当前密钥 '+esc(lastValues.API_KEY)+'；留空表示不修改。' : '未设置密钥；填一个即可启用鉴权。';
+    $('readonly').innerHTML = Object.entries(d.readonly||{}).map(([k,v])=>'<div><b>'+esc(k)+'</b><span>'+esc(v||'—')+'</span></div>').join('');
+    renderBackups(d.backups||[]);
+    renderApply(d.apply||{});
+    renderDefault(d.defaults||{});
+    if(!silent) msg('','');
+  }catch(e){ msg('读取配置失败：'+esc(e.message),'err'); }
+}
+
+function renderBackups(list){
+  if(!list.length){ $('backups').textContent = '暂无备份'; return; }
+  $('backups').innerHTML = '<table><tr><th>备份文件</th><th>时间</th><th></th></tr>'+list.slice(0,8).map(f=>{
+    const m = f.match(/env-(\d{8})-(\d{6})/);
+    const t = m ? m[1].slice(0,4)+'-'+m[1].slice(4,6)+'-'+m[1].slice(6,8)+' '+m[2].slice(0,2)+':'+m[2].slice(2,4)+':'+m[2].slice(4,6) : f;
+    return '<tr><td class="mono">'+esc(f)+'</td><td>'+esc(t)+'</td><td style="text-align:right"><button class="danger" onclick="rollback(\''+esc(f)+'\')">恢复</button></td></tr>';
+  }).join('')+'</table>';
+}
+
+// ====== [default-start-1111] 默认启动配置：保存 / 载入 / 覆盖 / 自动套用 ======
+function renderDefault(d){
+  currentDefaults = d || {};
+  const body = $('defaultBody');
+  if(!body) return;
+  if(!currentDefaults.exists){
+    body.innerHTML = '<div class="note warn" style="margin:0 0 10px">尚未保存默认启动配置。点「保存当前配置为默认」把当前 .env 存成一份可恢复的启动参数快照。</div>';
+    syncDefaultBtns();
+    return;
+  }
+  const vals = currentDefaults.values || {};
+  const rows = [
+    ['SERVED_MODEL_NAME','模型名称'],
+    ['MAX_SEQS','并发数'],
+    ['MAX_MODEL_LEN','上下文大小'],
+    ['MAX_BATCHED','批量 Token 上限'],
+    ['PORT','服务端口'],
+    ['P2P','P2P 模式'],
+    ['API_KEY','API Key']
+  ];
+  let html = '<div class="kv">' + rows.map(([k,l]) =>
+    '<div><b>'+esc(l)+'</b><span>'+esc(vals[k] == null ? '—' : vals[k])+'</span></div>'
+  ).join('') + '</div>';
+  html += '<div style="font-size:12px;color:var(--text3);margin-top:8px">保存于 '+esc(currentDefaults.saved_at || '—')
+        + ' · 来源 ' + esc(currentDefaults.source_label || '—')
+        + (currentDefaults.saved_by ? ' · 操作者 '+esc(currentDefaults.saved_by) : '') + '</div>';
+  if(currentDefaults.source_detail){
+    html += '<div style="font-size:11px;color:var(--text3);margin-top:2px">'+esc(currentDefaults.source_detail)+'</div>';
+  }
+  const diff = currentDefaults.diff || [];
+  if(currentDefaults.matches_env){
+    html += '<div class="note ok" style="margin:8px 0 0">默认启动配置与当前 .env 完全一致。</div>';
+  }else{
+    html += '<div class="diff">⚠ 有 <b>'+diff.length+'</b> 项差异（当前 .env → 默认配置）：'
+          + diff.map(x=>esc(x.field)+' <b>'+esc(x.current)+'</b> → <b>'+esc(x.default)+'</b>').join('；')
+          + '。</div>';
+  }
+  if(currentDefaults.extra_args){
+    html += '<div style="font-size:11px;color:var(--text3);margin-top:4px">EXTRA_ARGS：'+esc(currentDefaults.extra_args)+'</div>';
+  }
+  if(currentDefaults.auto_start){
+    html += '<div class="note info" style="margin:8px 0 0">已启用：点「启动模型」时会先把默认配置写回 .env 再启动。</div>';
+  }
+  body.innerHTML = html;
+  syncDefaultBtns();
+}
+
+function syncDefaultBtns(){
+  const exists = !!currentDefaults.exists;
+  const busy = applying;
+  const saveBtn = $('btnSaveDefault');
+  if(saveBtn) saveBtn.disabled = busy;
+  const saveRunBtn = $('btnSaveRunning');
+  if(saveRunBtn) saveRunBtn.disabled = busy || svcState !== 'running' || !svcHealthy;
+  ['btnLoadDefaultForm','btnRestoreDefault','btnClearDefault'].forEach(id => {
+    const b = $(id); if(b) b.disabled = busy || !exists;
+  });
+  const cb = $('autoDefault');
+  if(cb) cb.disabled = busy || !exists;
+  const wrap = $('autoDefaultWrap');
+  if(wrap) wrap.className = 'chk' + ((busy || !exists) ? ' disabled' : '');
+  const sd = $('saveAsDefault');
+  if(sd) sd.disabled = busy;
+}
+
+async function saveDefault(source){
+  if(!key()){ msg('保存默认配置需要管理密钥：请先在「管理密钥」输入框填入当前 API Key 再重试。','warn'); $('adminKey').focus(); return; }
+  if(source === 'running' && (svcState !== 'running' || !svcHealthy)){ msg('容器未运行或尚未就绪，无法保存「运行中配置」；可改用「保存 .env 为默认」。','warn'); return; }
+  const label = source === 'running' ? '运行中配置' : '当前 .env';
+  if(!confirm('把'+label+'保存为默认启动配置？\n\n会覆盖已有的默认启动配置（旧默认会另存到日志目录）。')) return;
+  try{
+    const d = await api('/api/defaults', {method:'POST', headers:headers(), body:JSON.stringify({action:'save', source:source})});
+    msg(esc(d.message || '已保存默认启动配置。'),'ok');
+    renderDefault(d.defaults || {});
+    if(!applying) setTimeout(()=>load(true), 500);
+  }catch(e){ msg('保存默认配置失败：'+esc(e.message),'err'); }
+}
+
+function loadDefaultToForm(){
+  if(!currentDefaults.exists){ msg('尚未保存默认启动配置。','warn'); return; }
+  const vals = currentDefaults.values || {};
+  for(const k of ['SERVED_MODEL_NAME','MAX_SEQS','MAX_MODEL_LEN','MAX_BATCHED','PORT','P2P']){
+    const el = $('f_'+k);
+    if(el && vals[k] != null) el.value = vals[k];
+  }
+  // API Key 不在页面上回填，留空 = 不修改当前密钥
+  $('f_API_KEY').value = '';
+  markCtx();
+  msg('已把默认启动配置载入表单。API Key 不会回填（留空表示保持当前密钥）；载入只改表单，点「保存」或「保存并应用」后才写入 .env。','info');
+}
+
+async function restoreDefaultEnv(){
+  if(!currentDefaults.exists){ msg('尚未保存默认启动配置。','warn'); return; }
+  if(!key()){ msg('恢复默认配置需要管理密钥：请先在「管理密钥」输入框填入当前 API Key 再重试。','warn'); $('adminKey').focus(); return; }
+  if(!confirm('用默认启动配置覆盖当前 .env？\n\n当前 .env 会先自动备份；此操作不重启容器，需再点「保存并应用」才生效。')) return;
+  try{
+    const d = await api('/api/defaults', {method:'POST', headers:headers(), body:JSON.stringify({action:'load'})});
+    msg(esc(d.message || ('已用默认启动配置覆盖 .env（备份 '+esc(d.backup||'—')+'）。')),'ok');
+    await load(true);
+  }catch(e){ msg('恢复默认配置失败：'+esc(e.message),'err'); }
+}
+
+async function clearDefault(){
+  if(!currentDefaults.exists){ msg('尚未保存默认启动配置。','warn'); return; }
+  if(!key()){ msg('清除默认配置需要管理密钥：请先在「管理密钥」输入框填入当前 API Key 再重试。','warn'); $('adminKey').focus(); return; }
+  if(!confirm('清除默认启动配置？\n\n只删除这份快照，当前 .env 与运行中的模型不受影响。')) return;
+  try{
+    const d = await api('/api/defaults', {method:'POST', headers:headers(), body:JSON.stringify({action:'clear'})});
+    msg(esc(d.message || '已清除默认启动配置。'),'ok');
+    renderDefault(d.defaults || {});
+    await load(true);
+  }catch(e){ msg('清除默认配置失败：'+esc(e.message),'err'); }
+}
+
+async function setAutoDefault(on){
+  if(!key()){ $('autoDefault').checked = !on; msg('保存该参数需要管理密钥：请先在「管理密钥」输入框填入当前 API Key。','warn'); $('adminKey').focus(); return; }
+  try{
+    const d = await api('/api/defaults', {method:'POST', headers:headers(), body:JSON.stringify({action:'auto_start', value:!!on})});
+    renderDefault(d.defaults || {});
+    msg(esc(d.message || ''),'ok');
+  }catch(e){
+    $('autoDefault').checked = !on;
+    msg('设置失败：'+esc(e.message),'err');
+  }
+}
+
+function syncSvcBtns(){
+  const running = svcState === 'running';
+  $('btnStart').disabled = applying || running;
+  $('btnStop').disabled = applying || !running;
+  const map = {running:'容器运行中 · 可停止', exited:'容器已停止 · 可启动',
+               created:'容器待启动 · 可启动', absent:'容器不存在 · 可启动', '':'状态未知'};
+  $('svcHint').textContent = applying ? '任务进行中…' : (map[svcState] || ('容器 '+svcState));
+}
+
+async function serviceAction(action){
+  if(!key()){ msg('启停需要管理密钥：请先在「管理密钥」输入框填入当前 API Key（与 .env 里的一致）再重试。','warn'); $('adminKey').focus(); return; }
+  if(action === 'start'){
+    if(!confirm('启动模型：容器要重新加载权重，约 6–9 分钟内 API 全部不可用。\n\n确定启动？')) return;
+  }else{
+    if(!confirm('停止模型：在途请求会立即中断，容器将被移除（.env 配置不变），API 随即不可用。\n\n确定停止？')) return;
+  }
+  $('btnStart').disabled = $('btnStop').disabled = true;
+  msg((action==='start' ? '正在启动模型…' : '正在停止模型…') + '进度见下方「任务进度」。','info');
+  try{
+    await api('/api/service', {method:'POST', headers:headers(), body:JSON.stringify({action:action})});
+    applying = true; syncSvcBtns(); if(!timer) timer = setInterval(poll, 5000);
+    await poll();
+  }catch(e){
+    msg((action==='start' ? '启动' : '停止') + '失败：' + esc(e.message), 'err');
+    applying = false; await load(true);
+  }
+}
+
+function renderApply(a){
+  const phase = a.phase || 'idle';
+  applying = phase === 'running' || phase === 'starting';
+  $('applyBtn').disabled = applying;
+  syncSvcBtns();
+  $('applyPhase').textContent = ({idle:'空闲', starting:'准备中',
+    running:(a.action==='start' ? '启动中' : a.action==='stop' ? '停止中' : '重建容器中'),
+    done:'已完成', failed:'失败'})[phase] || phase;
+  $('applyMsg').innerHTML = a.message
+    ? '<span class="'+(applying?'spin':'')+'"></span>'+esc(a.message)
+    : '点击「保存并应用」或「启动 / 停止模型」后，这里会显示任务日志与状态。';
+  $('applyLog').textContent = a.log || '(暂无日志)';
+  if(applying && !timer) timer = setInterval(poll, 5000);
+  if(!applying && timer && phase !== 'idle'){
+    clearInterval(timer); timer = null;
+    setTimeout(()=>load(true), 1200);
+  }
+  syncDefaultBtns();
+}
+
+async function poll(){
+  try{
+    const d = await api('/api/status');
+    const rt = d.runtime || {};
+    const ok = rt.health === 200;
+    svcHealthy = ok;
+    const b = $('svcBadge');
+    b.className = 'badge' + (ok ? '' : ' warn');
+    b.textContent = ok ? '服务在线' : '加载中 / 暂不可用';
+    renderApply(d.apply||{});
+    svcState = rt.container || 'absent';
+    syncSvcBtns();
+    renderDefault(d.defaults||{});
+    const pending = d.pending || [];
+    $('pendingBox').innerHTML = pending.length
+      ? '<div class="diff">⚠ 有 <b>'+pending.length+'</b> 项改动尚未应用：'+pending.map(p=>esc(p.field)+' <b>'+esc(p.running)+'</b> → '+esc(p.saved)).join('；')+'</div>'
+      : '<div class="note ok" style="margin:10px 0 0">当前运行参数与 .env 一致。</div>';
+  }catch(e){}
+}
+
+async function preview(){
+  try{
+    const d = await api('/api/config', {method:'POST', headers:headers(), body:JSON.stringify({values:collect(), preview:true})});
+    if(!d.changed || !d.changed.length){ $('previewBox').innerHTML='<div class="note ok" style="margin-top:12px">与当前 .env 相比没有改动。</div>'; return; }
+    $('previewBox').innerHTML = '<div class="note warn" style="margin-top:12px"><b>预览改动（未写入）</b><br>'+d.changed.map(c=>esc(c.field)+'：<b>'+esc(c.from)+'</b> → <b>'+esc(c.to)+'</b>').join('<br>')+'<br><span style="font-size:11px">EXTRA_ARGS → '+esc(d.extra_args||'(空)')+'</span></div>';
+  }catch(e){ $('previewBox').innerHTML=''; msg('预览失败：'+esc(e.message),'err'); }
+}
+
+async function save(apply){
+  const v = collect();
+  const portChanged = v.PORT && String(v.PORT) !== String(lastValues.PORT || '');
+  if(apply && portChanged && !confirm('端口将从 '+(lastValues.PORT||'8000')+' 改为 '+v.PORT+'：\n所有客户端（Cherry Studio / SDK）的 Base URL 都要改成新端口。\nCORS 网关 8001 会自动跟随。\n\n继续重建容器（约 6–9 分钟）？')) return;
+  if(apply && !portChanged && !confirm('保存并应用会重建模型容器，约 6–9 分钟内 API 不可用。确定继续？')) return;
+  const btn = apply ? $('applyBtn') : null;
+  if(btn) btn.disabled = true;
+  try{
+    const saveAsDefault = !!($('saveAsDefault') && $('saveAsDefault').checked);
+    const d = await api('/api/config', {method:'POST', headers:headers(), body:JSON.stringify({values:collect(), saveAsDefault:saveAsDefault})});
+    const what = (d.changed||[]).length ? d.changed.map(c=>c.field+' → '+c.to).join('；') : '无字段变化';
+    let defaultNote = '';
+    if(d.default_saved) defaultNote = '；已同时保存为默认启动配置';
+    else if(d.default_error) defaultNote = '；默认启动配置保存失败：'+esc(d.default_error);
+    if(!apply){
+      msg('已保存到 .env（备份 '+esc(d.backup||'—')+'）：'+esc(what)+defaultNote+'。<b>尚未生效</b>，需要点「保存并应用」。','ok');
+      $('previewBox').innerHTML=''; await load(true); return;
+    }
+    msg('配置已保存（备份 '+esc(d.backup||'—')+'）：'+esc(what)+defaultNote+'。正在重建容器…','info');
+    await api('/api/apply', {method:'POST', headers:headers(), body:JSON.stringify({})});
+    applying = true; if(!timer) timer = setInterval(poll, 5000);
+    await poll();
+  }catch(e){ msg('保存失败：'+esc(e.message),'err'); }
+  finally{ if(btn) btn.disabled = applying; }
+}
+
+async function rollback(name){
+  if(!confirm('用备份 '+name+' 覆盖当前 .env？（不会自动重启服务）')) return;
+  try{
+    const d = await api('/api/rollback', {method:'POST', headers:headers(), body:JSON.stringify({backup:name})});
+    msg('已恢复备份 '+esc(d.restored)+'，配置尚未应用。','ok');
+    await load(true);
+  }catch(e){ msg('恢复失败：'+esc(e.message),'err'); }
+}
+
+async function dryRun(){
+  msg('正在预演启动命令（只读，不会重启服务）…','info');
+  try{
+    const d = await api('/api/dry');
+    const lines = (d.excerpt||'').split('\n').filter(l=>/--(max-model-len|max-num-seqs|max-num-batched-tokens|served-model-name|allowed-origins|max-num-batched)/.test(l));
+    $('applyLog').textContent = (lines.length?lines.join('\n')+'\n':'') + (d.excerpt||'(无输出)').slice(-1800);
+    $('applyPhase').textContent = d.ok ? '预演完成' : '预演返回 '+d.rc;
+    msg('预演完成：'+Object.entries(d.flags||{}).map(([k,v])=>k+'='+v).join('  ')+'。以上只是生成命令，服务未改动。','ok');
+  }catch(e){ msg('预演失败：'+esc(e.message),'err'); }
+}
+
+$('adminKey').value = sessionStorage.getItem('dsv41AdminKey') || '';
+$('adminKey').addEventListener('change', e => sessionStorage.setItem('dsv41AdminKey', e.target.value.trim()));
+$('f_API_KEY').addEventListener('input', e => { if(e.target.value) $('adminKey').placeholder = '与 API Key 相同'; });
+$('f_MAX_MODEL_LEN').addEventListener('input', markCtx);
+document.querySelectorAll('#ctxChips .chip').forEach(c=>{
+  c.addEventListener('click', ()=>setCtx(c.dataset.ctx));
+});
+markCtx();
+// 该源上若残留旧项目的 Service Worker，会劫持 /api/* 返回别人的响应，顺手注销掉。
+if(navigator.serviceWorker && navigator.serviceWorker.getRegistrations){
+  navigator.serviceWorker.getRegistrations().then(rs=>rs.forEach(r=>r.unregister())).catch(()=>{});
+}
+load(false);
+setInterval(()=>{ if(!applying) load(true); }, 15000);
+</script>
+</body>
+</html>

@@ -70,6 +70,8 @@ ssh ll@192.168.1.127 'python3 -m py_compile /home/ll/dsv41-config-server.py; \
 - `dsv41-config.html.bak-defaultcfg-1111-20261111-110219`
 - `dsv41-config-*.bak-defaultcfg2-1111-20261111-110646`
 - `dsv41-config-*.bak-defaultcfg3-1111-20261111-111022`
+- `dsv41-config-server.py.bak-defaultcfg4-1111-20261111-111426`
+- `dsv41-config-server.py.bak-defaultcfg5-1111-20261111-111650`
 
 ## 测试
 

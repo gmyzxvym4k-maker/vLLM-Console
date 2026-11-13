@@ -42,3 +42,8 @@ work/
 
 # 与本控制台无关的同级资料（专利案卷等，只是碰巧放在同一个父目录下）
 /一种基于深度学习的PBFT改进方法及系统/
+
+# [gpu-ecc-1108] 控制台运行时状态（锚定根目录，防误伤 tests/fixtures/*.json）
+/gpu-ecc-state.json
+/gpu-ecc-events.jsonl
+/gpu-ecc.json

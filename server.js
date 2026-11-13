@@ -9003,6 +9003,113 @@ function gpuTempPayload(winS) {
     depth_s: H.length ? Math.round(Date.now() / 1000) - H[0].t : 0,
   };
 }
+// ==== [gpu-powercurve-1105] GPU 功耗历史（硬件监视页「GPU 功耗曲线」卡数据源）====
+// 口径完全承接 [gpu-temp-1103] 的铁律：
+//  · 落点与 __gpuLive 同拍（sampleGpuStats 每 1s，走 09-20 铁律的放弃式熔断通道）——
+//    power_draw 本来就在同一帧 CSV 里，本模块零新增 nvidia-smi 压力、纯内存 push。
+//  · 保留 1 小时逐秒点（3600 点 × 每卡 1 值，内存可忽略）；不落盘，走势自控制台启动积累。
+//  · 采样失败的那一拍**不落点**：绝不用上一拍旧值冒充当前功耗续画（驱动熔断期会画出
+//    "功耗恒定"的假象）。前端按时间轴断线留白——留白=数据缺失（09-22「宁返 null」）。
+//  · 合理性钳制：power.draw ∈ (0,1000] W 才算可信；驱动不支持该列时交回 0 / [N/A] 归 null。
+//    物理上进电的卡不会长期恰好 0W，把 0 当真值只会把纵轴下限白白拖到 0、压扁真实波动。
+const GPU_POWER_KEEP = 3600;
+function appendGpuPowerHistory(gpus) {
+  if (!Array.isArray(gpus) || !gpus.length) return;
+  const H = global.__gpuPowerHistory || (global.__gpuPowerHistory = []);
+  const t = Math.round(Date.now() / 1000);
+  const last = H[H.length - 1];
+  if (last && last.t === t) return; // 同一秒重复调用只记一次（防定时器重叠）
+  const g = {};
+  for (const x of gpus) {
+    if (x == null || x.index == null) continue;
+    const pw = x.power_draw;
+    const v = (typeof pw === 'number' && Number.isFinite(pw) && pw > 0 && pw <= 1000) ? Math.round(pw * 10) / 10 : null;
+    if (v == null) continue; // 该拍该卡缺列/异常：不落键 → 前端这条线在此拍留白
+    g[String(x.index)] = { p: v };
+  }
+  if (!Object.keys(g).length) return;
+  H.push({ t: t, g: g });
+  if (H.length > GPU_POWER_KEEP) H.splice(0, H.length - GPU_POWER_KEEP);
+}
+// 取窗口内序列并按桶抽稀到 ≤300 点（桶内均值）。逐卡统计（现值/均值/峰/谷/峰值时刻）在
+// **原始逐秒点**上算，不用抽稀后的桶——桶均值会抹掉真实尖峰，而功耗曲线要的恰恰是突发顶。
+function gpuPowerSeries(winS) {
+  const H = global.__gpuPowerHistory || [];
+  const nowS = Math.round(Date.now() / 1000);
+  const from = nowS - winS;
+  let i = 0;
+  while (i < H.length && H[i].t < from) i++;
+  const pts = H.slice(i);
+  const idxs = [];
+  for (const p of pts) for (const k of Object.keys(p.g)) if (idxs.indexOf(k) < 0) idxs.push(k);
+  idxs.sort((a, b) => (+a) - (+b));
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const bucket = Math.max(1, Math.ceil(pts.length / 300));
+  const points = [];
+  for (let k = 0; k < pts.length; k += bucket) {
+    const seg = pts.slice(k, k + bucket);
+    const g = {};
+    for (const idx of idxs) {
+      let sum = 0, cnt = 0;
+      for (const p of seg) {
+        const e = p.g[idx];
+        if (e && e.p != null) { sum += e.p; cnt++; }
+      }
+      if (cnt) g[idx] = { p: r1(sum / cnt) };
+    }
+    if (Object.keys(g).length) points.push({ t: seg[seg.length - 1].t, g: g });
+  }
+  const stats = {};
+  for (const idx of idxs) {
+    const o = { pow: { cur: null, avg: null, min: null, max: null, max_t: null, n: 0 } };
+    let sum = 0;
+    for (const p of pts) {
+      const e = p.g[idx];
+      if (!e || e.p == null) continue;
+      o.pow.cur = e.p; o.pow.n++; sum += e.p;
+      o.pow.min = o.pow.min == null ? e.p : Math.min(o.pow.min, e.p);
+      if (o.pow.max == null || e.p > o.pow.max) { o.pow.max = e.p; o.pow.max_t = p.t; }
+    }
+    if (o.pow.n) o.pow.avg = r1(sum / o.pow.n);
+    stats[idx] = o;
+  }
+  return {
+    points: points, stats: stats, sample_s: bucket, raw_points: pts.length,
+    first_t: pts.length ? pts[0].t : null, last_t: pts.length ? pts[pts.length - 1].t : null,
+    now_s: nowS,
+  };
+}
+// 接口载荷（窗口抽稀 + 卡名 + 逐卡功耗上限）。上限取 __gpuStatic 的 power.limit（nvidia-smi
+// power.limit 现值口径——控制台/gpu-ctl 改了 pl 会在 5min 静态缓存刷新后跟上来）；静态未就绪时
+// limits 为空对象，前端回落不画墙线，不影响曲线本体。
+function gpuPowerPayload(winS) {
+  const s = gpuPowerSeries(winS);
+  const names = {};
+  const limits = {};
+  try {
+    const st = global.__gpuStatic;
+    for (const g of ((st && st.gpus) || [])) {
+      if (g && g.index != null) {
+        names[String(g.index)] = g.name || null;
+        limits[String(g.index)] = (typeof g.power_limit === 'number' && Number.isFinite(g.power_limit) && g.power_limit > 0) ? g.power_limit : null;
+      }
+    }
+  } catch (e) { /* 静态帧未就绪：如实无名/无墙，不影响曲线 */ }
+  const live = global.__gpuLive || null;
+  const H = global.__gpuPowerHistory || [];
+  return {
+    ts: Date.now(), win_s: winS,
+    sample_s: s.sample_s, raw_points: s.raw_points,
+    points: s.points, stats: s.stats,
+    first_t: s.first_t, last_t: s.last_t, now_s: s.now_s,
+    names: names,
+    limits: limits,
+    live_age_s: (live && live.ts) ? Math.round((Date.now() - live.ts) / 1000) : null,
+    // 曲线只从控制台进程启动开始积累（不落盘历史）——如实告知追溯深度
+    depth_s: H.length ? Math.round(Date.now() / 1000) - H[0].t : 0,
+  };
+}
+
 function sampleGpuStats() {
   // 09-18：execFileSync 同步阻塞主循环 → 改异步 + 防重入。
   // 10-07：再改走统一放弃式通道。原 execFile 的 timeout 靠发信号实现，对 D 状态进程无效，
@@ -9035,6 +9142,8 @@ function sampleGpuStats() {
       try { appendGpuTempHistory(gpus); } catch (e) { /* 历史落点异常绝不影响主采样 */ }
       // [gpu-temp-1103] 与采样同拍落一条温度历史（本函数只多一次内存 push，零子进程）
       appendGpuTempHistory(gpus);
+      // [gpu-powercurve-1105] 与采样同拍落一条功耗历史（power_draw 来自同一帧 CSV，零新增 nvidia-smi）
+      try { appendGpuPowerHistory(gpus); } catch (e) { /* 历史落点异常绝不影响主采样 */ }
     } catch (e) { /* 解析失败保留上次采样 */ }
   });
 }
@@ -15056,6 +15165,26 @@ const server = http.createServer(async (req, res) => {
       body = gpuTempPayload(win);
     } catch (e) {
       body = { ts: Date.now(), win_s: win, points: [], stats: {}, names: {}, error: String((e && e.message) || e) };
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(body));
+    return;
+  }
+
+  // === Internal API: GPU 功耗曲线（[gpu-powercurve-1105] 硬件监视页「GPU 功耗曲线」卡）===
+  // GET /v1/internal/gpu-power?win=300   窗口秒，钳 30–3600，缺省 300
+  // 数据源＝GPU 采样器逐秒落的纯内存功耗历史（零子进程零 IO，可 2s 轮询）；桶均值抽稀到 ≤300 点。
+  // 口径：points[].g[卡号] = {p:瓦}，null/缺键＝该拍缺列或采样失败 → 前端断线留白，绝不插值补画。
+  // limits[卡号]=当前功耗上限 W（nvidia-smi power.limit，静态帧未就绪时为 null），供参考线与图例。
+  if (pathname === '/v1/internal/gpu-power') {
+    let win = 300;
+    try { win = parseInt(urlObj.searchParams.get('win'), 10) || 300; } catch (e) { win = 300; }
+    win = Math.min(3600, Math.max(30, win));
+    let body;
+    try {
+      body = gpuPowerPayload(win);
+    } catch (e) {
+      body = { ts: Date.now(), win_s: win, points: [], stats: {}, names: {}, limits: {}, error: String((e && e.message) || e) };
     }
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(body));

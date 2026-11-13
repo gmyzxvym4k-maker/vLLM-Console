@@ -721,7 +721,7 @@ const SCRIPT_MODELS = {
   },
 };
 SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
-  dirNames: ['Qwen3.8-Flash-Next-W4A16-AutoRound', 'Qwen3.8-Flash-Next-Channel-INT8-w8a8'],  // [w4a16-restore-1006] 主映射=W4A16-AutoRound（重下完成+验收通过，10-06 切回；w8a8 目录保留兼容）
+  dirNames: ['Qwen3.8-Flash-Next-W4A16-AutoRound', 'Qwen3.8-Flash-Next-Channel-INT8-w8a8', 'Qwen3.8-Flash-Next-Uncensored-W4A16-AutoRound-INT8PLE-MTP'],  // [__w4a16u_1104__ 破限W4A16]  // [w4a16-restore-1006] 主映射=W4A16-AutoRound（重下完成+验收通过，10-06 切回；w8a8 目录保留兼容）
   modelPath: '/media/ll/data/models/Qwen3.8-Flash-Next-W4A16-AutoRound',  // [w4a16-restore-1006]
   script: '/home/ll/deploy/start-flash-next-w4a16.sh',
   inner: '/home/ll/deploy/flash-next-w4a16-inner.sh',
@@ -742,13 +742,15 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
   altLogs: ['/home/ll/deploy/vllm-flash-next-0310.log', '/home/ll/deploy/vllm-flash-next-0300.log'],
   note: '官方 vLLM 0.31.0 运行时补丁栈 TP1×PP2（现行生产=W4A16-AutoRound-1M，PLE=INT8 磁盘 mmap，内存二级缓存 160GiB（PLE=INT8 磁盘 mmap，可回收页缓存）），加载约 5~8 分钟；回滚：touch /home/ll/deploy/vllm-0310/DISABLED → 退回 chroot 旧栈',  // [stack-0310-1006]
   base: {
-    maxModelLen: 262144, gpuMemUtil: 0.90, maxNumSeqs: 4, maxBatchedTokens: 8192,  // [seqs4-1006] 用户 10-06 指定 4 并发（FULL 图捕获 [1,2,4]）
+    maxModelLen: 262144, gpuMemUtil: 0.95, maxNumSeqs: 4, maxBatchedTokens: 8192,  // [seqs4-1006] 用户 10-06 指定 4 并发（FULL 图捕获 [1,2,4]）
     // [gen-loopfix 0929] 采样基准回到 09-21 反循环定档 t0.6 / p0.95 / k20 / minp0 / pp0.1 / rp1.0（用户 09-29 拍板：09-27 的 1/0/1 裸档导致思考模型 uct/duct token 级硬循环）。
     // base 同时是「弹窗默认值」与「是否下发 FN_GENCFG 的比较基准」，因此两套栈的 inner
     // GENCFG_DEFAULT 必须与此逐字段一致（flash-next-w4a16-inner.sh / vllm-0300/bin/flash-next-0300-inner.sh），
     // 否则会出现「弹窗显示 ≠ 引擎 cmdline 真值」。
-    blockSize: 1616, temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,  // [gen-1010 用户定档] 官方默认档
-    presencePenalty: 0.0, repetitionPenalty: 1.0, pp: 2, mtpTokens: 4,  // [w4a16-restore-1006] 本机在位 2×CMP 170HX（lspci 仅 03:00/04:00），PP 基准 3→2；三卡机勿套此值
+    // [gen-speed-1105] 采样档对齐仓库 P62 / 11-02 实跑：t0.6 / pres0 / rep1.15（保留 rep>1 防复读）。
+    // 实测旧档 pres0.15/rep1.2 = 92.0 tok/s；新档 = 100.2 tok/s；pres0/rep1 = 117.7 tok/s 但复读明显。
+    blockSize: 1616, temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+    presencePenalty: 0, repetitionPenalty: 1.15, pp: 2, mtpTokens: 4,  // [w4a16-restore-1006] 本机在位 2×CMP 170HX（lspci 仅 03:00/04:00），PP 基准 3→2；三卡机勿套此值
     // [hw-move 1005] 换装 HUANANZHI H12D-8D + EPYC 7F52 + 3×CMP 170HX + 仅 32GB 内存：
     // ① PP 基准 2→3（三卡满配，与 10-04 实跑实例 FN_PP=3 一致）；
     // ② 二级缓存关（classic 96GiB / SimpleCPU 100GiB 在 64GB 机即实锤 OOM，32GB 更快炸）；
@@ -797,6 +799,13 @@ SCRIPT_MODELS['qwen3.8-flash-next-w4a16'] = {
       pp: 3, minGpus: 3,        // 权重 ~132GB：PP2 每段 66GB > 单卡 64GB 显存，必须 PP3（本机 3 卡在位）
       kvoff: 'simple', kvoffGiB: 160, kvoffCap: 160,  // [restore160-1022] 96->160（kvoffCap 仍 160）  // [kvoff96-fix 1022] 默认 160→96（OOM 加固，kvoffCap 仍允许手动选 160）// [kvoff160 10-10 用户要求 96→160] 251GB 机账：48.3 PLE + 160 pinned + 引擎 ≈220，权重页缓存(可回收)压余量；内存告警第一刀降 96
     },
+    'Qwen3.8-Flash-Next-Uncensored-W4A16-AutoRound-INT8PLE-MTP': {
+      modelPath: '/media/ll/data/models/Qwen3.8-Flash-Next-Uncensored-W4A16-AutoRound-INT8PLE-MTP',
+      longCtxModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-Uncensored-W4A16-AutoRound-INT8PLE-MTP-1M',
+      longCtx512ModelPath: '/media/ll/data/models-1m/Qwen3.8-Flash-Next-Uncensored-W4A16-AutoRound-INT8PLE-MTP-512K',
+      pleInt8Dir: '/media/ll/data/ple-w4a16uncen',  // 本 ckpt 专属行向 INT8 表（row_scale 提取件 11-04）
+      kvoff: 'simple', kvoffGiB: 96, kvoffCap: 96,  // PLE INT8+heap 48.3GiB 与二级缓存互斥阈=96（10-22 定版）
+    },  // [__w4a16u_1104__]
   },  // __modelvariant_1008__
   maxModelLenLong: 1048576,
   maxModelLen512: 524288,  // [512k-reg-1016] 512K 档 = YaRN×2；mrope 缓存恒 262144×4=1048576，512K 在缓存内安全
@@ -809,6 +818,9 @@ MODEL_ALIASES['qwen3.8-flash-next-w4a16'] = 'qwen3.8-flash-next';
 MODEL_ALIASES['Qwen3.8-Flash-Next-W4A16-AutoRound'] = 'qwen3.8-flash-next';
 MODEL_ALIASES['Qwen3.8-Flash-Next-Channel-INT8-w8a8'] = 'qwen3.8-flash-next';  // [w8a8-1005]
 MODEL_ALIASES['Qwen3.8-Flash-Next-Channel-INT8-w8a8-1M'] = 'qwen3.8-flash-next';
+MODEL_ALIASES['Qwen3.8-Flash-Next-Uncensored-W4A16-AutoRound-INT8PLE-MTP'] = 'qwen3.8-flash-next';
+MODEL_ALIASES['Qwen3.8-Flash-Next-Uncensored-W4A16-AutoRound-INT8PLE-MTP-1M'] = 'qwen3.8-flash-next';
+MODEL_ALIASES['Qwen3.8-Flash-Next-Uncensored-W4A16-AutoRound-INT8PLE-MTP-512K'] = 'qwen3.8-flash-next';  // [__w4a16u_1104__]
 
 function scriptModelForName(name) {
   if (!name) return null;
@@ -1330,6 +1342,16 @@ function scriptModelLaunchPlan(smIn, d) {
   // 但 plan 此前不下发 → 快启预设无法携带卡序，点启动会静默回到「取前 N 张」。字段缺失=零漂移（旧行为不变）。
   const _cudaDevs = String(d.cudaDevs || '').trim();
   if (_cudaDevs) env.FN_CUDA_VISIBLE_DEVICES = _cudaDevs;
+  // [pp-partition-1105] 快启预设可固定 PP 层切分（如 '27,21'）。0310 inner 第 195 行
+  // 用 ${FN_PP_PARTITION:-26,22} 设 VLLM_PP_LAYER_PARTITION；控制台此前不下发该变量，
+  // 而 qsLaunchScript 启动前会清空 launch.env -> 手工分区在下次快启静默回到 26,22。
+  // 字段缺失 = 零漂移（旧预设仍走 inner 缺省）；TP 档上面已设 'none'，此处跳过。
+  const _ppPart = String(d.ppPartition || '').trim();
+  if (_ppPart && env.FN_PP_PARTITION !== 'none' && /^\d+(,\d+)+$/.test(_ppPart)) {
+    env.FN_PP_PARTITION = _ppPart;
+  } else if (_ppPart) {
+    warnings.push('已忽略非法的 PP 层切分「' + _ppPart + '」（应为逗号分隔的整数，如 27,21）。');
+  }
   env.FN_PREFIX_CACHE = String(String(d.prefixCaching) === '0' ? 0 : 1);
   env.FN_CHUNKED = String(String(d.chunkedPrefill) === '0' ? 0 : 1);
   env.FN_ASYNC = String(String(d.asyncScheduling) === '0' ? 0 : 1);

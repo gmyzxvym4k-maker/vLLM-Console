@@ -47,3 +47,7 @@ work/
 /gpu-ecc-state.json
 /gpu-ecc-events.jsonl
 /gpu-ecc.json
+
+# 本地工作快照（WIP 补丁与运行抓包，非可复用产物）
+/patches/wip/
+/v3capture.ndjson

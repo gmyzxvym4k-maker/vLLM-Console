@@ -11566,6 +11566,8 @@ async function gpuCtlHandle(req, res, urlObj) {
 //  · 状态落盘 gpu-hotshield-state.json（lastTriggeredTs/lastAction），重启后可追溯；日志 [hotshield] 前缀。
 //  · 安全底线：评估循环整体 try/catch，任何一步异常只记录不动作；GPU 数据缺失/过期（>15s）不参与判定
 //    （宁可不触发，绝不在盲态下关机）；cooldownMin 防"关机→开机→仍热→再关机"振荡。
+//  · [gpu-hotshield-templog 1105] 关机前 10 秒 GPU 温度留档：触发瞬间保底快照 + halt 前最后 10 秒权威快照，
+//    逐秒逐卡（核心/显存）落 gpu-hotshield-templog.jsonl；演练动作 templog-drill 只留档不关机。
 const HOTSHIELD_CONFIG_PATH = path.join(__dirname, 'gpu-hotshield.json');
 const HOTSHIELD_STATE_PATH = path.join(__dirname, 'gpu-hotshield-state.json');
 const HS_DEFAULTS = { enabled: false, thresholdC: 92, holdSec: 30, graceSec: 60, cooldownMin: 30 };
@@ -11601,6 +11603,103 @@ function hotShieldLoadState() {
 function hotShieldSaveState(s) {
   try { fs.writeFileSync(HOTSHIELD_STATE_PATH, JSON.stringify(s, null, 2)); } catch (e) {}
 }
+
+// ---- [gpu-hotshield-templog 1105] 关机前 10 秒 GPU 温度留档 ----
+// 需求：高温保护关机前，把最后 10 秒的 GPU 温度逐秒留档（事后可查"到底热到多少、怎么爬上去的"）。
+// 口径（承接 [gpu-temp-1103] 铁律）：
+//  · 数据源直接复用 global.__gpuTempHistory（GPU 采样器 1s 同拍落的逐秒逐卡 c/m），零新增 nvidia-smi 压力、
+//    零新增采样定时器；采样失败的那一拍本来就不落点，这里按整秒槽位如实标 missing，绝不插值或沿用旧值。
+//  · 窗口 = [endS-9, endS] 共 10 个整秒槽，endS 取"下发关机指令"那一秒（真正的关机前 10 秒）；
+//    另外在触发瞬间先冻结"触发前 10 秒"作为对照（高温爬升过程），并立即落盘保底。
+//  · 落盘 gpu-hotshield-templog.jsonl（append-only、同步写，在 gpu-ctl halt 之前完成，sync+断电不丢）；
+//    最近一次完整快照同步进 gpu-hotshield-state.json 的 lastTempSnapshot，管理台 1s 轮询即可见。
+//  · 三段式 append：trigger（触发即写，保底）→ pre-halt（停机指令前，权威 10 秒）→ halt-result（best effort）。
+//    任何一段异常都只记日志，绝不阻断高温关机主流程。
+const HS_TEMPLOG_PATH = path.join(__dirname, 'gpu-hotshield-templog.jsonl');
+const HS_TEMP_WINDOW_S = 10;
+const HS_TEMPLOG_MAX_LINES = 400;
+function hsGpuNames() {
+  const names = {};
+  try {
+    const st = global.__gpuStatic;
+    for (const g of ((st && st.gpus) || [])) if (g && g.index != null) names[String(g.index)] = g.name || null;
+  } catch (e) { /* 静态帧未就绪：如实无名列 */ }
+  return names;
+}
+// 取以 endS 结尾的 10 个整秒槽；H 里没有该秒的点 → missing:true（前端画 --，不用旧值顶替）
+function hsTempWindow(endS, winS) {
+  const H = global.__gpuTempHistory || [];
+  const n = winS || HS_TEMP_WINDOW_S;
+  const from = endS - n + 1;
+  const byT = {};
+  for (const p of H) if (p && p.t >= from && p.t <= endS) byT[p.t] = p.g || {};
+  const samples = [];
+  let missing = 0;
+  for (let t = from; t <= endS; t++) {
+    const g = byT[t];
+    if (!g) missing++;
+    samples.push({ t: t, rel_s: t - endS, g: g || null, missing: !g });
+  }
+  return { samples: samples, available: n - missing, missing: missing, first_t: from, last_t: endS };
+}
+function hsTempLogAppend(rec) {
+  try {
+    fs.appendFileSync(HS_TEMPLOG_PATH, JSON.stringify(rec) + '\n');
+    // 低频摊还截尾：只在超上限时重写一次，避免断电审计文件无限膨胀
+    const lines = fs.readFileSync(HS_TEMPLOG_PATH, 'utf8').split('\n').filter(Boolean);
+    if (lines.length > HS_TEMPLOG_MAX_LINES) fs.writeFileSync(HS_TEMPLOG_PATH, lines.slice(-HS_TEMPLOG_MAX_LINES).join('\n') + '\n');
+  } catch (e) { console.warn('[hotshield] 温度留档写入失败（不阻断关机）：' + String((e && e.message) || e)); }
+}
+// 只读接口：以 phase=pre-halt 的权威快照为主记录，合并同 id 的 halt-result；kind 为空=全部
+function hsTempLogRead(limit, kind) {
+  let lines = [];
+  try { lines = fs.readFileSync(HS_TEMPLOG_PATH, 'utf8').split('\n').filter(Boolean).slice(-HS_TEMPLOG_MAX_LINES); } catch (e) { return []; }
+  const recs = [], results = {};
+  for (const line of lines) {
+    let o; try { o = JSON.parse(line); } catch (e) { continue; }
+    if (!o || !o.phase) continue;
+    if (o.phase === 'halt-result' && o.id) results[o.id] = o;
+    else if (o.phase === 'pre-halt' && (!kind || o.kind === kind)) recs.push(o);
+  }
+  const n = Math.min(50, Math.max(1, parseInt(limit, 10) || 10));
+  return recs.map((r) => {
+    const x = results[r.id];
+    return x ? Object.assign({}, r, { halt_ok: x.halt_ok, halt_output: x.halt_output, halt_result_ts: x.ts }) : r;
+  }).reverse().slice(0, n);
+}
+// 记录公共字段：配置口径 + 触发瞬间最热卡 + 卡名 + 数据新鲜度（全部取自内存，零子进程）
+function hsTempBase(id, kind, triggerTs, extra) {
+  const cfg = hotShieldCfg();
+  const live = global.__gpuLive || null;
+  let hottest = null, hottestIdx = null;
+  try {
+    for (const g of ((live && live.gpus) || [])) {
+      if (!g || g.index == null) continue;
+      const t = Math.max(g.temp == null ? -Infinity : g.temp, g.temp_mem == null ? -Infinity : g.temp_mem);
+      if (t !== -Infinity && (hottest == null || t > hottest)) { hottest = t; hottestIdx = g.index; }
+    }
+  } catch (e) { /* 盲态如实 null */ }
+  return Object.assign({
+    id: id, kind: kind, ts: Date.now(), trigger_ts: triggerTs,
+    threshold_c: cfg.thresholdC, hold_sec: cfg.holdSec, grace_sec: cfg.graceSec,
+    hottest_idx: hottestIdx, hottest_c: hottest,
+    live_age_ms: (live && live.ts) ? Date.now() - live.ts : null,
+    names: hsGpuNames(), window_s: HS_TEMP_WINDOW_S,
+  }, extra || {});
+}
+// 演练：不停止推理实例、不关机，只把当前最近 10 秒温度按同一格式写一条记录（用于验证留档链路）
+function hsTempDrill() {
+  const nowMs = Date.now();
+  const w = hsTempWindow(Math.round(nowMs / 1000), HS_TEMP_WINDOW_S);
+  return hsTempBase('drill-' + nowMs, 'drill', nowMs, {
+    phase: 'pre-halt', halt_requested_ts: null, end_s: w.last_t,
+    samples: w.samples, available_seconds: w.available, missing_seconds: w.missing,
+    pre_trigger: null, halt_ok: null,
+    note: '演练：仅记录最近 10 秒 GPU 温度，未停止推理实例、未关机',
+  });
+}
+// ---- [gpu-hotshield-templog 1105] END helpers ----
+
 // 守护运行时状态（内存态，重启即清；lastTriggeredTs 从 state 文件恢复用于冷却判定）
 const __hs = {
   aboveSince: 0, peakAbove: null, hottestIdx: null,
@@ -11685,6 +11784,19 @@ async function hsFire(now) {
   const cfg = hotShieldCfg();
   console.error('[hotshield] 🔥 触发高温保护：停止推理实例并关机（阈值 ' + cfg.thresholdC + '°C）');
   hotShieldPushEvent('fire', '高温保护触发：正在停止 vLLM/SGLang 实例并执行关机');
+  // ⓪ [gpu-hotshield-templog 1105] 触发瞬间先冻结「触发前 10 秒」并立即同步落盘（保底：
+  //    后续停服最长 45s、poweroff 后进程随时可能被杀，这一段至少保证爬升过程不丢）
+  const hsRecId = 'hs-' + now;
+  let hsPreTrigger = null;
+  try {
+    const w0 = hsTempWindow(Math.round(now / 1000), HS_TEMP_WINDOW_S);
+    hsPreTrigger = w0;
+    hsTempLogAppend(hsTempBase(hsRecId, 'shutdown', now, {
+      phase: 'trigger', end_s: w0.last_t, samples: w0.samples,
+      available_seconds: w0.available, missing_seconds: w0.missing,
+      note: '触发前 10 秒温度（触发瞬间保底快照，非最终关机前 10 秒）',
+    }));
+  } catch (e) { console.warn('[hotshield] 触发前温度快照失败（不阻断关机）：' + String((e && e.message) || e)); }
   // ① 尽力停服（限时 45s 总预算：高温场景下时间就是损失，超时直接关机）
   try {
     const stopAll = (async () => {
@@ -11722,8 +11834,38 @@ async function hsFire(now) {
     await Promise.race([stopAll, budget]);
   } catch (e) { console.warn('[hotshield] 停服阶段异常（不阻断关机）：' + String((e && e.message) || e)); }
   // ② 关机：走 gpu-ctl halt（root：sync 落盘 + systemctl poweroff）
+  // [gpu-hotshield-templog 1105] 权威留档必须在下发 halt 之前完成：停服期间 GPU 采样器仍在逐秒落点，
+  // 这里取「关机指令下发前最后 10 秒」，同步 append 到 jsonl + 写进 state，随后 halt 里的 sync 保证脏页落盘。
+  let hsFinalRec = null;
+  try {
+    const haltTs = Date.now();
+    const w = hsTempWindow(Math.round(haltTs / 1000), HS_TEMP_WINDOW_S);
+    hsFinalRec = hsTempBase(hsRecId, 'shutdown', now, {
+      phase: 'pre-halt', halt_requested_ts: haltTs, end_s: w.last_t,
+      samples: w.samples, available_seconds: w.available, missing_seconds: w.missing,
+      pre_trigger: hsPreTrigger ? {
+        end_s: hsPreTrigger.last_t, samples: hsPreTrigger.samples,
+        available_seconds: hsPreTrigger.available, missing_seconds: hsPreTrigger.missing,
+      } : null,
+      halt_ok: null,
+      note: '关机指令下发前的最后 10 秒 GPU 温度（逐秒逐卡，核心/显存）',
+    });
+    hsTempLogAppend(hsFinalRec);
+    const stT = hotShieldLoadState();
+    stT.lastTempSnapshot = hsFinalRec;
+    hotShieldSaveState(stT);
+    console.warn('[hotshield] 关机前 10 秒 GPU 温度已留档（有效采样 ' + w.available + '/10 秒 → ' + HS_TEMPLOG_PATH + '）');
+  } catch (e) { console.warn('[hotshield] 关机前温度留档失败（不阻断关机）：' + String((e && e.message) || e)); }
   const r = await gpuCtlRun(['halt'], 15000);
   console.error('[hotshield] 关机指令结果：' + (r.ok ? '已下发' : '失败—' + String(r.output).slice(0, 200)));
+  // 关机结果补记（best effort：poweroff 后进程可能已被杀，写不进属预期，pre-halt 主记录早已落盘）
+  if (hsFinalRec) {
+    try {
+      hsTempLogAppend({ id: hsRecId, kind: 'shutdown', phase: 'halt-result', ts: Date.now(), halt_ok: r.ok, halt_output: String(r.output || '').slice(0, 300) });
+      const stR = hotShieldLoadState();
+      if (stR.lastTempSnapshot && stR.lastTempSnapshot.id === hsRecId) { stR.lastTempSnapshot.halt_ok = r.ok; hotShieldSaveState(stR); }
+    } catch (e) {}
+  }
   hotShieldPushEvent(r.ok ? 'fire' : 'error', r.ok ? '关机指令已下发（sync + systemctl poweroff）' : '关机指令失败：' + String(r.output).slice(0, 200));
   const st1 = hotShieldLoadState();
   st1.lastActionTs = Date.now();
@@ -11743,6 +11885,7 @@ if (!global.__hotShieldTimer) {
 function hotShieldStatus() {
   const cfg = hotShieldCfg();
   const now = Date.now();
+  const st = hotShieldLoadState();
   const armed = !!(cfg.enabled && !hsNowCooldownLeftMs());
   return {
     ok: true,
@@ -11758,8 +11901,9 @@ function hotShieldStatus() {
       seconds_left: __hs.countdownEndsAt ? Math.max(0, Math.ceil((__hs.countdownEndsAt - now) / 1000)) : 0,
       firing: __hs.firing,
       live_age_s: (global.__gpuLive && global.__gpuLive.ts) ? Math.round((now - global.__gpuLive.ts) / 1000) : null,
-      last_triggered_ts: hotShieldLoadState().lastTriggeredTs || null,
-      events: (hotShieldLoadState().events || []).slice(-10).reverse(),
+      last_triggered_ts: st.lastTriggeredTs || null,
+      events: (st.events || []).slice(-10).reverse(),
+      last_temp_snapshot: st.lastTempSnapshot || null,
     },
   };
 }
@@ -11768,6 +11912,21 @@ async function hotShieldCmd(req, res) {
   const body = await cpuCtlReadBody(req);
   if (!body) return reply(400, { ok: false, msg: '请求体不是合法 JSON' });
   const act = String(body.action || '');
+  if (act === 'templog-drill') {
+    // [gpu-hotshield-templog 1105] 演练：只留档、不停服、不关机（验证记录链路 / 让用户先看一眼记录长什么样）
+    try {
+      const rec = hsTempDrill();
+      hsTempLogAppend(rec);
+      const stD = hotShieldLoadState();
+      stD.lastTempSnapshot = rec;
+      hotShieldSaveState(stD);
+      hotShieldPushEvent('info', '已演练记录关机前 10 秒 GPU 温度（未关机）');
+      console.log('[hotshield] 温度留档演练完成（有效采样 ' + rec.available_seconds + '/10 秒）');
+      return reply(200, { ok: true, action: act, msg: '已写入一条演练记录（未停止实例、未关机）', record: rec, state: hotShieldStatus().state });
+    } catch (e) {
+      return reply(500, { ok: false, action: act, msg: '演练记录失败：' + String((e && e.message) || e) });
+    }
+  }
   if (act === 'cancel') {
     if (__hs.countdownEndsAt) hsCancelCountdown('用户在页面手动取消（关机前 ' + Math.max(0, Math.ceil((__hs.countdownEndsAt - Date.now()) / 1000)) + ' 秒）');
     else hotShieldPushEvent('info', '收到取消请求（当前并无进行中的倒计时）');
@@ -11792,6 +11951,14 @@ function hotShieldHandle(req, res, urlObj) {
   const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
   const sub = urlObj.pathname.slice('/v1/internal/hotshield'.length);
   if (req.method === 'POST' && sub === '/cmd') return hotShieldCmd(req, res);
+  // [gpu-hotshield-templog 1105] GET /v1/internal/hotshield/templog?limit=10&kind=shutdown|drill
+  if (req.method === 'GET' && (sub === '/templog' || sub === '/templog/')) {
+    let limit = 10;
+    try { limit = parseInt(urlObj.searchParams.get('limit'), 10) || 10; } catch (e) { limit = 10; }
+    let kind = null;
+    try { const k = urlObj.searchParams.get('kind'); if (k === 'shutdown' || k === 'drill') kind = k; } catch (e) {}
+    return reply(200, { ok: true, path: HS_TEMPLOG_PATH, window_s: HS_TEMP_WINDOW_S, limit: limit, kind: kind, records: hsTempLogRead(limit, kind) });
+  }
   return reply(200, hotShieldStatus());
 }
 // ==== [gpu-hotshield 1009] END module ====
@@ -15203,7 +15370,8 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // === GPU 高温自动关机守护 API（[gpu-hotshield 1009]：GET 状态 / POST cmd {action:save|cancel}）===
+  // === GPU 高温自动关机守护 API（[gpu-hotshield 1009] + [gpu-hotshield-templog 1105]：
+  //     GET 状态 / GET templog 关机前 10 秒温度记录 / POST cmd {action:save|cancel|templog-drill}）===
   if (pathname === '/v1/internal/hotshield' || pathname.startsWith('/v1/internal/hotshield/')) {
     return Promise.resolve(hotShieldHandle(req, res, urlObj)).catch((e) => {
       try { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); } catch (_) {}

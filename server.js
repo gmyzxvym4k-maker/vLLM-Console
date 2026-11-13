@@ -14885,12 +14885,33 @@ const server = http.createServer(async (req, res) => {
     req.on('end', () => {
       let data = {};
       try { data = JSON.parse(body || '{}'); } catch (e) {}
-      const target = String(data.target || '').trim();
+      const rawTarget = String(data.target || '').trim();
       const params = (data.params && typeof data.params === 'object') ? data.params : null;
       const cards = quickStartCards() || {};
+      // [qs-save-fix 1107] 预设表已由「按 GPU 卡分组」改为「按模型分组」
+      // （flashnext / uncensored），但前端「保存到快速启动」仍下发 'gpu' + gpuId。
+      // 兼容解析：精确 key > 按端口唯一匹配 > 按 gpu 编号唯一匹配。
+      // 两张卡的 gpu 都是 0，故端口优先（18420→flashnext / 18430→uncensored）。
+      let target = rawTarget;
+      if (!cards[target] && params) {
+        const portN = parseInt(params.port);
+        const uniq = pred => {
+          const hit = Object.keys(cards).filter(pred);
+          return hit.length === 1 ? hit[0] : null;
+        };
+        target = uniq(k => Number(cards[k].port) === portN)
+              || (/^gpu\d+$/i.test(rawTarget)
+                    ? uniq(k => Number(cards[k].gpu) === Number(rawTarget.slice(3)))
+                    : null)
+              || rawTarget;
+      }
       if (!cards[target] || !params) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ ok: false, error: '参数缺失（target/params）' }));
+        return res.end(JSON.stringify({
+          ok: false,
+          error: '参数缺失（target/params）：' + (rawTarget || '(空)') +
+                 ' 未匹配到预设卡，可用：' + Object.keys(cards).join(', ')
+        }));
       }
       if (!params.modelName || !fs.existsSync(path.join(MODELS_DIR, params.modelName))) {
         res.writeHead(400, { 'Content-Type': 'application/json' });

@@ -80,8 +80,16 @@ async function runPage(file, scenario) {
   const renders = { text: env.counters.text - before.text, html: env.counters.html - before.html };
   report.notes.push(`渲染写入 text+${renders.text} html+${renders.html}｜fetch ${fetchCalls.length} 次｜存活定时器 ${env.timerCount()}｜自愈 ${w.__dashRestarts || 0} 次`);
   if (scenario.assert) {
-    const problems = scenario.assert(w, env, { renders, fetchCalls, report });
-    (problems || []).forEach((p) => report.runtimeErrors.push('断言失败: ' + p));
+    // 断言抛错必须记为失败，不能让它打断主循环：此前 assert 里一个 TypeError 会让
+    // runPage 的 Promise 直接 reject、await 抛出后整个测试静默结束、退出码仍是 0
+    // （1103 的 dom-mock 假绿是同类问题，只是那条在 esc() 侧）。现在统一收进 runtimeErrors，
+    // 「测试跑到一半就没了」这种形态会显式变红，而不是看起来全绿。
+    try {
+      const problems = scenario.assert(w, env, { renders, fetchCalls, report });
+      (problems || []).forEach((p) => report.runtimeErrors.push('断言失败: ' + p));
+    } catch (e) {
+      report.runtimeErrors.push('断言抛错: ' + msg(e));
+    }
   }
   process.off('unhandledRejection', onRej);
   report.runtimeErrors.push(...env.errors);
@@ -442,7 +450,11 @@ const scenarios = {
   for (const f of targets) {
     const list = scenarios[f] || [{ name: '仅加载', ms: 3000 }];
     for (const sc of list) {
-      const r = await runPage(f, sc);
+      // 单个场景抛错不得静默终止整轮测试（否则后面的场景根本没跑，退出码还是 0——
+      // 「测试跑一半就没了」这种形态比红更危险）。这里兜住后显式记为失败并继续。
+      let r;
+      try { r = await runPage(f, sc); }
+      catch (e) { r = { file: f, loadErrors: [], runtimeErrors: ['场景执行抛错: ' + msg(e)], notes: [] }; }
       const bad = r.loadErrors.length || r.runtimeErrors.length;
       if (bad) fail++;
       console.log(`\n=== ${f} · ${sc.name} === ${bad ? '✗' : '✓'}`);

@@ -1,5 +1,17 @@
 # 更新日志
 
+## 2026-11-13 [dash-prefs-1113] 仪表盘新增「显示设置」配置项（哪些信息可显示 / 隐藏，页面 r59）
+- 需求：仪表盘上再增加一个配置项，配置哪些信息可以显示、哪些隐藏。落在页头「⚙ 显示设置」，弹窗按 **4 组共 22 项**勾选：页头与操作（总功耗 / 数据截至）、KPI 卡（GPU 显存 / GPU 利用率·CPU / 显卡功耗·温度 / 内存，逐张可控）、主要区块（Token 吞吐 / 能耗·电费 / PD 走势图 / 费用统计 / 性能指标格 / GPU 排队·处理 / 并发请求+最近完成请求 / 系统详情）、指标格内单项（TTFT / TPOT / pp TPS / tg TPS / MTP 命中率 / KV Cache / 二级缓存·CPU / 已缓存 token）。
+- **口径与 10-16 的 tab-prefs 一致，不另起一套机制**：单一注册表 `DASH_BLOCKS` + `DASH_METRIC_ITEMS` 是全量真值——配置项、id、分组、默认值只写这一处，弹窗渲染、应用、角标统计全部由它派生（增删区块只改注册表，不留散落 if 分支）。存 `localStorage.dashHiddenBlocks`（存「被隐藏的 key」），**仅本浏览器生效、零后端改动、零重启**，`index.html` 每请求读盘即生效。
+- **默认行为零漂移**：未配置 = 全部显示，与改造前逐像素一致，存量使用者无感知；实测 22 项元素全部命中、`display` 均非 none。
+- **隐藏只影响渲染层**（09-22 / 10-29 铁律：显示偏好不得反向影响数据链路）：只给容器加 `.dash-block-hidden { display:none !important }`，**不动内联样式、不删 DOM、不改取数 / 轮询 / 导出**，切回即原样恢复。加 `!important` 是必须的——KPI 卡与指标格自身带内联 `display:flex`，纯类选择器会被内联样式压过去（同 tailwind-build 的层叠顺序）。真实浏览器实测：隐藏 6 个区块后，15 个只读接口（energy / gpu / gpu-ecc / gpu-temp / gpu-power / hotswap / net / disk-trend …）**全部继续推进**，取数链零影响。
+- **配置健壮性**：读配置时按注册表过滤未知 key（删掉或改名的旧配置自动失效，不会永久隐藏一个不存在的区块）；坏 JSON / 非数组一律降级为空数组；隐私模式下写 localStorage 抛错只降级为「不记忆」，绝不拖死页面。实测脏配置 `["ghost.key","block.billing",123]` → 过滤为 `["block.billing"]`，无关区块不被误伤。
+- **边界状态补齐（隐藏 ≠ 留白）**：① KPI 四张全隐 → 外层栅格行 `dashKpiRow` 一并收掉，否则会留一条只有 gap 的空行；② Token 卡与能耗卡同时隐 → `dashTokenRow` 同隐，只隐其一则保留行（两张卡共用一行）；③ **全部隐藏时** `dashAllHiddenBar` 兜底条出现并给「恢复显示」按钮，页头入口常驻且带「设置 · 隐藏 N」角标——两处入口保证不自锁（与 tab-prefs 刻意不同：导航必须留一项否则无法操作，仪表盘允许全隐藏）。真实浏览器实测各配置组合下**零空壳 / 零空洞**，指标格只剩 1 项时该项自动铺满整行（1248px），不留半宽残条。
+- 注册表同时导出 `window.__dashPrefsRegistry`（all / blocks / metrics / apply / read / write / isHidden / set / refresh / open），供排障与仿真断言直接读取（顶层 `const` 不挂 window）。
+- **回归**：pages 40 场景，新增 8 条 dash-prefs 场景全绿（未配置全显示 / 单区块隐藏且轮询不受影响 / KPI 行收掉 / Token 行按需收掉 / 全部隐藏兜底条与恢复 / 脏配置过滤 / dashBlockSet 开关含非法 key 拒绝 / 注册表↔页面 id 一一对应且无重复）。**做了 5 组变异自测**：不加隐藏类、KPI 行不收、不过滤脏 key、兜底条不出、Token 行误收——各自让对应场景变红，确认断言不是空转。唯一红项 `GPU ECC 卡：接口 500 → 保留上一帧` 为**改动前既有失败**（已用原件回跑证明，不因本次引入）。
+- 同批修 `tests/pages.test.js` 两处**假绿形态**：① `assert` 抛错此前会打断整轮测试且退出码仍为 0；② 单场景执行抛错同样静默终止（表现为「只跑了几条就没了，却显示全绿」）。现统一收进 `runtimeErrors` 显式变红——与 1103 那条 `esc()` 假绿同源，属测试基建缺陷。真实浏览器验证走 CDP（Node 22 自带 WebSocket，无需装 puppeteer）：弹窗 22 项 4 组、勾选切换、刷新后配置持久、恢复默认回原样、全部隐藏兜底条与恢复入口均实测通过。
+- 回滚：`index.html.bak-dashprefs-1113`（纯前端新增，无配置文件与落盘数据需清理；`localStorage.dashHiddenBlocks` 可在弹窗点「恢复默认」清空）。
+
 ## 2026-11-03 [qs-dflash-1103] 固化当前 vLLM 实跑参数为快启默认档 + 打通 DFlash 下发链（已上线 .127）
 - 把 11-03 18:21:31 在跑的 18420 实例（pid 1114856，官方 vLLM 0.31 新栈）逐键固化为 flashnext 卡新默认档 `w4a16-pp2-1m-dflash7-b1680`：**W4A16-AutoRound 的 1M YaRN×4 副本 · TP1×PP2 · block-size 1680 · DFlash 外部草稿×7 · SimpleCPU 二级缓存 96GiB · PLE BF16 锁页 · 思考 xhigh · 采样落 inner 缺省（t1/p0.95/k20/minp0/pp0/rp1）**。
 - **不覆盖历史**：四条旧档位（w8a8 PP3 1M/512K/750K、11-02 的 w4a16-pp2-1m-mtp4-bf16pin-gpu01）params 逐字段原样保留、全部留在下拉，只把 `standard` 默认标记从 11-02 档移到新档（旧档名尾标〔…·旧默认〕）；uncensored 卡零改动。校验＝逐档 diff 旧 params 全等 + 新组单测「固化历史不覆盖」锁住。

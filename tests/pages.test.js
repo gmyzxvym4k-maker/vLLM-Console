@@ -160,6 +160,18 @@ function gpuTempSubpaths(rec) {
   return out;
 }
 
+// [dash-prefs 1113] 页面把注册表显式导出到 window.__dashPrefsRegistry（顶层 const 不挂 window）。
+// 这里统一走 R(w)；页面未加载成功时返回空壳并把缺失记进 w.__dashPrefsMissing，
+// 断言据此给出「模块没加载」而不是抛 TypeError（后者会打断整个测试，见 runPage 的断言兜底）。
+function R(w) {
+  const reg = w && w.__dashPrefsRegistry;
+  if (reg) return reg;
+  if (w) w.__dashPrefsMissing = true;
+  const noop = () => ({});
+  return { all: [], blocks: [], metrics: [], apply: () => ({ hit: 0, miss: [], hidden: 0 }),
+    read: () => [], write: noop, isHidden: () => false, set: () => false, refresh: noop };
+}
+
 const scenarios = {
   'index.html': [
     { name: '正常轮询（真实线上载荷）', ms: 20000, fetch: live, setup: connected,
@@ -167,6 +179,138 @@ const scenarios = {
         const bad = [];
         if (r.renders.text + r.renders.html < 20) bad.push('20s 内几乎没有渲染写入（轮询链可能没跑起来）');
         if (r.fetchCalls.length < 10) bad.push('fetch 次数过少（轮询未持续）');
+        return bad;
+      } },
+    // ==== [dash-prefs 1113] 仪表盘区块显示 / 隐藏配置 ====
+    // 这批场景盯的是「配置契约」而非像素：未配置=全显示、隐藏只加类、配置失效不污染、
+    // 全部隐藏有兜底、申明不存在的 key 会被过滤。每条都做了「删掉对应实现必红」的变异自测。
+    { name: '仪表盘显示设置：未配置 → 全部区块显示（默认行为零漂移）', ms: 3000, fetch: live,
+      setup: async (w) => { R(w).apply(); R(w).refresh(); },
+      assert: (w, env, r) => {
+        const bad = [];
+        if (typeof w.dashPrefsApply !== 'function') return ['dashPrefsApply 未定义（模块没加载）'];
+        // 注册表里每一项都必须能在页面上找到对应元素——脱节会表现为「配置了却什么也没发生」
+        if (!R()) return ['页面未导出 __dashPrefsRegistry（dash-prefs 模块没加载）'];
+        const res = R(w).apply();
+        if (!res || res.miss.length) bad.push('注册表 id 未命中：' + JSON.stringify(res && res.miss));
+        if (res && res.hidden !== 0) bad.push('未配置时 hidden 应为 0（实得 ' + res.hidden + '）');
+        ['dashKpiGpuMem', 'dashTokenCard', 'billingCard', 'gpuQueueCard', 'dashConcCard', 'sysDetailCard', 'dashMetricTtft'].forEach((id) => {
+          if (w.document.getElementById(id).classList.contains('dash-block-hidden')) bad.push(id + ' 未配置却被隐藏');
+        });
+        if (w.document.getElementById('dashAllHiddenBar').style.display === 'flex') bad.push('未配置却显示「全部隐藏」兜底条');
+        return bad;
+      } },
+    { name: '仪表盘显示设置：隐藏单个区块 → 只加类，取数与轮询不受影响', ms: 12000, fetch: live,
+      setup: async (w) => {
+        R(w).write(['block.billing']);
+        R(w).apply();
+        await new Promise((r) => setImmediate(r));
+      },
+      assert: (w, env, r) => {
+        const bad = [];
+        if (!w.document.getElementById('billingCard').classList.contains('dash-block-hidden')) bad.push('billingCard 未被隐藏');
+        if (w.document.getElementById('gpuQueueCard').classList.contains('dash-block-hidden')) bad.push('gpuQueueCard 被误隐藏（越界影响）');
+        // 铁律：显示偏好只影响渲染，不得反向影响数据链路——隐藏后轮询必须照常推进
+        if (r.fetchCalls.length < 8) bad.push('隐藏区块后 fetch 次数骤降（' + r.fetchCalls.length + '），取数链路被显示配置影响');
+        if (r.renders.text + r.renders.html < 20) bad.push('隐藏区块后渲染几乎停止（' + (r.renders.text + r.renders.html) + '）');
+        return bad;
+      } },
+    { name: '仪表盘显示设置：KPI 四张全隐藏 → 外层栅格行一并收掉（不留空洞）', ms: 3000, fetch: live,
+      setup: async (w) => {
+        R(w).write(['kpi.gpumem', 'kpi.util', 'kpi.powertemp', 'kpi.mem']);
+        R(w).apply();
+      },
+      assert: (w, env, r) => {
+        const bad = [];
+        if (!w.document.getElementById('dashKpiRow').classList.contains('dash-block-hidden')) bad.push('KPI 卡全隐藏后 dashKpiRow 未收掉（会留空行）');
+        // 只收容器、不收卡片本身：单张恢复时靠的是卡片自己的类
+        if (!w.document.getElementById('dashKpiMem').classList.contains('dash-block-hidden')) bad.push('dashKpiMem 未被隐藏');
+        return bad;
+      } },
+    { name: '仪表盘显示设置：Token 卡与能耗卡同隐 → 整行收掉；只隐其一则保留行', ms: 3000, fetch: live,
+      setup: async (w) => {
+        R(w).write(['block.token']);
+        R(w).apply();
+        w.__rowA = w.document.getElementById('dashTokenRow').classList.contains('dash-block-hidden');
+        R(w).write(['block.token', 'block.energy']);
+        R(w).apply();
+        w.__rowB = w.document.getElementById('dashTokenRow').classList.contains('dash-block-hidden');
+      },
+      assert: (w) => {
+        const bad = [];
+        if (w.__rowA) bad.push('只隐藏 Token 卡时整行就被收掉了（能耗卡会一起消失）');
+        if (!w.__rowB) bad.push('两张卡都隐藏后整行未收掉（留空行）');
+        return bad;
+      } },
+    { name: '仪表盘显示设置：全部区块隐藏 → 兜底条出现，恢复后消失', ms: 3000, fetch: live,
+      setup: async (w) => {
+        R(w).write(R(w).all.map((b) => b.key));
+        R(w).apply();
+        R(w).refresh();
+      },
+      assert: (w) => {
+        const bad = [];
+        if (w.document.getElementById('dashAllHiddenBar').style.display !== 'flex') bad.push('全部隐藏后兜底条未出现（会白屏且无恢复入口）');
+        if (!w.document.getElementById('dashKpiRow').classList.contains('dash-block-hidden')) bad.push('全部隐藏后 KPI 行未收掉');
+        // 页头入口必须常驻且带已隐藏计数——这是恢复路径，不能被配置自己藏掉
+        const t = w.document.getElementById('dashPrefsTrigger');
+        if (t.classList.contains('dash-block-hidden')) bad.push('页头「显示设置」入口被配置藏掉了（自锁风险）');
+        const lab = w.document.getElementById('dashPrefsTriggerLabel').textContent || '';
+        if (lab.indexOf(String(R(w).all.length)) < 0) bad.push('入口角标未显示已隐藏数（实得 ' + JSON.stringify(lab) + '）');
+        // 恢复默认后兜底条必须消失
+        try { w.localStorage.removeItem('dashHiddenBlocks'); } catch (e) {}
+        R(w).apply();
+        if (w.document.getElementById('dashAllHiddenBar').style.display === 'flex') bad.push('恢复默认后兜底条仍在');
+        return bad;
+      } },
+    { name: '仪表盘显示设置：脏配置（未知 key / 非数组 / 坏 JSON）→ 过滤后不污染', ms: 3000, fetch: live,
+      setup: async (w) => {
+        w.localStorage.setItem('dashHiddenBlocks', JSON.stringify(['ghost.key', 'block.billing', 123]));
+        w.__read1 = R(w).read();
+        w.localStorage.setItem('dashHiddenBlocks', 'not-json{{{');
+        w.__read2 = R(w).read();
+        w.localStorage.setItem('dashHiddenBlocks', JSON.stringify({ a: 1 }));
+        w.__read3 = R(w).read();
+        R(w).apply();
+      },
+      assert: (w) => {
+        const bad = [];
+        if (JSON.stringify(w.__read1) !== JSON.stringify(['block.billing'])) bad.push('未知 key/非字符串未被过滤（实得 ' + JSON.stringify(w.__read1) + '）');
+        if (!Array.isArray(w.__read2) || w.__read2.length) bad.push('坏 JSON 未降级为空数组（实得 ' + JSON.stringify(w.__read2) + '）');
+        if (!Array.isArray(w.__read3) || w.__read3.length) bad.push('非数组未降级为空数组（实得 ' + JSON.stringify(w.__read3) + '）');
+        if (w.document.getElementById('sysDetailCard').classList.contains('dash-block-hidden')) bad.push('脏配置把无关区块隐藏了');
+        return bad;
+      } },
+    { name: '仪表盘显示设置：dashBlockSet 单向开关（含非法 key 拒绝）', ms: 3000, fetch: live,
+      setup: async (w) => {
+        w.__ok1 = R(w).set('block.billing', false);
+        w.__hid1 = R(w).isHidden('block.billing');
+        w.__ok2 = R(w).set('block.billing', true);
+        w.__hid2 = R(w).isHidden('block.billing');
+        w.__ok3 = R(w).set('nope.key', false);
+        w.__hid3 = R(w).isHidden('nope.key');
+      },
+      assert: (w) => {
+        const bad = [];
+        if (!w.__ok1 || !w.__hid1) bad.push('dashBlockSet(key,false) 未生效');
+        if (!w.__ok2 || w.__hid2) bad.push('dashBlockSet(key,true) 未恢复');
+        if (w.__ok3 || w.__hid3) bad.push('非法 key 未被拒绝');
+        return bad;
+      } },
+    { name: '仪表盘显示设置：配置项与页面元素一一对应（id 存在性 + 无重复 key/id）', ms: 3000, fetch: live,
+      setup: async (w) => { R(w).apply(); },
+      assert: (w) => {
+        const bad = [];
+        const all = R(w).all || [];
+        if (all.length < 20) bad.push('注册表项过少（实得 ' + all.length + '）');
+        const keys = new Set(), ids = new Set();
+        all.forEach((b) => {
+          if (keys.has(b.key)) bad.push('key 重复：' + b.key);
+          if (ids.has(b.id)) bad.push('id 重复：' + b.id);
+          keys.add(b.key); ids.add(b.id);
+          if (!w.document.getElementById(b.id)) bad.push('注册表 id 在页面上不存在：' + b.id);
+          if (!b.label || !b.group) bad.push('项缺 label/group：' + b.key);
+        });
         return bad;
       } },
     { name: 'fetch 永不 settle → 看门狗应自愈', ms: 45000,

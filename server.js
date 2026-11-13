@@ -222,6 +222,249 @@ function listVllmInstances(force) {
   return dedup;
 }
 
+// ===== [model-layers-1105] 每个 GPU 加载的模型层数（只读，供「vLLM」标签页显示） =====
+// 口径链（真值优先，任何一级不成立都不拿估算值冒充）：
+//  ① 总层数 = 模型目录 config.json 的 num_hidden_layers（顶层优先，兼容 text_config）。
+//  ② PP 段切分 = 本次启动落盘的 launch.env · FN_PP_PARTITION（脚本栈唯一可靠参数通道；
+//     inner.sh: export VLLM_PP_LAYER_PARTITION=${FN_PP_PARTITION:-26,22}，rt-patch hook10
+//     据此覆盖 vLLM get_pp_indices）。按 FN_PORT 归属端口、mtime 最新者胜，避免同端口
+//     多栈（0300 / 0310 / pre0320）读到退役配置。校验项数==PP 且总和==总层数。
+//  ③ launch.env 未下发该键时读 inner.sh 的缺省值（引擎实际会用它）。
+//  ④ 都取不到 → vLLM 官方 get_pp_indices 均分（余数给末段），明确标「推算」。
+//  ⑤ GPU↔PP 段 = nvidia-smi compute-apps（走 gpuQuery 单飞通道、10s 结果缓存）与
+//     /proc 中 VLLM::Worker_PP<n> 进程交叉定址；取不到时回落实例 CUDA_VISIBLE_DEVICES 顺序。
+//  ⑥ TP 不切层：TP>1 时同一 PP 段的每张卡都加载该段全部层数（层内张量分片），如实说明。
+const ML_TTL_MS = 10000;
+function mlReadEnv(file) {
+  const out = {};
+  try {
+    const lines = fs.readFileSync(file, 'utf8').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line || line.charAt(0) === '#') continue;
+      const eq = line.indexOf('=');
+      if (eq < 1) continue;
+      const key = line.slice(0, eq).trim();
+      if (!/^FN_[A-Z0-9_]+$/.test(key)) continue;
+      // launch.env 由 shell printf 生成，逗号/花括号/引号被反斜杠转义（如 27\,21）
+      const val = line.slice(eq + 1).trim().replace(/\\([,{}"'\\])/g, '$1').replace(/^["']|["']$/g, '');
+      out[key] = val;
+    }
+  } catch (e) {}
+  return out;
+}
+function mlLaunchEnvForPort(port) {
+  const root = '/home/ll/deploy';
+  let best = null;
+  try {
+    for (const n of fs.readdirSync(root)) {
+      if (n.indexOf('vllm-') !== 0) continue;
+      const file = root + '/' + n + '/launch.env';
+      let st;
+      try { st = fs.statSync(file); } catch (e) { continue; }
+      const env = mlReadEnv(file);
+      if (parseInt(env.FN_PORT, 10) !== port) continue;
+      if (!best || st.mtimeMs > best.mtimeMs) best = { file: file, mtimeMs: st.mtimeMs, env: env };
+    }
+  } catch (e) {}
+  return best;
+}
+function mlInnerDefault(launchFile) {
+  try {
+    const dir = require('path').dirname(launchFile) + '/bin';
+    for (const n of fs.readdirSync(dir)) {
+      if (!/inner.*\.sh$/.test(n)) continue;
+      const s = fs.readFileSync(dir + '/' + n, 'utf8');
+      const m = s.match(/VLLM_PP_LAYER_PARTITION=\$\{FN_PP_PARTITION:-([0-9,]+)\}/);
+      if (m) return { value: m[1], file: dir + '/' + n };
+    }
+  } catch (e) {}
+  return null;
+}
+function mlModelLayers(modelPath) {
+  if (!modelPath) return { total: null, source: null, error: '模型路径不可得' };
+  try {
+    const file = require('path').join(modelPath, 'config.json');
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+    // 主骨干层数在 text_config（Qwen3-Next 类）或顶层（Llama 类）；MTP / 草稿子配置
+    // 也有 num_hidden_layers，但只有 1 层 —— 优先取 >1 的候选，避免把草稿层数当骨干层数。
+    const cands = [
+      { v: cfg.text_config && cfg.text_config.num_hidden_layers, k: 'text_config.num_hidden_layers' },
+      { v: cfg.num_hidden_layers, k: 'num_hidden_layers' },
+      { v: cfg.llm_config && cfg.llm_config.num_hidden_layers, k: 'llm_config.num_hidden_layers' },
+    ];
+    let total = null, key = null;
+    for (const c of cands) if (c.v > 1) { total = c.v; key = c.k; break; }
+    if (!total) for (const c of cands) if (c.v > 0) { total = c.v; key = c.k; break; }
+    if (!total) return { total: null, source: null, error: 'config.json 无 num_hidden_layers' };
+    return { total: Math.round(total), source: file + ' · ' + key, error: null };
+  } catch (e) {
+    return { total: null, source: null, error: 'config.json 不可读：' + String((e && e.message) || e) };
+  }
+}
+function mlValidParts(raw, pp, total) {
+  if (!raw || !/^[0-9]+(,[0-9]+)*$/.test(raw)) return null;
+  const parts = raw.split(',').map(function (x) { return parseInt(x, 10); });
+  if (parts.length !== pp) return null;
+  let sum = 0;
+  for (const v of parts) { if (!(v > 0)) return null; sum += v; }
+  return sum === total ? parts : null;
+}
+function mlEvenParts(total, pp) {
+  const base = Math.floor(total / pp), rem = total % pp, parts = [];
+  for (let i = 0; i < pp; i++) parts.push(base + (i === pp - 1 ? rem : 0));
+  return parts;
+}
+function mlResolveSplit(total, pp, port) {
+  const le = mlLaunchEnvForPort(port);
+  if (le && le.env.FN_PP_PARTITION && le.env.FN_PP_PARTITION !== 'none') {
+    const parts = mlValidParts(le.env.FN_PP_PARTITION, pp, total);
+    if (parts) return { parts: parts, kind: 'launch_env',
+      source: '本次启动 launch.env · FN_PP_PARTITION=' + le.env.FN_PP_PARTITION,
+      file: le.file, mtime: le.mtimeMs };
+    return { parts: mlEvenParts(total, pp), kind: 'even_split',
+      source: 'launch.env 的 FN_PP_PARTITION=' + le.env.FN_PP_PARTITION + ' 与 ' + total + ' 层 / PP' + pp + ' 不匹配，已回落 vLLM 均分（推算）',
+      file: le.file, mtime: le.mtimeMs };
+  }
+  if (le) {
+    const dflt = mlInnerDefault(le.file);
+    if (dflt) {
+      const parts = mlValidParts(dflt.value, pp, total);
+      if (parts) return { parts: parts, kind: 'inner_default',
+        source: 'inner.sh 缺省 · VLLM_PP_LAYER_PARTITION=' + dflt.value + '（launch.env 未下发 FN_PP_PARTITION）',
+        file: dflt.file, mtime: le.mtimeMs };
+    }
+  }
+  return { parts: mlEvenParts(total, pp), kind: 'even_split',
+    source: 'vLLM get_pp_indices 均分（余数给末段）· 推算值', file: null, mtime: null };
+}
+function mlPidBelongsTo(pid, rootPid, hops) {
+  let cur = pid;
+  for (let i = 0; i < (hops || 6); i++) {
+    if (cur === rootPid) return true;
+    if (!cur || cur <= 1) return false;
+    let pp = null;
+    try {
+      const st = fs.readFileSync('/proc/' + cur + '/status', 'utf8');
+      pp = parseInt((st.match(/^PPid:\s*(\d+)/m) || [])[1], 10) || null;
+    } catch (e) { return false; }
+    if (!pp) return false;
+    cur = pp;
+  }
+  return cur === rootPid;
+}
+function mlWorkers() {
+  const out = [];
+  try {
+    const s = require('child_process').execSync('pgrep -f "[V]LLM::Worker_PP" || true', { encoding: 'utf8', timeout: 2000 }).toString().trim();
+    for (const tok of s.split('\n')) {
+      const pid = parseInt(tok.trim(), 10);
+      if (!pid) continue;
+      try {
+        const cmd = fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8').split('\0').join(' ');
+        const m = cmd.match(/VLLM::Worker_(?:TP(\d+)_)?PP(\d+)/);
+        if (!m) continue;
+        out.push({ pid: pid, pp_rank: parseInt(m[2], 10), tp_rank: m[1] ? parseInt(m[1], 10) : 0 });
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return out;
+}
+async function mlGpuByPid() {
+  const out = {};
+  try {
+    const r = await Promise.all([
+      gpuQuery(['--query-compute-apps=pid,gpu_uuid,used_memory', '--format=csv,noheader,nounits'], GPU_Q_MS_LIVE),
+      gpuQuery(['--query-gpu=index,uuid,name', '--format=csv,noheader'], GPU_Q_MS_LIVE),
+    ]);
+    const idxByUuid = {}, nameByUuid = {};
+    for (const line of String(r[1] || '').split('\n')) {
+      const p = line.split(',').map(function (x) { return x.trim(); });
+      if (p.length < 3) continue;
+      idxByUuid[p[1]] = parseInt(p[0], 10);
+      nameByUuid[p[1]] = p[2];
+    }
+    for (const line of String(r[0] || '').split('\n')) {
+      const p = line.split(',').map(function (x) { return x.trim(); });
+      if (p.length < 2) continue;
+      const pid = parseInt(p[0], 10);
+      if (!pid) continue;
+      const gi = idxByUuid[p[1]];
+      if (!Number.isInteger(gi)) continue;
+      out[pid] = { gpu: gi, gpu_name: nameByUuid[p[1]] || null, mem_mib: parseInt(p[2], 10) || null };
+    }
+  } catch (e) {}
+  return out;
+}
+async function modelLayersInfo() {
+  const cache = (global.__modelLayersCache = global.__modelLayersCache || { at: 0, data: null });
+  const now = Date.now();
+  if (cache.data && now - cache.at < ML_TTL_MS) return cache.data;
+  const instances = [];
+  let gpuByPid = {};
+  try { gpuByPid = await mlGpuByPid(); } catch (e) {}
+  const workers = mlWorkers();
+  const allInst = listVllmInstances();
+  for (const inst of allInst) {
+    try {
+      const cmdline = fs.readFileSync('/proc/' + inst.pid + '/cmdline', 'utf8').split('\0').filter(Boolean);
+      const cmd = cmdline.join(' ');
+      const pp = parseInt((cmd.match(/--pipeline-parallel-size[=\s]+(\d+)/) || [])[1], 10) || 1;
+      const tp = parseInt((cmd.match(/--tensor-parallel-size[=\s]+(\d+)/) || [])[1], 10) || 1;
+      const modelPath = inst.modelPath || ((cmd.match(/(?:vllm\.entrypoints\.cli\.main|vllm) serve\s+(\S+)/) || [])[1] || '');
+      const ml = mlModelLayers(modelPath);
+      let split = null, gpus = [];
+      if (ml.total && pp > 0 && tp > 0) {
+        split = mlResolveSplit(ml.total, pp, inst.port);
+        const mine = workers.filter(function (w) { return allInst.length === 1 || mlPidBelongsTo(w.pid, inst.pid, 6); });
+        let start = 0;
+        for (let pr = 0; pr < pp; pr++) {
+          const end = start + split.parts[pr];
+          const segWorkers = mine.filter(function (x) { return x.pp_rank === pr; });
+          for (let tr = 0; tr < tp; tr++) {
+            const rank = pr * tp + tr;
+            const w = segWorkers[tr] || null;
+            const gm = (w && gpuByPid[w.pid]) ? gpuByPid[w.pid] : null;
+            const fb = (inst.gpus && inst.gpus.length) ? inst.gpus[rank] : null;
+            const gi = (gm && Number.isInteger(gm.gpu)) ? gm.gpu : (Number.isInteger(fb) ? fb : null);
+            gpus.push({
+              gpu: gi, gpu_name: gm ? gm.gpu_name : null,
+              pp_rank: pr, tp_rank: tr,
+              layers: split.parts[pr], layer_start: start, layer_end: end,
+              layer_range: (end > start) ? (start + '–' + (end - 1)) : '--',
+              share: split.parts[pr] / ml.total,
+              worker_pid: w ? w.pid : null,
+              mem_used_mib: gm ? gm.mem_mib : null,
+              mapping: (gm && Number.isInteger(gm.gpu)) ? 'nvidia-smi' : (Number.isInteger(fb) ? 'CUDA_VISIBLE_DEVICES 顺序（推算）' : '未知')
+            });
+          }
+          start = end;
+        }
+        gpus.sort(function (a, b) { return (a.gpu == null ? 999 : a.gpu) - (b.gpu == null ? 999 : b.gpu); });
+      }
+      instances.push({
+        port: inst.port, pid: inst.pid,
+        model: inst.servedName || inst.modelPath || '', model_path: modelPath,
+        pp_size: pp, tp_size: tp,
+        total_layers: ml.total, layers_source: ml.source, layers_error: ml.error,
+        partition: split ? split.parts : null,
+        partition_kind: split ? split.kind : null,
+        partition_source: split ? split.source : null,
+        partition_file: split ? split.file : null,
+        partition_mtime: split ? split.mtime : null,
+        gpus: gpus,
+        gpu_mapping_source: Object.keys(gpuByPid).length ? 'nvidia-smi compute-apps + /proc VLLM::Worker_PP 进程（进程树归属）' : '实例 CUDA_VISIBLE_DEVICES 顺序（nvidia-smi 不可用）',
+        note: tp > 1 ? 'TP 为层内张量并行、不切分层：同一 PP 段的每张卡都加载该段全部层数。' : (pp > 1 ? 'PP 按层切段，各卡加载本段全部层的权重；非层参数（embedding / lm_head / MTP）按 vLLM 规则落在首末段。' : '单卡 / 无 PP：该卡加载模型全部层。')
+      });
+    } catch (e) {
+      instances.push({ port: inst.port, pid: inst.pid, gpus: [], total_layers: null, layers_error: String((e && e.message) || e) });
+    }
+  }
+  const data = { ts: Date.now(), instances: instances, ttl_ms: ML_TTL_MS };
+  cache.at = Date.now(); cache.data = data;
+  return data;
+}
+
 // ---- vLLM 版本探测（[vllm-version-1006] 供「vLLM」标签页显示当前模型的引擎版本）----
 // 判据链（与 ple_table 同款"日志是真值"）：
 //   ① 引擎启动日志自报行 "Initializing a V1 LLM engine (<ver>)"——脚本化/chroot 实例
@@ -12329,6 +12572,19 @@ const server = http.createServer(async (req, res) => {
   }
   // ==== [strata-console] END route ====
   // === Internal API: Model Running Parameters ===
+  // === Internal API: 每个 GPU 加载的模型层数 [model-layers-1105] ===
+  // 只读；内部 10s 结果缓存（页面 2s 轮询不会反复触发 nvidia-smi / 读盘）。
+  if (pathname === '/v1/internal/model-layers') {
+    modelLayersInfo().then(function (data) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(data));
+    }).catch(function (e) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ts: Date.now(), instances: [], error: String((e && e.message) || e) }));
+    });
+    return;
+  }
+
   if (pathname === '/v1/internal/model-params') {
     // 采样参数回落：命令行未显式传采样参数时，读模型目录的 generation_config.json。
     // 脚本化启动实例（如 Flash-Next chroot 链路）按设计不下发 --override-generation-config，

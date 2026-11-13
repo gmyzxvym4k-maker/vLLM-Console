@@ -356,6 +356,82 @@ const scenarios = {
         if (!msg || msg.indexOf('魔术包') < 0) bad.push('pwrMsg 未回显后端 msg（实际：' + JSON.stringify(msg) + '）');
         return bad;
       } },
+    // [gpu-ecc-1108] 硬件监视页「GPU ECC 状态与报错」卡：真实形态载荷渲染 + 关闭红标 + 500 保帧 + DBE 显色
+    { name: 'GPU ECC 卡渲染（真实形态载荷）', ms: 8000, fetch: live,
+      setup: async (w) => { w.loadGpuEcc(); await new Promise((r) => setImmediate(r)); },
+      assert: (w, env, r) => {
+        const bad = [];
+        const rows = w.document.getElementById('eccGpuRows').innerHTML || '';
+        if (rows.indexOf('CMP 170HX') < 0) bad.push('eccGpuRows 未渲染逐卡行（实得 ' + JSON.stringify(rows.slice(0, 80)) + '）');
+        if (rows.indexOf('已开启') < 0) bad.push('ECC 模式列未渲染开启态');
+        if (rows.indexOf('6.16') < 0) bad.push('Inforom ECC 版本未显示');
+        if (rows.indexOf('正常（无 ECC 报错）') < 0) bad.push('健康状态列未显示 status_label');
+        if (rows.indexOf('--') < 0) bad.push('本机 N/A 列（L2/行重映射/页退役）未按 -- 口径显示');
+        const sum = w.document.getElementById('eccSummary').innerHTML || '';
+        if (sum.indexOf('ECC 开启') < 0 || sum.indexOf('终身 DBE') < 0) bad.push('摘要缺 显卡数/ECC 开启/终身 DBE 段位');
+        if (sum.indexOf('自基线新增') < 0) bad.push('摘要缺 自基线新增 段位');
+        const evts = w.document.getElementById('eccEventRows').innerHTML || '';
+        if (evts.indexOf('Xid 13') < 0) bad.push('报错记录未渲染内核 Xid 事件');
+        if (evts.indexOf('非 ECC') < 0) bad.push('Xid 未按 ECC 类/非 ECC 分标');
+        if (evts.indexOf('首次观测') < 0) bad.push('first_seen 事件未渲染');
+        const hint = w.document.getElementById('eccHint').textContent || '';
+        if (hint.indexOf('采样每 30s') < 0) bad.push('hint 未显示采样周期（实得 ' + JSON.stringify(hint) + '）');
+        return bad;
+      } },
+    { name: 'GPU ECC 卡：ECC 关闭的卡 → 显式红标「已关闭」（位翻转不可检测≠健康）', ms: 8000,
+      fetch: (u) => (u.indexOf('gpu-ecc') < 0 ? live(u) : (() => {
+        const d = JSON.parse(JSON.stringify(fixtures['/gpu-ecc']));
+        const g = d.gpus[0];
+        g.mode_current = 'Disabled'; g.mode_pending = 'Disabled'; g.mode_on = false;
+        g.status = 'disabled'; g.status_label = 'ECC 已关闭（位翻转不可检测）';
+        Object.keys(g.counters).forEach((k) => { g.counters[k] = null; });
+        d.summary.ecc_on = 2; d.summary.ecc_off = 1;
+        return d;
+      })()),
+      setup: async (w) => { w.loadGpuEcc(); await new Promise((r) => setImmediate(r)); },
+      assert: (w, env, r) => {
+        const bad = [];
+        const rows = w.document.getElementById('eccGpuRows').innerHTML || '';
+        if (rows.indexOf('已关闭') < 0) bad.push('未渲染关闭态标记');
+        if (rows.indexOf('var(--red)') < 0) bad.push('关闭态未用红色（disabled=红，不得当正常）');
+        const sum = w.document.getElementById('eccSummary').innerHTML || '';
+        if (sum.indexOf('（关闭 1）') < 0) bad.push('摘要未透传关闭卡计数（实得 ' + JSON.stringify(sum.slice(0, 120)) + '）');
+        return bad;
+      } },
+    { name: 'GPU ECC 卡：接口 500 → 保留上一帧，轮询不得停', ms: 25000,
+      fetch: (u, n, t) => (u.indexOf('gpu-ecc') >= 0 && (t - 1700000000000) > 4000 ? 'fail' : live(u)),
+      setup: async (w) => { w.loadGpuEcc(); await new Promise((r) => setImmediate(r)); },
+      assert: (w, env, r) => {
+        const bad = [];
+        const rows = w.document.getElementById('eccGpuRows').innerHTML || '';
+        if (rows.indexOf('CMP 170HX') < 0) bad.push('取数失败后上一帧被空数据覆盖（09-22 铁律违例）');
+        const n = r.fetchCalls.filter((x) => x.indexOf('gpu-ecc') >= 0).length;
+        if (n < 3) bad.push('取数失败后轮询停止（gpu-ecc 仅 ' + n + ' 次）');
+        return bad;
+      } },
+    { name: 'GPU ECC 卡：DBE 计数增长事件 → 红标 + 当时温度/功耗上下文', ms: 8000,
+      fetch: (u) => (u.indexOf('gpu-ecc') < 0 ? live(u) : (() => {
+        const d = JSON.parse(JSON.stringify(fixtures['/gpu-ecc']));
+        const g = d.gpus[1];
+        g.counters.a_dram_u = 1; g.columns.a_dram_u.value = 1; g.since.a_dram_u = 1;
+        g.status = 'error'; g.status_label = '存在不可纠正错误（DBE）';
+        d.summary.lifetime_dbe = 1; d.summary.since_dbe = 1;
+        d.events.unshift({ ts: 1794104000000, kind: 'ecc', scope: 'aggregate', sev: 'error', idx: 1, ekind: 'dbe', where: 'dram', field: 'a_dram_u', label: '终身 显存(DRAM) 不可纠正 DBE', from: 0, to: 1, delta: 1, ctx: { temp: 61, temp_mem: 74, power: 198.2, util: 96, sm: 1410 }, msg: '终身 显存(DRAM) 不可纠正 DBE 0 → 1（+1）' });
+        return d;
+      })()),
+      setup: async (w) => { w.loadGpuEcc(); await new Promise((r) => setImmediate(r)); },
+      assert: (w, env, r) => {
+        const bad = [];
+        const evts = w.document.getElementById('eccEventRows').innerHTML || '';
+        if (evts.indexOf('不可纠正 DBE') < 0) bad.push('DBE 事件类型未渲染（实得 ' + JSON.stringify(evts.slice(0, 120)) + '）');
+        if (evts.indexOf('0 → 1') < 0) bad.push('事件未显示 从→到 增量');
+        if (evts.indexOf('61/74 ℃') < 0 || evts.indexOf('198.2 W') < 0) bad.push('报错时刻温度/功耗快照未显示');
+        const rows = w.document.getElementById('eccGpuRows').innerHTML || '';
+        if (rows.indexOf('存在不可纠正错误') < 0) bad.push('GPU1 状态列未标 DBE 状态');
+        const sum = w.document.getElementById('eccSummary').innerHTML || '';
+        if (sum.indexOf('终身 DBE') < 0) bad.push('摘要 DBE 段缺失');
+        return bad;
+      } },
   ],
 };
 

@@ -531,6 +531,114 @@ function loadPlanChain(totalmemGiB) {
   });
 }
 
+
+// ============ 16. GPU ECC 解析与判障口径 [gpu-ecc-1108] ============
+{
+  const EC = load(['ECC_XID_ECC_IDS', 'ECC_COLS', 'eccColsOfLevel', 'eccQueryArgs', 'eccNA', 'gpuNum', 'eccParseRows',
+    'eccDiffCounters', 'eccSinceOne', 'eccParseIso', 'eccParseXidLine', 'eccParseXidLines',
+    'eccBusToIndex', 'eccModeOn', 'eccModeOff', 'eccGpuStatus']);
+  // 本机 192.168.1.127 实测真实行（三卡同构，取 GPU0；[N/A] = 该卡不提供此计数器）
+  const REAL0 = '0, GPU-75e3aa88-a4b8-7e63-d5bd-62e2f71c1285, Enabled, Enabled, 6.16, 0, 0, 0, 0, [N/A], [N/A], 0, 0, 0, 0, 0, 0, [N/A], [N/A], 0, 0, No, [N/A], [N/A], [N/A], [N/A], [N/A], [N/A], [N/A], [N/A]';
+  t('查询串与列定义同源：level 0 = 全列，level 2 = 仅基础列（防"查了不显示 / 显示了没查"）', () => {
+    const q = EC.eccQueryArgs(0)[0];
+    const full = 'index,uuid,ecc.mode.current,ecc.mode.pending,inforom.ecc,ecc.errors.corrected.volatile.dram';
+    if (q.indexOf('--query-gpu=' + full) !== 0) return '前缀列序不符：' + q.slice(0, 120);
+    if (q.indexOf('remapped_rows.correctable') < 0) return '完整档应含行重映射';
+    const min = EC.eccColsOfLevel(2).map((c) => c.k);
+    if (min.indexOf('remapped_rows.correctable') >= 0 || min.indexOf('ecc.errors.corrected.volatile.sram') >= 0) return '最小档混入了高阶级列';
+    if (min.indexOf('ecc.errors.corrected.volatile.dram') < 0) return '最小档缺显存计数';
+    return true;
+  });
+  t('真实 CSV 行解析：模式/Inforom/本轮与终身计数落位，[N/A] → null', () => {
+    const cols = EC.eccColsOfLevel(0);
+    const rows = EC.eccParseRows(REAL0, cols);
+    if (rows.length !== 1) return '行数 ' + rows.length;
+    const g = rows[0];
+    if (g.index !== 0) return 'index=' + g.index;
+    if (g.uuid !== 'GPU-75e3aa88-a4b8-7e63-d5bd-62e2f71c1285') return 'uuid=' + g.uuid;
+    if (g.text.mode_current !== 'Enabled' || g.text.inforom_ecc !== '6.16') return JSON.stringify(g.text);
+    if (g.counters.v_dram_c !== 0 || g.counters.a_dram_u !== 0) return '计数=' + JSON.stringify(g.counters);
+    if (g.counters.v_l2_c !== null || g.counters.remap_c !== null) return 'N/A 列必须是 null（不得当 0）：' + JSON.stringify({ l2: g.counters.v_l2_c, remap: g.counters.remap_c });
+    if (g.text.a_sram_thr !== 'No') return 'thresholdExceeded=' + g.text.a_sram_thr;
+    return true;
+  });
+  t('列数不足整行弃（错位会造出根本不存在的"错误增长"）', () => {
+    const cols = EC.eccColsOfLevel(0);
+    const rows = EC.eccParseRows('0, GPU-x, Enabled, Enabled', cols);
+    return rows.length === 0 || '短行未被丢弃';
+  });
+  t('档位回落时按当档列数解析（核心档行 = 少列但仍是合法行）', () => {
+    const cols = EC.eccColsOfLevel(1);
+    if (cols.length !== 13) return '核心档应 13 列，实得 ' + cols.length;
+    if (cols.map((c) => c.k).join(',').indexOf('ecc.errors.corrected.volatile.sram') >= 0) return '核心档混入 SRAM 分项';
+    // 位序 = index,uuid,mode_cur,mode_pend,inforom,v_dram_c,v_dram_u,v_total_c,v_total_u,a_dram_c,a_dram_u,a_total_c,a_total_u
+    const head = '1, GPU-bad03bee-db2a-c7bd-cb66-a0e7ea0280fd, Enabled, Enabled, 6.16, 3, 0, 5, 0, 2, 0, 5, 0';
+    const rows = EC.eccParseRows(head, cols);
+    if (rows.length !== 1) return '核心档行数 ' + rows.length;
+    const g = rows[0];
+    if (g.counters.v_dram_c !== 3 || g.counters.v_total_c !== 5 || g.counters.a_total_u !== 0 || g.index !== 1) return JSON.stringify(g.counters);
+    if (g.counters.a_sram_c !== undefined) return '未查询档位的列不得凭空造值';
+    return true;
+  });
+  t('计数增长/倒退/无基线 三态（倒退=新一轮，不是"错误变少"）', () => {
+    const d = EC.eccDiffCounters({ v_dram_c: 2, a_dram_u: 0, v_sram_c: 7 }, { v_dram_c: 5, a_dram_u: 1, v_sram_c: null, v_l2_c: 3 });
+    const ev = d.events.map((e) => e.key + ':' + e.delta).sort().join(',');
+    if (ev !== 'a_dram_u:1,v_dram_c:3') return '增长=' + ev;
+    if (d.resets.length) return '倒退判定误触发：' + JSON.stringify(d.resets);
+    const r = EC.eccDiffCounters({ v_dram_c: 9 }, { v_dram_c: 0 });   // 驱动重载/重启后本轮归零
+    if (r.resets.length !== 1 || r.resets[0] !== 'v_dram_c') return '未识别轮次重置：' + JSON.stringify(r);
+    if (EC.eccDiffCounters(null, { v_dram_c: 4 }).events.length) return '无上一拍基线不得出结论';
+    return true;
+  });
+  t('自基线新增 = 已完成轮次累加 + 当前轮增量（锚点缺失如实 null）', () => {
+    if (EC.eccSinceOne(0, 5, 2) !== 3) return '当前轮增量算错';
+    if (EC.eccSinceOne(7, 1, 0) !== 8) return '跨轮累加算错';      // 上一轮归档 7 + 新一轮 1
+    if (EC.eccSinceOne(7, 1, null) !== null) return '锚点缺失必须 null';
+    if (EC.eccSinceOne(7, null, 0) !== null) return '当前值缺失必须 null（不以 0 冒充）';
+    return true;
+  });
+  t('journal 时间戳解析（+0800 无冒号偏移 Date.parse 可能不吃 → 补冒号回退）', () => {
+    const a = EC.eccParseIso('2026-11-08T09:18:28+0800');
+    const b = EC.eccParseIso('2026-11-08T09:18:28+08:00');
+    if (a == null || b == null) return '解析失败 ' + a + '/' + b;
+    if (a !== b) return '两种偏移写法不一致：' + a + ' vs ' + b;
+    if (EC.eccParseIso('garbage') !== null) return '垃圾输入必须 null';
+    return true;
+  });
+  t('内核 Xid 行解析（本机真实行）+ ECC 类分标 + 非 Xid 行不误吞', () => {
+    const l1 = '2026-11-08T09:18:28+0800 ll-desktop kernel: NVRM: Xid (PCI:0000:0a:00): 13, Graphics SM Warp Exception on (GPC 3, TPC 0, SM 0): Out Of Range Address';
+    const e1 = EC.eccParseXidLine(l1);
+    if (!e1 || e1.xid !== 13 || e1.bus !== '0000:0a:00' || e1.ecc) return JSON.stringify(e1);
+    if (e1.msg.indexOf('Out Of Range Address') < 0) return 'msg=' + e1.msg;
+    const l2 = '2026-11-08T09:18:28+0800 ll-desktop kernel: NVRM: Xid (PCI:0000:0a:00): 48, Double Bit ECC Error';
+    const l3 = '2026-11-08T09:18:28+0800 ll-desktop kernel: NVRM: gpuGetNameString_FWCLIENT: 不是 Xid';
+    const all = EC.eccParseXidLines([l1, l2, l3].join('\n'));
+    if (all.length !== 2) return '应只收 2 条 Xid，实得 ' + all.length;
+    if (!all[1].ecc) return 'Xid 48 必须标 ECC 类';
+    return true;
+  });
+  t('Xid 的 PCI 地址 ↔ nvidia-smi bus_id 对齐（对不上如实 null，不按顺序猜卡号）', () => {
+    const gs = [{ index: 0, pci_bus_id: '0000:0a:00.0' }, { index: 1, pci_bus_id: '0000:0b:00.0' }, { index: 2, pci_bus_id: '0000:01:00.0' }];
+    if (EC.eccBusToIndex('0000:0a:00', gs) !== 0) return '缺 function 号未匹配';
+    if (EC.eccBusToIndex('0000:0b:00.0', gs) !== 1) return '带 function 号未匹配';
+    if (EC.eccBusToIndex('0000:99:00.0', gs) !== null) return '未知地址必须 null';
+    if (EC.eccBusToIndex(null, gs) !== null) return '空地址必须 null';
+    return true;
+  });
+  t('逐卡健康判定口径（DBE=error / SBE=warn / 关闭=disabled / 无数=unknown / 全零=ok）', () => {
+    const mk = (c, text, since) => ({ counters: c || {}, since: since || {}, text: text || { mode_current: 'Enabled' } });
+    if (EC.eccGpuStatus(mk({ a_dram_u: 1 })).status !== 'error') return '终身 DBE 必须 error';
+    if (EC.eccGpuStatus(mk({}, { mode_current: 'Enabled' }, { a_total_u: 2 })).status !== 'error') return '自基线新增 DBE 必须 error';
+    if (EC.eccGpuStatus(mk({ a_dram_c: 3 })).status !== 'warn') return 'SBE 必须 warn';
+    if (EC.eccGpuStatus(mk({ remap_pending: 2 })).status !== 'warn') return '重映射待处理必须 warn';
+    if (EC.eccGpuStatus(mk({}, { mode_current: 'Disabled' })).status !== 'disabled') return 'ECC 关闭必须 disabled（不得显示成正常 0）';
+    if (EC.eccGpuStatus(mk({ v_dram_c: 0, a_dram_c: 0, a_dram_u: 0 })).status !== 'ok') return '全零应 ok';
+    if (EC.eccGpuStatus(mk({}, { mode_current: null })).status !== 'unknown') return '无模式字段应 unknown';
+    if (!EC.eccModeOn('Enabled') || EC.eccModeOn('Disabled') || EC.eccModeOff('Enabled')) return '模式串判定错';
+    return true;
+  });
+}
+
   // ============ 报告 ============
   console.log(`单元测试：通过 ${pass} / 失败 ${fail}`);
   failures.forEach((f) => console.log('  ✗ ' + f));

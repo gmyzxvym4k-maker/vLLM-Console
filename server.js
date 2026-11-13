@@ -10,6 +10,9 @@ const path = require('path');
 const { URL } = require('url');
 const { spawn } = require('child_process');
 const zlib = require('zlib');
+// [0320-utf8] 流式/非流式 tee 解析必须跨 TCP 包保留未完成的多字节字符，
+// 否则中文 UTF-8 被切断会变成 U+FFFD（0.32 的 SSE 分块更细，命中率显著上升）。
+const { StringDecoder } = require('string_decoder');
 
 // 09-20 性能优化：异步 sleep（替代 execSync('sleep N')——后者会冻结整个事件循环，
 // 停止/清理模型期间所有轮询与页面请求排队 1~30 秒）。
@@ -3118,9 +3121,10 @@ setInterval(() => {
 // Tee an SSE (streaming) response: forward raw bytes, parse delta text.
 function teeSseStream(proxyRes, res, live, taskId) {
   let buf = '';
+  const sdec = new StringDecoder('utf8');
   proxyRes.on('data', (chunk) => {
     res.write(chunk); // transparent forward — client sees the original stream
-    buf += chunk.toString('utf8');
+    buf += sdec.write(chunk);
     let nl;
     while ((nl = buf.indexOf('\n')) !== -1) {
       let line = buf.slice(0, nl);
@@ -3150,6 +3154,24 @@ function teeSseStream(proxyRes, res, live, taskId) {
     }
   });
   proxyRes.on('end', () => {
+    buf += sdec.end();
+    // 收尾无换行符的最后一帧，避免末尾中文被丢弃
+    const tail = buf.trim();
+    if (tail.startsWith('data:')) {
+      const payload = tail.slice(5).trim();
+      if (payload && payload !== '[DONE]') {
+        try {
+          const obj = JSON.parse(payload);
+          const ch = obj.choices && obj.choices[0];
+          if (ch) {
+            const d = ch.delta || {};
+            const piece = (d.content || '') + (d.reasoning_content || d.reasoning || '');
+            if (piece) appendLiveText(live, piece);
+            if (ch.finish_reason) live.finish = String(ch.finish_reason);
+          }
+        } catch (e) { /* ignore */ }
+      }
+    }
     if (!live.done) finishLiveReq(live, live.finish || 'done');
     res.end();
   });
@@ -3163,13 +3185,15 @@ function teeSseStream(proxyRes, res, live, taskId) {
 function teeJsonStream(proxyRes, res, live, taskId) {
   let buf = '';
   let size = 0;
+  const sdec = new StringDecoder('utf8');
   proxyRes.on('data', (chunk) => {
     res.write(chunk);
     size += chunk.length;
-    if (size < 8 * 1024 * 1024) buf += chunk.toString('utf8');
+    if (size < 8 * 1024 * 1024) buf += sdec.write(chunk);
   });
   proxyRes.on('end', () => {
     res.end();
+    buf += sdec.end();
     if (buf) {
       try {
         const obj = JSON.parse(buf);

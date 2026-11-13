@@ -674,7 +674,10 @@ function startDashPolling() {
     loadModels();
     loadPdSeries();
     _dashTimer = setInterval(() => {
-        const active = document.querySelector('.page.active').id;
+        // 10-07 测试修复：无 .page.active 时 querySelector 返回 null，.id 直接 TypeError，
+        // 定时器每 2s 抛一次、轮询静默失效（页面表现为"数字定格"）
+        const activeEl = document.querySelector('.page.active');
+        const active = activeEl ? activeEl.id : 'page-dash';
         if (active === 'page-dash') {
             loadMachine();
             loadStats();

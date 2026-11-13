@@ -498,7 +498,7 @@ def default_summary():
         "last_loaded_at": meta.get("last_loaded_at", ""),
         "env_path": str(DEFAULT_ENV),
         "source": source,
-        "source_label": "运行中配置" if source == "running" else ".env",
+        "source_label": {"running": "运行中配置", "manual": "页面编辑"}.get(source, ".env"),
         "source_detail": meta.get("source_detail", ""),
         "backups": [],
     }

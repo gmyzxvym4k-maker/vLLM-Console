@@ -265,16 +265,20 @@ function j(){try{return JSON.stringify([].slice.call(arguments))}catch(e){return
 
 // services
 function loadSvcs(){
+  // 10-07 测试修复：原实现无错误分支、无类型守卫——接口失败或返回非数组（如鉴权/异常时
+  // 返回 {}）时 list.forEach 直接 TypeError，服务列表被清空且无任何提示（页面表现为
+  // 「可测服务全没了」）；名称/描述未转义，含 < 的配置值会撕坏 DOM。
   fetch('/v1/internal/bench/services').then(r=>r.json()).then(function(list){
+    if(!Array.isArray(list)){console.warn('[bench] /bench/services 返回非数组，跳过渲染：',list);return;}
     var w=document.getElementById('svcs'); w.innerHTML='';
     list.forEach(function(s,i){
       var d=h('div','svc'+(i===0?' sel':''));
-      d.innerHTML='<span class="dot'+(s.healthy?' ok':'')+'"></span><span class="nm">'+s.name+'</span><div class="ds">'+s.desc+(s.model?' · '+s.model:' · 未响应')+'</div>';
+      d.innerHTML='<span class="dot'+(s.healthy?' ok':'')+'"></span><span class="nm">'+esc(s.name)+'</span><div class="ds">'+esc(s.desc)+(s.model?' · '+esc(s.model):' · 未响应')+'</div>';
       d.onclick=function(){if(running)return;document.querySelectorAll('.svc').forEach(function(x){x.classList.remove('sel')});d.classList.add('sel');selSvc=s;selModel=s.model;};
       if(i===0){selSvc=s;selModel=s.model;}
       w.appendChild(d);
     });
-  });
+  },function(e){console.warn('[bench] /bench/services 加载失败：',e);});
 }
 // mode chips
 var MODE_LABEL={single:'▶ 开始 · 单流解码 13 类',conc:'▶ 开始 · 并发档位测试',prefill:'▶ 开始 · 预填充测试'};
@@ -616,7 +620,9 @@ function renderPf(){
 }
 // history
 function loadHist(){
+  // 10-07 测试修复：同 loadSvcs，补类型守卫与错误分支（历史接口异常时整表清空且无提示）
   fetch('/v1/internal/bench/history').then(r=>r.json()).then(function(list){
+    if(!Array.isArray(list)){console.warn('[bench] /bench/history 返回非数组，跳过渲染：',list);return;}
     var t=document.getElementById('tbHist');
     var MN={single:'单流',conc:'并发',prefill:'预填充',full:'旧全流程'};
     var html='<tr><th>时间</th><th>标签</th><th>模式</th><th>服务</th><th>类型</th><th>轮</th><th>decode均值</th><th>TTFT ms</th><th>接受率</th><th>并发峰值</th><th>pf峰值</th><th></th></tr>';
@@ -637,7 +643,7 @@ function loadHist(){
     t.querySelectorAll('.dbtn').forEach(function(b){
       b.onclick=function(e){e.stopPropagation();openDetail(b.dataset.file);};
     });
-  });
+  },function(e){console.warn('[bench] /bench/history 加载失败：',e);});
 }
 function cmpAvg(run,ids,key){var v=ids.map(function(id){return ((run.single||{})[id]||{})[key]}).filter(function(x){return x!=null&&x});return v.length?v.reduce(function(a,b){return a+b},0)/v.length:null}
 function cmpTile(label,va,vb,fmt){
@@ -951,7 +957,7 @@ function loadLive(){
   if(!selSvc)return;
   fetch('/v1/internal/bench/metrics?sid='+encodeURIComponent(selSvc.id)).then(r=>r.json()).then(function(m){
     document.getElementById('live').innerHTML='前缀缓存命中：<b>'+(m.prefixHit!=null?m.prefixHit+'%':'—')+'</b><br>投机接受率：<b>'+(m.accept!=null?m.accept+'%':'—')+'</b>';
-  });
+  },function(e){console.warn('[bench] /bench/metrics 加载失败：',e);});
 }
 loadSvcs();loadLive();setInterval(loadLive,5000);poll();
 </script></body></html>
